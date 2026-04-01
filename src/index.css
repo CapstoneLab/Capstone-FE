@@ -1,0 +1,111 @@
+@import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Pretendard', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-green-900: #003d2b;
+  --color-green-800: #116b4b;
+  --color-green-700: #147a57;
+  --color-green-600: #149362;
+  --color-green-500: #45bd87;
+  --color-green-400: #3cc38f;
+  --color-green-300: #6bc7a2;
+  --color-green-200: #8fd0b3;
+  --color-green-100: #a8d1bd;
+  --color-green-50: #bfd3c8;
+
+  --color-gray-900: #000000;
+  --color-gray-800: #121212;
+  --color-gray-700: #1c1c1c;
+  --color-gray-600: #2a2a2a;
+  --color-gray-500: #444444;
+  --color-gray-400: #6b7280;
+  --color-gray-300: #9a9a9a;
+  --color-gray-200: #bfc3c7;
+  --color-gray-100: #d1d5db;
+  --color-gray-50: #e5e7eb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--color-gray-50);
+  background: #1e1e1e;
+  overflow: hidden;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+[role='button'] {
+  cursor: pointer;
+}
+
+button:disabled,
+[role='button'][aria-disabled='true'] {
+  cursor: not-allowed;
+}
+
+::selection {
+  background: rgba(69, 189, 135, 0.45);
+  color: #ffffff;
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes accordion-down {
+  from {
+    height: 0;
+    opacity: 0;
+  }
+
+  to {
+    height: var(--radix-accordion-content-height);
+    opacity: 1;
+  }
+}
+
+@keyframes accordion-up {
+  from {
+    height: var(--radix-accordion-content-height);
+    opacity: 1;
+  }
+
+  to {
+    height: 0;
+    opacity: 0;
+  }
+}
+
+.accordion-content[data-state='open'] {
+  animation: accordion-down 220ms ease-out;
+}
+
+.accordion-content[data-state='closed'] {
+  animation: accordion-up 180ms ease-out;
+}
