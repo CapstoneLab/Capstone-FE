@@ -4,12 +4,16 @@ import { BrowserRouter, HashRouter } from 'react-router-dom'
 import './index.css'
 import App from './App.tsx'
 
-const Router = window.location.protocol === 'file:' ? HashRouter : BrowserRouter
-
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <Router>
-      <App />
-    </Router>
+    {window.location.protocol === 'file:' ? (
+      <HashRouter>
+        <App />
+      </HashRouter>
+    ) : (
+      <BrowserRouter>
+        <App />
+      </BrowserRouter>
+    )}
   </StrictMode>,
 )

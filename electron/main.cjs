@@ -7,8 +7,74 @@ const { spawn } = require('node:child_process')
 
 const isDev = !app.isPackaged
 const devServerUrl = 'http://localhost:5173'
-const fallbackGithubRepo = 'kth08/capstone-FE'
+const defaultGithubRepo = 'CapstoneLab/Capstone-FE'
 const appRootDir = path.join(__dirname, '..')
+
+function normalizeRepoValue(value) {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const candidate = value.trim()
+  if (!candidate) {
+    return null
+  }
+
+  if (/^https?:\/\//i.test(candidate)) {
+    try {
+      const parsed = new URL(candidate)
+      const segments = parsed.pathname
+        .split('/')
+        .filter(Boolean)
+        .map((segment) => segment.trim())
+
+      if (segments.length >= 2) {
+        return `${segments[0]}/${segments[1]}`
+      }
+
+      return null
+    } catch {
+      return null
+    }
+  }
+
+  if (!candidate.includes('/')) {
+    return null
+  }
+
+  const [owner, repo] = candidate.split('/')
+  if (!owner || !repo) {
+    return null
+  }
+
+  return `${owner.trim()}/${repo.trim()}`
+}
+
+function getRepositoryFromPackageJson() {
+  try {
+    const packageJsonPath = path.join(appRootDir, 'package.json')
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'))
+    const explicitRepo = normalizeRepoValue(packageJson.releaseRepository)
+
+    if (explicitRepo) {
+      return explicitRepo
+    }
+
+    if (typeof packageJson.repository === 'string') {
+      return normalizeRepoValue(packageJson.repository)
+    }
+
+    if (typeof packageJson.repository?.url === 'string') {
+      return normalizeRepoValue(packageJson.repository.url)
+    }
+
+    return null
+  } catch {
+    return null
+  }
+}
+
+const fallbackGithubRepo = getRepositoryFromPackageJson() || defaultGithubRepo
 
 function loadDotEnvFile(filePath) {
   if (!fs.existsSync(filePath)) {
@@ -83,33 +149,7 @@ function getReleaseRepository() {
     process.env.GITHUB_RELEASE_REPO ||
     process.env.GITHUB_RELEASE_REPO_URL ||
     process.env.GITHUB_REPOSITORY
-  const candidate = (envValue || fallbackGithubRepo).trim()
-
-  if (!candidate) {
-    return fallbackGithubRepo
-  }
-
-  if (/^https?:\/\//i.test(candidate)) {
-    try {
-      const parsed = new URL(candidate)
-      const segments = parsed.pathname
-        .split('/')
-        .filter(Boolean)
-        .map((segment) => segment.trim())
-
-      if (segments.length >= 2) {
-        return `${segments[0]}/${segments[1]}`
-      }
-    } catch {
-      return fallbackGithubRepo
-    }
-  }
-
-  if (!candidate || !candidate.includes('/')) {
-    return fallbackGithubRepo
-  }
-
-  return candidate
+  return normalizeRepoValue(envValue) || fallbackGithubRepo
 }
 
 function getGithubAuthHeader() {
