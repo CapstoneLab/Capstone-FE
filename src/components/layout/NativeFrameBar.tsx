@@ -12,7 +12,7 @@ import {
   UserRound,
   X,
 } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate, useNavigationType } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -42,6 +42,8 @@ function normalizeUpdaterErrorMessage(error: unknown) {
 
 export function NativeFrameBar() {
   const navigate = useNavigate()
+  const location = useLocation()
+  const navigationType = useNavigationType()
   const [isMaximized, setIsMaximized] = useState(false)
   const [isProfileDialogOpen, setIsProfileDialogOpen] = useState(false)
   const [isUpdateDialogOpen, setIsUpdateDialogOpen] = useState(false)
@@ -49,11 +51,14 @@ export function NativeFrameBar() {
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false)
   const [downloadProgress, setDownloadProgress] = useState<number | null>(null)
   const [updateError, setUpdateError] = useState<string | null>(null)
+  const [canGoBack, setCanGoBack] = useState(false)
+  const [canGoForward, setCanGoForward] = useState(false)
   const [appInfo, setAppInfo] = useState({
     appName: 'SecuPipeline',
     version: '0.0.0',
   })
   const [releaseInfo, setReleaseInfo] = useState<DesktopReleaseInfo | null>(null)
+  const appIconSrc = window.location.protocol === 'file:' ? './logo.png' : '/logo.png'
 
   useEffect(() => {
     let mounted = true
@@ -73,6 +78,37 @@ export function NativeFrameBar() {
       unsubscribe?.()
     }
   }, [])
+
+  useEffect(() => {
+    const historyState = window.history.state
+    const currentIndex =
+      typeof historyState?.idx === 'number'
+        ? historyState.idx
+        : Math.max(0, window.history.length - 1)
+
+    let maxVisitedIndex = currentIndex
+
+    try {
+      const key = 'secupipeline:max-history-idx'
+      const savedRaw = window.sessionStorage.getItem(key)
+      const savedIndex = savedRaw ? Number.parseInt(savedRaw, 10) : currentIndex
+
+      maxVisitedIndex = Number.isFinite(savedIndex)
+        ? Math.max(savedIndex, currentIndex)
+        : currentIndex
+
+      if (navigationType === 'PUSH') {
+        maxVisitedIndex = currentIndex
+      }
+
+      window.sessionStorage.setItem(key, String(maxVisitedIndex))
+    } catch {
+      maxVisitedIndex = currentIndex
+    }
+
+    setCanGoBack(currentIndex > 0)
+    setCanGoForward(currentIndex < maxVisitedIndex)
+  }, [location.key, navigationType])
 
   useEffect(() => {
     const unsubscribe = window.desktop?.updater?.onDownloadProgress?.((progress) => {
@@ -179,30 +215,32 @@ export function NativeFrameBar() {
             type="button"
             aria-label="홈"
             onClick={() => navigate('/')}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 hover:bg-gray-700/70"
+            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70"
           >
             <House className="h-4 w-4" />
           </button>
           <button
             type="button"
             aria-label="뒤로"
-            onClick={() => navigate(-1)}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 hover:bg-gray-700/70"
+            onClick={() => canGoBack && navigate(-1)}
+            disabled={!canGoBack}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70 disabled:cursor-not-allowed disabled:text-gray-500 disabled:hover:bg-transparent disabled:hover:text-gray-500"
           >
             <ChevronLeft className="h-4 w-4" />
           </button>
           <button
             type="button"
             aria-label="앞으로"
-            onClick={() => navigate(1)}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 hover:bg-gray-700/70"
+            onClick={() => canGoForward && navigate(1)}
+            disabled={!canGoForward}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70 disabled:cursor-not-allowed disabled:text-gray-500 disabled:hover:bg-transparent disabled:hover:text-gray-500"
           >
             <ChevronRight className="h-4 w-4" />
           </button>
         </div>
 
         <div className="pointer-events-none absolute left-1/2 flex -translate-x-1/2 items-center gap-2">
-          <img src="/favicon.png" alt="앱 아이콘" className="h-6 w-6 rounded-xl object-cover" />
+          <img src={appIconSrc} alt="앱 아이콘" className="h-7 w-7 rounded-xl object-cover" />
           <p className="text-sm font-semibold text-gray-100">SecuPipeline</p>
         </div>
 
@@ -298,7 +336,7 @@ export function NativeFrameBar() {
           </DialogHeader>
 
           <div className="mt-3 flex flex-col items-center text-center">
-            <img src="/favicon.png" alt="앱 아이콘" className="h-12 w-12 rounded-xl object-cover" />
+            <img src={appIconSrc} alt="앱 아이콘" className="h-12 w-12 rounded-xl object-cover" />
             <p className="mt-3 text-base font-semibold text-white">{releaseInfo?.appName || appInfo.appName}</p>
             <p className="mt-1 text-xs text-gray-300">
               현재 앱 버전 {withVersionPrefix(releaseInfo?.currentVersion || appInfo.version)}
@@ -328,20 +366,21 @@ export function NativeFrameBar() {
                 >
                   {isInstallingUpdate ? (
                     <>
-                      <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
-                      {typeof downloadProgress === 'number'
-                        ? `다운로드 중... ${downloadProgress}%`
-                        : '다운로드 중...'}
+                      <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />다운로드 중...
                     </>
                   ) : (
                     <>
-                      <Download className="mr-1.5 h-4 w-4" />업데이트 하기
+                      <Download className="mr-1.5 h-4 w-4" />다운로드
                     </>
                   )}
                 </Button>
 
-                {isInstallingUpdate && typeof downloadProgress === 'number' && (
-                  <p className="text-xs text-gray-300">다운로드 진행률: {downloadProgress}%</p>
+                {isInstallingUpdate && (
+                  <p className="text-xs text-gray-300">
+                    {typeof downloadProgress === 'number'
+                      ? `다운로드 진행률: ${downloadProgress}%`
+                      : '다운로드 진행률 계산 중...'}
+                  </p>
                 )}
               </div>
             ) : (

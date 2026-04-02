@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+	<defs>
+		<linearGradient id="icon-gradient" x1="24" y1="16" x2="104" y2="112" gradientUnits="userSpaceOnUse">
+			<stop stop-color="#B98CFF" />
+			<stop offset="1" stop-color="#76CCFF" />
+		</linearGradient>
+	</defs>
+
+	<path
+		d="M64 12L92 25V57C92 80 76 99 64 108C52 99 36 80 36 57V25L64 12Z"
+		stroke="url(#icon-gradient)"
+		stroke-width="8"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+	/>
+
+	<path
+		d="M42 71C45 85 55 95 64 101C76 92 84 82 88 66"
+		stroke="url(#icon-gradient)"
+		stroke-width="8"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+	/>
+
+	<path
+		d="M38 44L70 36"
+		stroke="url(#icon-gradient)"
+		stroke-width="8"
+		stroke-linecap="round"
+	/>
+
+	<path
+		d="M70 36L70 58"
+		stroke="url(#icon-gradient)"
+		stroke-width="8"
+		stroke-linecap="round"
+	/>
+
+	<path
+		d="M70 58L50 76"
+		stroke="url(#icon-gradient)"
+		stroke-width="8"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+	/>
+
+	<path
+		d="M90 58L106 72L90 86"
+		stroke="url(#icon-gradient)"
+		stroke-width="8"
+		stroke-linecap="round"
+		stroke-linejoin="round"
+	/>
+
+	<path
+		d="M104 72H86"
+		stroke="url(#icon-gradient)"
+		stroke-width="8"
+		stroke-linecap="round"
+	/>
+</svg>
