@@ -2,6 +2,9 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('desktop', {
   app: 'DevSecOps Pipeline',
+  appInfo: {
+    get: () => ipcRenderer.invoke('app:get-info'),
+  },
   window: {
     minimize: () => ipcRenderer.invoke('window:minimize'),
     toggleMaximize: () => ipcRenderer.invoke('window:toggle-maximize'),
@@ -16,5 +19,13 @@ contextBridge.exposeInMainWorld('desktop', {
       ipcRenderer.on('window:maximized-changed', listener)
       return () => ipcRenderer.removeListener('window:maximized-changed', listener)
     },
+  },
+  updater: {
+    checkForUpdates: () => ipcRenderer.invoke('updater:check-release'),
+    downloadAndInstall: (installerUrl, version) =>
+      ipcRenderer.invoke('updater:download-and-install', {
+        installerUrl,
+        version,
+      }),
   },
 })
