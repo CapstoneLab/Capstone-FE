@@ -27,5 +27,14 @@ contextBridge.exposeInMainWorld('desktop', {
         installerUrl,
         version,
       }),
+    onDownloadProgress: (callback) => {
+      if (typeof callback !== 'function') {
+        return () => {}
+      }
+
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on('updater:download-progress', listener)
+      return () => ipcRenderer.removeListener('updater:download-progress', listener)
+    },
   },
 })

@@ -14,6 +14,13 @@ declare global {
     statusMessage?: string | null
   }
 
+  type DesktopDownloadProgress = {
+    percent: number | null
+    downloadedBytes: number
+    totalBytes: number | null
+    completed?: boolean
+  }
+
   interface Window {
     desktop?: {
       app?: string
@@ -33,6 +40,7 @@ declare global {
       updater?: {
         checkForUpdates?: () => Promise<DesktopReleaseInfo>
         downloadAndInstall?: (installerUrl: string, version: string) => Promise<{ started: boolean }>
+        onDownloadProgress?: (callback: (progress: DesktopDownloadProgress) => void) => () => void
       }
     }
   }

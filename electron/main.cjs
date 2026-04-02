@@ -311,7 +311,7 @@ async function fetchLatestRelease() {
   }
 }
 
-async function downloadInstaller(url, version) {
+async function downloadInstaller(url, version, onProgress) {
   const safeVersion = normalizeVersion(version || 'latest').replace(/[^0-9A-Za-z._-]/g, '') || 'latest'
   const fileName = `secupipeline-${safeVersion}-setup.exe`
   const targetDir = path.join(app.getPath('temp'), 'secupipeline-updates')
@@ -331,7 +331,64 @@ async function downloadInstaller(url, version) {
     throw new Error(`업데이트 파일 다운로드 실패 (HTTP ${response.status})`)
   }
 
-  await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(targetPath))
+  const totalBytesRaw = Number.parseInt(response.headers.get('content-length') || '0', 10)
+  const totalBytes = Number.isFinite(totalBytesRaw) && totalBytesRaw > 0 ? totalBytesRaw : null
+  const sourceStream = Readable.fromWeb(response.body)
+  let downloadedBytes = 0
+  let lastPercent = -1
+  let lastEmitAt = 0
+
+  if (typeof onProgress === 'function') {
+    onProgress({
+      percent: totalBytes ? 0 : null,
+      downloadedBytes: 0,
+      totalBytes,
+    })
+  }
+
+  sourceStream.on('data', (chunk) => {
+    const chunkSize = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk)
+    downloadedBytes += chunkSize
+
+    if (typeof onProgress !== 'function') {
+      return
+    }
+
+    if (totalBytes) {
+      const percent = Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100))
+      if (percent !== lastPercent) {
+        lastPercent = percent
+        onProgress({
+          percent,
+          downloadedBytes,
+          totalBytes,
+        })
+      }
+      return
+    }
+
+    const now = Date.now()
+    if (now - lastEmitAt >= 300) {
+      lastEmitAt = now
+      onProgress({
+        percent: null,
+        downloadedBytes,
+        totalBytes: null,
+      })
+    }
+  })
+
+  await pipeline(sourceStream, fs.createWriteStream(targetPath))
+
+  if (typeof onProgress === 'function') {
+    onProgress({
+      percent: 100,
+      downloadedBytes,
+      totalBytes,
+      completed: true,
+    })
+  }
+
   return targetPath
 }
 
@@ -456,7 +513,7 @@ ipcMain.handle('updater:check-release', async () => {
   return fetchLatestRelease()
 })
 
-ipcMain.handle('updater:download-and-install', async (_event, payload) => {
+ipcMain.handle('updater:download-and-install', async (event, payload) => {
   const installerUrl = payload?.installerUrl
   const version = payload?.version
 
@@ -468,7 +525,15 @@ ipcMain.handle('updater:download-and-install', async (_event, payload) => {
     throw new Error('허용되지 않은 다운로드 URL입니다.')
   }
 
-  const installerPath = await downloadInstaller(installerUrl, version)
+  const sendProgress = (progressPayload) => {
+    if (!event.sender || event.sender.isDestroyed()) {
+      return
+    }
+
+    event.sender.send('updater:download-progress', progressPayload)
+  }
+
+  const installerPath = await downloadInstaller(installerUrl, version, sendProgress)
 
   spawn(installerPath, [], {
     detached: true,

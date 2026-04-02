@@ -47,6 +47,7 @@ export function NativeFrameBar() {
   const [isUpdateDialogOpen, setIsUpdateDialogOpen] = useState(false)
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false)
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false)
+  const [downloadProgress, setDownloadProgress] = useState<number | null>(null)
   const [updateError, setUpdateError] = useState<string | null>(null)
   const [appInfo, setAppInfo] = useState({
     appName: 'SecuPipeline',
@@ -69,6 +70,29 @@ export function NativeFrameBar() {
 
     return () => {
       mounted = false
+      unsubscribe?.()
+    }
+  }, [])
+
+  useEffect(() => {
+    const unsubscribe = window.desktop?.updater?.onDownloadProgress?.((progress) => {
+      if (!progress) {
+        return
+      }
+
+      if (progress.completed) {
+        setDownloadProgress(100)
+        return
+      }
+
+      if (typeof progress.percent === 'number') {
+        setDownloadProgress(Math.min(100, Math.max(0, progress.percent)))
+      } else {
+        setDownloadProgress(null)
+      }
+    })
+
+    return () => {
       unsubscribe?.()
     }
   }, [])
@@ -107,6 +131,7 @@ export function NativeFrameBar() {
   const handleCheckUpdates = async () => {
     setIsCheckingUpdate(true)
     setUpdateError(null)
+    setDownloadProgress(null)
 
     try {
       const info = await window.desktop?.updater?.checkForUpdates?.()
@@ -136,6 +161,7 @@ export function NativeFrameBar() {
 
     setIsInstallingUpdate(true)
     setUpdateError(null)
+    setDownloadProgress(0)
 
     try {
       await window.desktop?.updater?.downloadAndInstall?.(releaseInfo.installerUrl, releaseInfo.latestVersion)
@@ -176,7 +202,7 @@ export function NativeFrameBar() {
         </div>
 
         <div className="pointer-events-none absolute left-1/2 flex -translate-x-1/2 items-center gap-2">
-          <img src="/favicon.svg" alt="앱 아이콘" className="h-4 w-4" />
+          <img src="/favicon.png" alt="앱 아이콘" className="h-6 w-6 rounded-xl object-cover" />
           <p className="text-sm font-semibold text-gray-100">SecuPipeline</p>
         </div>
 
@@ -272,7 +298,7 @@ export function NativeFrameBar() {
           </DialogHeader>
 
           <div className="mt-3 flex flex-col items-center text-center">
-            <img src="/favicon.svg" alt="앱 아이콘" className="h-10 w-10" />
+            <img src="/favicon.png" alt="앱 아이콘" className="h-12 w-12 rounded-xl object-cover" />
             <p className="mt-3 text-base font-semibold text-white">{releaseInfo?.appName || appInfo.appName}</p>
             <p className="mt-1 text-xs text-gray-300">
               현재 앱 버전 {withVersionPrefix(releaseInfo?.currentVersion || appInfo.version)}
@@ -295,13 +321,17 @@ export function NativeFrameBar() {
                 </p>
                 <Button
                   type="button"
-                  className="h-9 bg-emerald-400 px-4 text-xs font-semibold text-[#111827] hover:bg-emerald-300"
+                  variant="ghost"
+                  className="h-9 bg-emerald-400 px-4 text-xs font-semibold text-[#111827] shadow-none hover:bg-emerald-300"
                   onClick={handleInstallUpdate}
                   disabled={isInstallingUpdate}
                 >
                   {isInstallingUpdate ? (
                     <>
-                      <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />다운로드 중...
+                      <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+                      {typeof downloadProgress === 'number'
+                        ? `다운로드 중... ${downloadProgress}%`
+                        : '다운로드 중...'}
                     </>
                   ) : (
                     <>
@@ -309,6 +339,10 @@ export function NativeFrameBar() {
                     </>
                   )}
                 </Button>
+
+                {isInstallingUpdate && typeof downloadProgress === 'number' && (
+                  <p className="text-xs text-gray-300">다운로드 진행률: {downloadProgress}%</p>
+                )}
               </div>
             ) : (
               <p className="text-center text-sm text-emerald-300">
