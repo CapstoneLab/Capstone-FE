@@ -502,6 +502,87 @@ ipcMain.handle('window:is-maximized', (event) => {
   return target.isMaximized()
 })
 
+const apiBaseUrl = process.env.VITE_API_BASE_URL || 'http://ec2-54-221-222-244.compute-1.amazonaws.com/capstonelab/capstone-back'
+const DEFAULT_AUTH_LOGIN_URL = `${apiBaseUrl}/auth/github/login`
+
+const ALLOWED_AUTH_HOSTS = new Set([
+  '127.0.0.1',
+  'localhost',
+  (() => { try { return new URL(apiBaseUrl).hostname } catch { return '' } })(),
+].filter(Boolean))
+
+function isAllowedAuthUrl(url) {
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false
+    }
+    return ALLOWED_AUTH_HOSTS.has(parsed.hostname.toLowerCase())
+  } catch {
+    return false
+  }
+}
+
+ipcMain.handle('auth:open-github-login', async (event, payload) => {
+  const requested = typeof payload?.url === 'string' && payload.url.trim()
+  const target =
+    requested && isAllowedAuthUrl(requested)
+      ? requested
+      : process.env.AUTH_LOGIN_URL && isAllowedAuthUrl(process.env.AUTH_LOGIN_URL)
+        ? process.env.AUTH_LOGIN_URL
+        : DEFAULT_AUTH_LOGIN_URL
+
+  const parentWindow = BrowserWindow.fromWebContents(event.sender)
+
+  const authWindow = new BrowserWindow({
+    width: 600,
+    height: 700,
+    parent: parentWindow || undefined,
+    modal: true,
+    show: false,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+    },
+  })
+
+  authWindow.once('ready-to-show', () => authWindow.show())
+
+  return new Promise((resolve) => {
+    let resolved = false
+
+    const checkForToken = (url) => {
+      try {
+        const parsed = new URL(url)
+        const token = parsed.searchParams.get('token')
+        if (token && parsed.pathname.includes('/auth/success')) {
+          if (!resolved) {
+            resolved = true
+            event.sender.send('auth:token-received', token)
+            authWindow.close()
+            resolve({ opened: true, url: target, token })
+          }
+        }
+      } catch {
+        // ignore parse errors
+      }
+    }
+
+    authWindow.webContents.on('will-redirect', (_e, url) => checkForToken(url))
+    authWindow.webContents.on('did-navigate', (_e, url) => checkForToken(url))
+    authWindow.webContents.on('did-navigate-in-page', (_e, url) => checkForToken(url))
+
+    authWindow.on('closed', () => {
+      if (!resolved) {
+        resolved = true
+        resolve({ opened: true, url: target, token: null })
+      }
+    })
+
+    authWindow.loadURL(target)
+  })
+})
+
 ipcMain.handle('app:get-info', () => {
   return {
     appName: 'SecuPipeline',

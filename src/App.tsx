@@ -7,12 +7,20 @@ import { NewPipelinePage } from '@/pages/NewPipelinePage'
 import { PipelineProcessPage } from '@/pages/PipelineProcessPage'
 import { PipelineProgressPage } from '@/pages/PipelineProgressPage'
 import { RepositoryDetailPage } from '@/pages/RepositoryDetailPage'
+import { useAuth } from '@/contexts/AuthContext'
+
+function AuthRedirect({ children }: { children: React.ReactNode }) {
+  const { user, isLoading } = useAuth()
+  if (isLoading) return null
+  if (user) return <Navigate to="/dashboard" replace />
+  return <>{children}</>
+}
 
 function App() {
   return (
     <Routes>
-      <Route path="/" element={<HomePage />} />
-      <Route path="/auth" element={<AuthPage />} />
+      <Route path="/" element={<AuthRedirect><HomePage /></AuthRedirect>} />
+      <Route path="/auth" element={<AuthRedirect><AuthPage /></AuthRedirect>} />
       <Route path="/docs" element={<DocsPage />} />
       <Route path="/dashboard" element={<DashboardPage />} />
       <Route path="/repository" element={<RepositoryDetailPage />} />

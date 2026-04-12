@@ -37,6 +37,10 @@ declare global {
         isMaximized?: () => Promise<boolean>
         onMaximizedChange?: (callback: (isMaximized: boolean) => void) => () => void
       }
+      auth?: {
+        startGithubLogin?: (url?: string) => Promise<{ opened: boolean; url: string; token?: string | null }>
+        onAuthToken?: (callback: (token: string) => void) => () => void
+      }
       updater?: {
         checkForUpdates?: () => Promise<DesktopReleaseInfo>
         downloadAndInstall?: (installerUrl: string, version: string) => Promise<{ started: boolean }>

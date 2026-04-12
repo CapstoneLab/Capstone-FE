@@ -5,6 +5,7 @@ import {
   Copy,
   Download,
   LogIn,
+  LogOut,
   House,
   Loader2,
   Minus,
@@ -14,6 +15,7 @@ import {
 } from 'lucide-react'
 import { useLocation, useNavigate, useNavigationType } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
+import { useAuth } from '@/contexts/AuthContext'
 import {
   Dialog,
   DialogClose,
@@ -44,6 +46,7 @@ export function NativeFrameBar() {
   const navigate = useNavigate()
   const location = useLocation()
   const navigationType = useNavigationType()
+  const { user, logout } = useAuth()
   const [isMaximized, setIsMaximized] = useState(false)
   const [isProfileDialogOpen, setIsProfileDialogOpen] = useState(false)
   const [isUpdateDialogOpen, setIsUpdateDialogOpen] = useState(false)
@@ -214,7 +217,7 @@ export function NativeFrameBar() {
           <button
             type="button"
             aria-label="홈"
-            onClick={() => navigate('/')}
+            onClick={() => navigate(user ? '/dashboard' : '/')}
             className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70"
           >
             <House className="h-4 w-4" />
@@ -252,7 +255,11 @@ export function NativeFrameBar() {
                 aria-label="프로필"
                 className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-300 transition-colors hover:bg-[#2F2F2F] hover:text-white active:bg-[#3A3A3A]"
               >
-                <UserRound className="h-4 w-4" />
+                {user?.avatarUrl ? (
+                  <img src={user.avatarUrl} alt={user.name || user.login} className="h-5 w-5 rounded-full" />
+                ) : (
+                  <UserRound className="h-4 w-4" />
+                )}
               </button>
             </DialogTrigger>
 
@@ -264,24 +271,56 @@ export function NativeFrameBar() {
               </div>
 
               <div className="space-y-3 px-4 py-3">
-                <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-gray-700/70 bg-[#1C1C1C] px-3 py-4">
-                  <img src="/default-profile.svg" alt="기본 프로필" className="h-16 w-16 rounded-full" />
-                  <p className="text-center text-sm font-semibold text-gray-100">
-                    비로그인 상태입니다. 로그인이 필요합니다.
-                  </p>
-                </div>
+                {user ? (
+                  <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-gray-700/70 bg-[#1C1C1C] px-3 py-4">
+                    <img
+                      src={user.avatarUrl || '/default-profile.svg'}
+                      alt={user.name || user.login}
+                      className="h-16 w-16 rounded-full"
+                    />
+                    <p className="text-center text-sm font-semibold text-gray-100">
+                      {user.name || user.login}
+                    </p>
+                    <p className="text-center text-xs text-gray-400">@{user.login}</p>
+                    {user.email && (
+                      <p className="text-center text-xs text-gray-500">{user.email}</p>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-gray-700/70 bg-[#1C1C1C] px-3 py-4">
+                    <img src="/default-profile.svg" alt="기본 프로필" className="h-16 w-16 rounded-full" />
+                    <p className="text-center text-sm font-semibold text-gray-100">
+                      비로그인 상태입니다. 로그인이 필요합니다.
+                    </p>
+                  </div>
+                )}
 
-                <Button
-                  type="button"
-                  variant="ghost"
-                  className="h-9 w-full justify-center bg-emerald-400 px-3 text-xs font-semibold text-[#111827] shadow-none hover:bg-emerald-300"
-                  onClick={() => {
-                    setIsProfileDialogOpen(false)
-                    navigate('/auth')
-                  }}
-                >
-                  <LogIn className="mr-1.5 h-4 w-4" />로그인
-                </Button>
+                {user ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="h-9 w-full justify-center bg-red-500/80 px-3 text-xs font-semibold text-white shadow-none hover:bg-red-500"
+                    onClick={() => {
+                      logout()
+                      setIsProfileDialogOpen(false)
+                      navigate('/auth')
+                    }}
+                  >
+                    <LogOut className="mr-1.5 h-4 w-4" />로그아웃
+                  </Button>
+                ) : (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="h-9 w-full justify-center bg-emerald-400 px-3 text-xs font-semibold text-[#111827] shadow-none hover:bg-emerald-300"
+                    onClick={() => {
+                      setIsProfileDialogOpen(false)
+                      navigate('/auth')
+                    }}
+                  >
+                    <LogIn className="mr-1.5 h-4 w-4" />로그인
+                  </Button>
+                )}
 
                 <Button
                   type="button"

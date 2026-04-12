@@ -1,9 +1,13 @@
 import { CheckCircle2 } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { NativeFrameBar } from '@/components/layout/NativeFrameBar'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { GitHubIcon } from '@/components/ui/github-icon'
+import { useAuth } from '@/contexts/AuthContext'
+
+const GITHUB_LOGIN_URL = `${import.meta.env.VITE_API_BASE_URL}/auth/github/login`
 
 const permissions = [
   {
@@ -26,9 +30,56 @@ const permissions = [
 
 export function AuthPage() {
   const navigate = useNavigate()
+  const { login, user } = useAuth()
+  const [status, setStatus] = useState<string | null>(null)
+  const [isPending, setIsPending] = useState(false)
 
-  const onSignIn = () => {
-    navigate('/dashboard')
+  useEffect(() => {
+    if (user) {
+      navigate('/dashboard', { replace: true })
+    }
+  }, [user, navigate])
+
+  useEffect(() => {
+    const unsubscribe = window.desktop?.auth?.onAuthToken?.((token) => {
+      login(token)
+        .then(() => navigate('/dashboard', { replace: true }))
+        .catch((err) => {
+          console.error('[AuthPage] login failed:', err)
+          setStatus(`로그인에 실패했습니다: ${err instanceof Error ? err.message : '알 수 없는 오류'}`)
+        })
+        .finally(() => setIsPending(false))
+    })
+
+    return () => {
+      unsubscribe?.()
+    }
+  }, [login, navigate])
+
+  const onSignIn = async () => {
+    setIsPending(true)
+    setStatus(null)
+    try {
+      const startGithubLogin = window.desktop?.auth?.startGithubLogin
+      if (typeof startGithubLogin === 'function') {
+        const result = await startGithubLogin(GITHUB_LOGIN_URL)
+        if (result?.token) {
+          await login(result.token)
+          navigate('/dashboard', { replace: true })
+        } else {
+          setIsPending(false)
+        }
+      } else {
+        window.location.href = GITHUB_LOGIN_URL
+      }
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? `로그인 창을 열지 못했습니다: ${error.message}`
+          : '로그인 창을 열지 못했습니다.',
+      )
+      setIsPending(false)
+    }
   }
 
   return (
@@ -43,11 +94,14 @@ export function AuthPage() {
 
             <Button
               onClick={onSignIn}
-              className="mt-5 w-full bg-white text-[#202020] shadow-none hover:bg-gray-100"
+              disabled={isPending}
+              className="mt-5 w-full bg-white text-[#202020] shadow-none hover:bg-gray-100 disabled:opacity-70"
               size="lg"
             >
-              <GitHubIcon className="mr-2 h-4 w-4" /> GitHub로 계속하기
+              <GitHubIcon className="mr-2 h-4 w-4" />
+              {isPending ? 'GitHub 로그인 중...' : 'GitHub로 계속하기'}
             </Button>
+            {status && <p className="mt-3 text-xs text-[#6B7280]">{status}</p>}
           </Card>
 
           <Card className="mt-5 border-gray-500/70 bg-[#242424] p-4">

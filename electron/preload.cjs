@@ -20,6 +20,18 @@ contextBridge.exposeInMainWorld('desktop', {
       return () => ipcRenderer.removeListener('window:maximized-changed', listener)
     },
   },
+  auth: {
+    startGithubLogin: (url) => ipcRenderer.invoke('auth:open-github-login', { url }),
+    onAuthToken: (callback) => {
+      if (typeof callback !== 'function') {
+        return () => {}
+      }
+
+      const listener = (_event, token) => callback(token)
+      ipcRenderer.on('auth:token-received', listener)
+      return () => ipcRenderer.removeListener('auth:token-received', listener)
+    },
+  },
   updater: {
     checkForUpdates: () => ipcRenderer.invoke('updater:check-release'),
     downloadAndInstall: (installerUrl, version) =>
