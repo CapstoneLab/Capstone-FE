@@ -39,9 +39,13 @@ async function fetchMe(token: string): Promise<User> {
   const data = await res.json()
   console.log('[AuthContext] /auth/me response:', data)
 
+  const login =
+    data.github_login ?? data.githubLogin ?? data.login ?? data.username ?? ''
+  const name = data.display_name ?? data.displayName ?? data.name ?? login ?? null
+
   return {
-    login: data.login ?? data.username ?? data.githubLogin ?? '',
-    name: data.name ?? data.login ?? data.username ?? data.githubLogin ?? null,
+    login,
+    name,
     avatarUrl: data.avatar_url ?? data.avatarUrl ?? data.profileImageUrl ?? null,
     email: data.email ?? null,
   }

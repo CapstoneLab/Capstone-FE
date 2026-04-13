@@ -1,5 +1,5 @@
 import { GitBranch, Play, Search, SquareMousePointer, Star } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
 import { Badge } from '@/components/ui/badge'
@@ -9,40 +9,10 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-
-type RepoOption = {
-  id: string
-  name: string
-  description: string
-  visibility: 'Public' | 'Private'
-  language: string
-  stars: number
-  branchCount: number
-  branches: string[]
-}
-
-const repoOptions: RepoOption[] = [
-  {
-    id: '1',
-    name: 'myuser/web-app',
-    description: 'React 기반 프론트엔드 웹 애플리케이션',
-    visibility: 'Public',
-    language: 'TypeScript',
-    stars: 12,
-    branchCount: 4,
-    branches: ['main(default)', 'develop', 'feature/login'],
-  },
-  {
-    id: '2',
-    name: 'myuser/api-server',
-    description: '보안 검사 API 서버',
-    visibility: 'Public',
-    language: 'TypeScript',
-    stars: 8,
-    branchCount: 3,
-    branches: ['main(default)', 'develop', 'release/v1'],
-  },
-]
+import { useAuth } from '@/contexts/AuthContext'
+import { fetchReposWithBranches, getCachedRepos, setCachedRepos } from '@/lib/api'
+import { getLanguageColor } from '@/lib/languageColors'
+import type { RepositoryItem } from '@/data/repositories'
 
 const vulnerabilityCheckOptions = [
   {
@@ -79,22 +49,74 @@ const vulnerabilityCheckOptions = [
 
 export function NewPipelinePage() {
   const navigate = useNavigate()
+  const { token } = useAuth()
+  const cacheKey = token ? token.slice(0, 16) : 'anonymous'
   const [search, setSearch] = useState('')
-  const [selectedRepoId, setSelectedRepoId] = useState(repoOptions[0]?.id ?? '')
-  const [selectedBranch, setSelectedBranch] = useState(repoOptions[0]?.branches[0] ?? '')
+  const [repos, setRepos] = useState<RepositoryItem[]>(
+    () => (token ? (getCachedRepos(cacheKey) ?? []) : []),
+  )
+  const [isReposLoading, setIsReposLoading] = useState(
+    () => !!token && !getCachedRepos(cacheKey),
+  )
+  const [reposError, setReposError] = useState<string | null>(null)
+  const [selectedRepoId, setSelectedRepoId] = useState('')
+  const [selectedBranch, setSelectedBranch] = useState('')
   const [selectedVulnerabilityIds, setSelectedVulnerabilityIds] = useState<string[]>([
     'sql-injection',
     'command-injection',
     'hardcoded-secret',
   ])
 
+  useEffect(() => {
+    if (!token) {
+      setRepos([])
+      return
+    }
+
+    let mounted = true
+    setReposError(null)
+
+    fetchReposWithBranches(token)
+      .then((list) => {
+        if (mounted) {
+          setRepos(list)
+          setCachedRepos(cacheKey, list)
+        }
+      })
+      .catch((error: unknown) => {
+        if (mounted) {
+          setReposError(
+            error instanceof Error ? error.message : '레포지토리를 불러오지 못했습니다.',
+          )
+        }
+      })
+      .finally(() => {
+        if (mounted) {
+          setIsReposLoading(false)
+        }
+      })
+
+    return () => {
+      mounted = false
+    }
+  }, [token, cacheKey])
+
   const filteredRepos = useMemo(() => {
-    return repoOptions.filter((repo) => {
+    return repos.filter((repo) => {
       return `${repo.name} ${repo.description}`.toLowerCase().includes(search.toLowerCase())
     })
-  }, [search])
+  }, [repos, search])
 
-  const selectedRepo = repoOptions.find((repo) => repo.id === selectedRepoId) ?? null
+  const selectedRepo = repos.find((repo) => repo.id === selectedRepoId) ?? null
+
+  useEffect(() => {
+    if (repos.length === 0) return
+    if (!selectedRepoId || !repos.some((repo) => repo.id === selectedRepoId)) {
+      const first = repos[0]
+      setSelectedRepoId(first.id)
+      setSelectedBranch(first.branches[0] ?? '')
+    }
+  }, [repos, selectedRepoId])
 
   const toggleVulnerabilityOption = (optionId: string, checked: boolean | 'indeterminate') => {
     setSelectedVulnerabilityIds((prev) => {
@@ -134,12 +156,30 @@ export function NewPipelinePage() {
             />
           </label>
 
+          {isReposLoading && repos.length === 0 ? (
+            <div className="mt-4 space-y-2">
+              {Array.from({ length: 3 }).map((_, idx) => (
+                <div
+                  key={idx}
+                  className="h-16 animate-pulse rounded-lg border border-[#2F2F2F] bg-[#1E1E1E]"
+                />
+              ))}
+            </div>
+          ) : reposError ? (
+            <p className="mt-4 rounded-lg border border-[#404040] bg-[#1E1E1E] p-4 text-center text-sm text-[#FCA5A5]">
+              {reposError}
+            </p>
+          ) : filteredRepos.length === 0 ? (
+            <p className="mt-4 rounded-lg border border-[#404040] bg-[#1E1E1E] p-4 text-center text-sm text-[#9CA3AF]">
+              표시할 레포지토리가 없습니다.
+            </p>
+          ) : (
           <RadioGroup
-            className="mt-4 space-y-2"
+            className="mt-4 max-h-80 space-y-2 overflow-y-auto pr-2"
             value={selectedRepoId}
             onValueChange={(value) => {
               setSelectedRepoId(value)
-              const nextRepo = repoOptions.find((repo) => repo.id === value)
+              const nextRepo = repos.find((repo) => repo.id === value)
               if (nextRepo?.branches[0]) {
                 setSelectedBranch(nextRepo.branches[0])
               }
@@ -161,7 +201,10 @@ export function NewPipelinePage() {
                         {repo.visibility}
                       </Badge>
                       <span className="inline-flex items-center gap-2 text-[12px] text-[#6B7280]">
-                        <span className="h-3 w-3 rounded-full bg-[#0EA5E9]" />
+                        <span
+                          className="h-3 w-3 rounded-full"
+                          style={{ backgroundColor: getLanguageColor(repo.language) }}
+                        />
                         {repo.language}
                       </span>
                     </div>
@@ -171,7 +214,7 @@ export function NewPipelinePage() {
 
                 <div className="flex items-center gap-4 text-[12px] text-[#6B7280]">
                   <span className="inline-flex items-center gap-1">
-                    <GitBranch className="h-3.5 w-3.5" /> {repo.branchCount}개
+                    <GitBranch className="h-3.5 w-3.5" /> {repo.branches.length}개
                   </span>
                   <span className="inline-flex items-center gap-1">
                     <Star className="h-3.5 w-3.5" /> {repo.stars}
@@ -180,6 +223,7 @@ export function NewPipelinePage() {
               </label>
             ))}
           </RadioGroup>
+          )}
         </Card>
 
         {selectedRepo ? (

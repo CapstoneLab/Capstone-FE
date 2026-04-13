@@ -32,7 +32,10 @@ import {
 import { Line } from 'react-chartjs-2'
 import { Link, useNavigate } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
-import { repositorySeed, type RepositoryItem } from '@/data/repositories'
+import { type RepositoryItem } from '@/data/repositories'
+import { fetchReposWithBranches, getCachedRepos, setCachedRepos } from '@/lib/api'
+import { getLanguageColor } from '@/lib/languageColors'
+import { useAuth } from '@/contexts/AuthContext'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -106,14 +109,56 @@ function formatDuration(durationSec: number) {
 
 export function DashboardPage() {
   const navigate = useNavigate()
+  const { token } = useAuth()
+  const cacheKey = token ? token.slice(0, 16) : 'anonymous'
   const [activeTab, setActiveTab] = useState<'repo' | 'pipeline'>('repo')
   const [searchInput, setSearchInput] = useState('')
   const [searchKeyword, setSearchKeyword] = useState('')
-  const [repos, setRepos] = useState<RepositoryItem[]>(repositorySeed)
+  const [repos, setRepos] = useState<RepositoryItem[]>(
+    () => (token ? (getCachedRepos(cacheKey) ?? []) : []),
+  )
   const [pipelines, setPipelines] = useState(pipelineSeed)
   const [isLoading, setIsLoading] = useState(false)
+  const [isReposLoading, setIsReposLoading] = useState(
+    () => !!token && !getCachedRepos(cacheKey),
+  )
+  const [reposError, setReposError] = useState<string | null>(null)
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null)
   const loadingTimerRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    if (!token) {
+      setRepos([])
+      return
+    }
+
+    let mounted = true
+    setReposError(null)
+
+    fetchReposWithBranches(token)
+      .then((list) => {
+        if (mounted) {
+          setRepos(list)
+          setCachedRepos(cacheKey, list)
+        }
+      })
+      .catch((error: unknown) => {
+        if (mounted) {
+          setReposError(
+            error instanceof Error ? error.message : '레포지토리를 불러오지 못했습니다.',
+          )
+        }
+      })
+      .finally(() => {
+        if (mounted) {
+          setIsReposLoading(false)
+        }
+      })
+
+    return () => {
+      mounted = false
+    }
+  }, [token, cacheKey])
 
   const triggerLoading = () => {
     if (loadingTimerRef.current) {
@@ -259,10 +304,14 @@ export function DashboardPage() {
 
         {activeTab === 'repo' ? (
           <div className="space-y-4">
-            {isLoading ? (
+            {isLoading || isReposLoading ? (
               Array.from({ length: 3 }).map((_, idx) => (
                 <Card key={idx} className="h-36 animate-pulse border-gray-500/60 bg-gray-700/30" />
               ))
+            ) : reposError ? (
+              <Card className="p-4 text-center text-[#FCA5A5]">
+                {reposError}
+              </Card>
             ) : filteredRepos.length === 0 ? (
               <Card className="p-4 text-center text-gray-200">
                 레포지토리가 없습니다. GitHub 연동 후 레포지토리 추가를 진행하세요.
@@ -304,7 +353,10 @@ export function DashboardPage() {
                           <Star className="h-4 w-4" /> {repo.stars}
                         </span>
                         <span className="inline-flex items-center gap-2 text-[12px] text-[#6B7280]">
-                          <span className="h-3 w-3 rounded-full bg-[#0EA5E9]" />
+                          <span
+                            className="h-3 w-3 rounded-full"
+                            style={{ backgroundColor: getLanguageColor(repo.language) }}
+                          />
                           {repo.language}
                         </span>
                       </p>
@@ -315,11 +367,11 @@ export function DashboardPage() {
                         <span className="inline-flex items-center text-[#6B7280]">
                           <GitBranch className="h-4 w-4" />
                         </span>
-                        {repo.branches.map((branch) => (
+                        {repo.branches.slice(0, 4).map((branch) => (
                           <Badge
                             key={branch}
                             className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-[12px] ${
-                              branch === 'main'
+                              branch === 'main' || branch === 'master'
                                 ? 'border-[#6EE7B7] bg-[#065F46] text-[#6EE7B7]'
                                 : 'border-white/20 bg-[#3A3A3A] text-[#9CA3AF]'
                             }`}
@@ -327,6 +379,11 @@ export function DashboardPage() {
                             {branch}
                           </Badge>
                         ))}
+                        {repo.branches.length > 4 ? (
+                          <Badge className="inline-flex items-center gap-1 rounded-full border-white/20 bg-[#3A3A3A] px-3 py-1 text-[12px] text-[#9CA3AF]">
+                            +{repo.branches.length - 4}개
+                          </Badge>
+                        ) : null}
                       </div>
                       <div className="inline-flex items-center gap-2 text-[12px] text-[#D1D5DB]">
                         <Eye className="h-4 w-4 text-[#34D399]" />
@@ -480,7 +537,11 @@ export function DashboardPage() {
                           <Clock3 className="h-4 w-4" /> {formatDuration(run.durationSec)}
                         </span>
                         <span className="inline-flex items-center gap-2 text-[12px] text-[#6B7280]">
-                          <span className="h-4 w-4 rounded-full bg-[#0EA5E9]" /> {run.language}
+                          <span
+                            className="h-4 w-4 rounded-full"
+                            style={{ backgroundColor: getLanguageColor(run.language) }}
+                          />{' '}
+                          {run.language}
                         </span>
                       </div>
 
