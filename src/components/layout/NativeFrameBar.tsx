@@ -16,6 +16,8 @@ import {
 import { useLocation, useNavigate, useNavigationType } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
 import { useAuth } from '@/contexts/AuthContext'
+import defaultProfileSvg from '@/assets/default-profile.svg'
+import appLogo from '@/assets/logo.png'
 import {
   Dialog,
   DialogClose,
@@ -61,7 +63,7 @@ export function NativeFrameBar() {
     version: '0.0.0',
   })
   const [releaseInfo, setReleaseInfo] = useState<DesktopReleaseInfo | null>(null)
-  const appIconSrc = window.location.protocol === 'file:' ? './logo.png' : '/logo.png'
+  const appIconSrc = appLogo
 
   useEffect(() => {
     let mounted = true
@@ -274,7 +276,7 @@ export function NativeFrameBar() {
                 {user ? (
                   <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-gray-700/70 bg-[#1C1C1C] px-3 py-4">
                     <img
-                      src={user.avatarUrl || '/default-profile.svg'}
+                      src={user.avatarUrl || defaultProfileSvg}
                       alt={user.name || user.login}
                       className="h-16 w-16 rounded-full"
                     />
@@ -288,7 +290,7 @@ export function NativeFrameBar() {
                   </div>
                 ) : (
                   <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-gray-700/70 bg-[#1C1C1C] px-3 py-4">
-                    <img src="/default-profile.svg" alt="기본 프로필" className="h-16 w-16 rounded-full" />
+                    <img src={defaultProfileSvg} alt="기본 프로필" className="h-16 w-16 rounded-full" />
                     <p className="text-center text-sm font-semibold text-gray-100">
                       비로그인 상태입니다. 로그인이 필요합니다.
                     </p>

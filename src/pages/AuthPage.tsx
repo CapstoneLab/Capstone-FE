@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { GitHubIcon } from '@/components/ui/github-icon'
 import { useAuth } from '@/contexts/AuthContext'
+import appLogo from '@/assets/logo.png'
 
 const GITHUB_LOGIN_URL = `${import.meta.env.VITE_API_BASE_URL}/auth/github/login`
 
@@ -88,7 +89,11 @@ export function AuthPage() {
       <main className="mx-auto flex min-h-screen w-full max-w-6xl items-center justify-center px-6 pb-10 pt-14">
         <div className="w-full max-w-md">
           <Card className="border-gray-500/80 bg-[#242424] p-4 text-center">
-            <div className="mx-auto h-16 w-16 rounded-2xl bg-[#5A5A5A]" />
+            <img
+              src={appLogo}
+              alt="SecuPipeline"
+              className="mx-auto aspect-square h-28 w-28 rounded-2xl object-cover"
+            />
             <h1 className="mt-4 text-4xl font-extrabold text-white">로그인</h1>
             <p className="mt-2 text-sm text-[#6B7280]">GitHub 계정으로 간편하게 시작하세요</p>
 
