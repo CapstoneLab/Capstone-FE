@@ -101,5 +101,6 @@ jobs:
           generate_release_notes: true
           files: |
             ${{ steps.resolve_installer.outputs.installer_path }}
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
