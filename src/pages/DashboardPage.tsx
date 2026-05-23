@@ -33,7 +33,16 @@ import { Line } from 'react-chartjs-2'
 import { Link, useNavigate } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
 import { type RepositoryItem } from '@/data/repositories'
-import { fetchReposWithBranches, getCachedRepos, setCachedRepos } from '@/lib/api'
+import {
+  fetchJobsByIds,
+  fetchReposWithBranches,
+  getCachedRepos,
+  getTrackedJobIds,
+  removeTrackedJobId,
+  setCachedRepos,
+  type JobDetail,
+  type JobVerdict,
+} from '@/lib/api'
 import { getLanguageColor } from '@/lib/languageColors'
 import { useAuth } from '@/contexts/AuthContext'
 import { Badge } from '@/components/ui/badge'
@@ -55,56 +64,68 @@ ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip,
 
 type PipelineItem = {
   id: string
+  jobId: string
   repoName: string
   description: string
   branch: string
   durationSec: number
-  language: string
-  status: 'success' | 'failed'
+  status: 'success' | 'failed' | 'running' | 'queued' | 'cancelled'
   score: number
+  verdict: JobVerdict | null
+  verdictReason: string | null
+  totalFindings: number
+  severityCounts: { critical: number; high: number; medium: number; low: number }
   executedAt: string
 }
-
-const pipelineSeed: PipelineItem[] = [
-  {
-    id: '#400001',
-    repoName: 'myuser/web-app',
-    description: '웹 앱 CI/CD 실행',
-    branch: 'main',
-    durationSec: 225,
-    language: 'TypeScript',
-    status: 'success',
-    score: 91,
-    executedAt: '2026-03-30T08:12:00',
-  },
-  {
-    id: '#400002',
-    repoName: 'myuser/api-server',
-    description: 'API 서버 CI/CD 실행',
-    branch: 'develop',
-    durationSec: 252,
-    language: 'TypeScript',
-    status: 'failed',
-    score: 72,
-    executedAt: '2026-03-30T10:03:00',
-  },
-  {
-    id: '#400003',
-    repoName: 'myuser/mobile-client',
-    description: '모바일 클라이언트 파이프라인',
-    branch: 'main',
-    durationSec: 182,
-    language: 'TypeScript',
-    status: 'success',
-    score: 84,
-    executedAt: '2026-03-31T12:22:00',
-  },
-]
 
 function formatDuration(durationSec: number) {
   const minutes = Math.floor(durationSec / 60)
   const seconds = durationSec % 60
   return `${minutes}m ${String(seconds).padStart(2, '0')}s`
+}
+
+function shortJobId(jobId: string) {
+  return jobId ? `#${jobId.slice(0, 8)}` : ''
+}
+
+function mapJobToPipelineItem(job: JobDetail): PipelineItem {
+  const finalStatus =
+    job.status === 'success' || job.status === 'failed' || job.status === 'cancelled'
+      ? job.status
+      : job.status === 'running'
+        ? 'running'
+        : 'queued'
+
+  return {
+    id: shortJobId(job.jobId),
+    jobId: job.jobId,
+    repoName: job.repoName,
+    description: `${job.triggerSource || 'pipeline'} · ${job.branch || '-'}`,
+    branch: job.branch,
+    durationSec: job.durationSecs,
+    status: finalStatus,
+    score: job.securityScore,
+    verdict: job.verdict,
+    verdictReason: job.verdictReason,
+    totalFindings: job.totalFindings,
+    severityCounts: job.severityCounts,
+    executedAt: job.completedAt ?? job.startedAt ?? job.createdAt ?? '',
+  }
+}
+
+const verdictMeta: Record<JobVerdict, { label: string; className: string }> = {
+  passed: {
+    label: 'PASS',
+    className: 'border-[#6EE7B7] bg-[#065F46] text-[#6EE7B7]',
+  },
+  warning: {
+    label: 'WARN',
+    className: 'border-[#FCD34D] bg-[#78350F] text-[#FCD34D]',
+  },
+  failed: {
+    label: 'FAIL',
+    className: 'border-[#FCA5A5] bg-[#7F1D1D] text-[#FCA5A5]',
+  },
 }
 
 export function DashboardPage() {
@@ -117,12 +138,16 @@ export function DashboardPage() {
   const [repos, setRepos] = useState<RepositoryItem[]>(
     () => (token ? (getCachedRepos(cacheKey) ?? []) : []),
   )
-  const [pipelines, setPipelines] = useState(pipelineSeed)
+  const [pipelines, setPipelines] = useState<PipelineItem[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [isReposLoading, setIsReposLoading] = useState(
     () => !!token && !getCachedRepos(cacheKey),
   )
+  const [isJobsLoading, setIsJobsLoading] = useState(
+    () => !!token && getTrackedJobIds(cacheKey).length > 0,
+  )
   const [reposError, setReposError] = useState<string | null>(null)
+  const [jobsError, setJobsError] = useState<string | null>(null)
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null)
   const loadingTimerRef = useRef<number | null>(null)
 
@@ -157,6 +182,57 @@ export function DashboardPage() {
 
     return () => {
       mounted = false
+    }
+  }, [token, cacheKey])
+
+  useEffect(() => {
+    if (!token) {
+      setPipelines([])
+      return
+    }
+
+    const ids = getTrackedJobIds(cacheKey)
+
+    if (ids.length === 0) {
+      setPipelines([])
+      setIsJobsLoading(false)
+      return
+    }
+
+    let cancelled = false
+    let timer: number | null = null
+    setIsJobsLoading(true)
+    setJobsError(null)
+
+    const TERMINAL = new Set(['success', 'failed', 'cancelled'])
+
+    async function tick(initial: boolean) {
+      try {
+        const jobs = await fetchJobsByIds(token!, ids)
+        if (cancelled) return
+        const mapped = jobs.map(mapJobToPipelineItem)
+        setPipelines(mapped)
+        setJobsError(null)
+
+        const hasActive = mapped.some((p) => !TERMINAL.has(p.status))
+        if (!cancelled && hasActive) {
+          timer = window.setTimeout(() => tick(false), 5000)
+        }
+      } catch (error) {
+        if (cancelled) return
+        setJobsError(
+          error instanceof Error ? error.message : '파이프라인 결과를 불러오지 못했습니다.',
+        )
+      } finally {
+        if (!cancelled && initial) setIsJobsLoading(false)
+      }
+    }
+
+    tick(true)
+
+    return () => {
+      cancelled = true
+      if (timer !== null) window.clearTimeout(timer)
     }
   }, [token, cacheKey])
 
@@ -201,26 +277,35 @@ export function DashboardPage() {
   )
 
   const deleteTarget = useMemo(
-    () => pipelines.find((item) => item.id === deleteTargetId) ?? null,
+    () => pipelines.find((item) => item.jobId === deleteTargetId) ?? null,
     [deleteTargetId, pipelines],
   )
 
   const detectionOnCount = repos.filter((repo) => repo.detectEnabled).length
-  const successRate = Math.round(
-    (pipelines.filter((item) => item.status === 'success').length / pipelines.length) * 100,
-  )
-  const avgScore = Math.round(pipelines.reduce((sum, item) => sum + item.score, 0) / pipelines.length)
-  const avgDuration = Math.round(
-    pipelines.reduce((sum, item) => sum + item.durationSec, 0) / pipelines.length,
+  const totalPipelines = pipelines.length
+  const successCount = pipelines.filter((item) => item.status === 'success').length
+  const successRate = totalPipelines === 0 ? 0 : Math.round((successCount / totalPipelines) * 100)
+  const avgScore =
+    totalPipelines === 0
+      ? 0
+      : Math.round(pipelines.reduce((sum, item) => sum + item.score, 0) / totalPipelines)
+  const avgDuration =
+    totalPipelines === 0
+      ? 0
+      : Math.round(pipelines.reduce((sum, item) => sum + item.durationSec, 0) / totalPipelines)
+
+  const chartPipelines = useMemo(
+    () => [...pipelines].reverse().slice(-20),
+    [pipelines],
   )
 
   const chartData = useMemo(
     () => ({
-      labels: pipelines.map((item) => item.id),
+      labels: chartPipelines.map((item) => item.id),
       datasets: [
         {
           label: '보안 점수 추이',
-          data: pipelines.map((item) => item.score),
+          data: chartPipelines.map((item) => item.score),
           borderColor: '#45bd87',
           backgroundColor: 'rgba(69, 189, 135, 0.2)',
           fill: true,
@@ -228,7 +313,7 @@ export function DashboardPage() {
         },
       ],
     }),
-    [pipelines],
+    [chartPipelines],
   )
 
   return (
@@ -498,10 +583,12 @@ export function DashboardPage() {
               />
             </Card>
 
-            {isLoading ? (
+            {isLoading || isJobsLoading ? (
               Array.from({ length: 2 }).map((_, idx) => (
                 <Card key={idx} className="h-42 animate-pulse border-gray-500/60 bg-gray-700/30" />
               ))
+            ) : jobsError ? (
+              <Card className="p-4 text-center text-[#FCA5A5]">{jobsError}</Card>
             ) : filteredPipelines.length === 0 ? (
               <Card className="p-4 text-center text-gray-200">
                 실행 기록이 없습니다. 새 파이프라인을 생성하세요.
@@ -509,7 +596,7 @@ export function DashboardPage() {
             ) : (
               filteredPipelines.map((run) => (
                 <Card
-                  key={run.id}
+                  key={run.jobId}
                   className="border-white/10 bg-[#262626] p-4"
                 >
                   <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
@@ -517,13 +604,29 @@ export function DashboardPage() {
                       <div className="flex items-center gap-3">
                         {run.status === 'success' ? (
                           <CircleCheckBig className="h-6 w-6 text-[#34D399]" />
-                        ) : (
+                        ) : run.status === 'failed' ? (
                           <CircleX className="h-6 w-6 text-[#FF3B30]" />
+                        ) : (
+                          <Activity className="h-6 w-6 text-[#FCD34D]" />
                         )}
                         <h3 className="text-[18px] font-bold leading-none text-white">
-                          {run.repoName}
+                          {run.repoName || run.jobId}
                         </h3>
-                        <span className="text-[18px] text-[#6B7280]">{run.id}</span>
+                        <span className="text-[14px] text-[#6B7280]">{run.id}</span>
+                        {run.status === 'running' || run.status === 'queued' ? (
+                          <Badge className="border-[#F59E0B] bg-[#78350F] px-2 py-0.5 text-[11px] text-[#FCD34D]">
+                            <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[#FCD34D]" />
+                            {run.status === 'running' ? '실행 중' : '대기 중'}
+                          </Badge>
+                        ) : null}
+                        {run.verdict ? (
+                          <Badge
+                            className={`px-2 py-0.5 text-[11px] ${verdictMeta[run.verdict].className}`}
+                            title={run.verdictReason ?? undefined}
+                          >
+                            {verdictMeta[run.verdict].label}
+                          </Badge>
+                        ) : null}
                       </div>
                       <p className="mt-3 text-[12px] text-[#6B7280]">{run.description}</p>
                       <div className="mt-4 flex flex-wrap items-center gap-4 text-[12px] text-[#6B7280]">
@@ -531,53 +634,123 @@ export function DashboardPage() {
                           <GitBranch className="h-4.5 w-4.5 text-[#6B7280]" />
                         </span>
                         <Badge className="border-[#6EE7B7] bg-[#065F46] px-3 py-1 text-[12px] text-[#6EE7B7]">
-                          {run.branch}
+                          {run.branch || '-'}
                         </Badge>
                         <span className="inline-flex items-center gap-1 text-[12px] text-[#6B7280]">
                           <Clock3 className="h-4 w-4" /> {formatDuration(run.durationSec)}
                         </span>
-                        <span className="inline-flex items-center gap-2 text-[12px] text-[#6B7280]">
-                          <span
-                            className="h-4 w-4 rounded-full"
-                            style={{ backgroundColor: getLanguageColor(run.language) }}
-                          />{' '}
-                          {run.language}
+                        {run.executedAt ? (
+                          <span className="text-[12px] text-[#6B7280]">
+                            {dayjs(run.executedAt).fromNow()}
+                          </span>
+                        ) : null}
+                        <span className="inline-flex items-center gap-1 text-[12px] text-[#6B7280]">
+                          <Shield className="h-4 w-4" /> {run.totalFindings} findings
                         </span>
                       </div>
 
+                      {run.totalFindings > 0 ? (
+                        <div className="mt-3 flex flex-wrap gap-2 text-[11px]">
+                          {run.severityCounts.critical > 0 ? (
+                            <Badge className="border-[#FCA5A5] bg-[#7F1D1D] px-2 py-0.5 text-[#FCA5A5]">
+                              Critical {run.severityCounts.critical}
+                            </Badge>
+                          ) : null}
+                          {run.severityCounts.high > 0 ? (
+                            <Badge className="border-[#FDBA74] bg-[#7C2D12] px-2 py-0.5 text-[#FDBA74]">
+                              High {run.severityCounts.high}
+                            </Badge>
+                          ) : null}
+                          {run.severityCounts.medium > 0 ? (
+                            <Badge className="border-[#FCD34D] bg-[#78350F] px-2 py-0.5 text-[#FCD34D]">
+                              Medium {run.severityCounts.medium}
+                            </Badge>
+                          ) : null}
+                          {run.severityCounts.low > 0 ? (
+                            <Badge className="border-[#93C5FD] bg-[#1E3A8A] px-2 py-0.5 text-[#93C5FD]">
+                              Low {run.severityCounts.low}
+                            </Badge>
+                          ) : null}
+                        </div>
+                      ) : null}
+
                       <hr className="my-4 border-white/10" />
 
-                      <div>
-                        <div className="mb-2 flex items-center justify-between text-sm">
-                          <span className="text-[10px] text-[#E5E7EB]">보안 점수</span>
-                          <span className="text-[14px] font-semibold text-[#FF7206]">
-                            {run.score}/100
-                          </span>
+                      {run.status === 'running' || run.status === 'queued' ? (
+                        <div>
+                          <div className="mb-2 flex items-center justify-between text-sm">
+                            <span className="text-[10px] text-[#E5E7EB]">진행 중...</span>
+                            <span className="text-[12px] text-[#FCD34D]">결과 대기</span>
+                          </div>
+                          <div className="h-2.5 w-full max-w-203.75 overflow-hidden rounded-full bg-[#404040]">
+                            <div className="h-full w-1/3 animate-pulse rounded-full bg-[#F59E0B]" />
+                          </div>
                         </div>
-                        <div className="h-2.5 w-full max-w-203.75 overflow-hidden rounded-full bg-[#404040]">
-                          <div className="h-full bg-[#FF7206]" style={{ width: `${run.score}%` }} />
+                      ) : (
+                        <div>
+                          <div className="mb-2 flex items-center justify-between text-sm">
+                            <span className="text-[10px] text-[#E5E7EB]">보안 점수</span>
+                            <span className="text-[14px] font-semibold text-[#FF7206]">
+                              {run.score}/100
+                            </span>
+                          </div>
+                          <div className="h-2.5 w-full max-w-203.75 overflow-hidden rounded-full bg-[#404040]">
+                            <div className="h-full bg-[#FF7206]" style={{ width: `${run.score}%` }} />
+                          </div>
                         </div>
-                      </div>
+                      )}
                     </div>
 
                     <div className="flex shrink-0 items-center gap-2">
                       <button
                         type="button"
-                        className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-[#5B5B5B] bg-[#2E2E2E] text-[#22D3EE]"
-                        aria-label="브랜치 보기"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          navigate('/pipeline/progress', {
+                            state: {
+                              jobId: run.jobId,
+                              repoName: run.repoName,
+                              branch: run.branch,
+                            },
+                          })
+                        }}
+                        className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-[#5B5B5B] bg-[#2E2E2E] text-[#22D3EE] transition-colors hover:bg-[#3A3A3A]"
+                        aria-label="실행 페이지 보기"
                       >
                         <GitBranch className="h-4 w-4" />
                       </button>
                       <button
                         type="button"
-                        className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-[#5B5B5B] bg-[#2E2E2E] text-[#6366F1]"
-                        aria-label="복사"
+                        disabled={
+                          run.status !== 'success' &&
+                          run.status !== 'failed' &&
+                          run.status !== 'cancelled'
+                        }
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          navigate('/pipeline/result', {
+                            state: {
+                              jobId: run.jobId,
+                              repoName: run.repoName,
+                              branch: run.branch,
+                            },
+                          })
+                        }}
+                        className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-[#5B5B5B] bg-[#2E2E2E] text-[#6366F1] transition-colors hover:bg-[#3A3A3A] disabled:cursor-not-allowed disabled:text-[#4B5563] disabled:hover:bg-[#2E2E2E]"
+                        aria-label="결과 페이지 보기"
+                        title={
+                          run.status === 'success' ||
+                          run.status === 'failed' ||
+                          run.status === 'cancelled'
+                            ? '결과 페이지 보기'
+                            : '파이프라인 종료 후 활성화됩니다'
+                        }
                       >
                         <Copy className="h-4 w-4" />
                       </button>
                       <button
                         type="button"
-                        onClick={() => setDeleteTargetId(run.id)}
+                        onClick={() => setDeleteTargetId(run.jobId)}
                         className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-[#5B5B5B] bg-[#2E2E2E] text-[#EF4444]"
                         aria-label="삭제"
                       >
@@ -597,7 +770,9 @@ export function DashboardPage() {
           <DialogHeader>
             <DialogTitle>실행 기록을 삭제할까요?</DialogTitle>
             <DialogDescription>
-              {deleteTarget ? `${deleteTarget.id} 항목은 삭제 후 복구할 수 없습니다.` : ''}
+              {deleteTarget
+                ? `${deleteTarget.id} (${deleteTarget.repoName || deleteTarget.jobId}) 항목을 목록에서 제거합니다. 백엔드 데이터는 유지됩니다.`
+                : ''}
             </DialogDescription>
           </DialogHeader>
 
@@ -610,7 +785,8 @@ export function DashboardPage() {
                 if (!deleteTarget) {
                   return
                 }
-                setPipelines((prev) => prev.filter((item) => item.id !== deleteTarget.id))
+                removeTrackedJobId(cacheKey, deleteTarget.jobId)
+                setPipelines((prev) => prev.filter((item) => item.jobId !== deleteTarget.jobId))
                 setDeleteTargetId(null)
               }}
               className="bg-[#EF4444] text-white shadow-none hover:bg-[#DC2626]"

@@ -1,4 +1,4 @@
-import { GitBranch, Play, Search, SquareMousePointer, Star } from 'lucide-react'
+import { GitBranch, Loader2, Lock, Play, Search, SquareMousePointer, Star } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
@@ -10,7 +10,18 @@ import { Input } from '@/components/ui/input'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useAuth } from '@/contexts/AuthContext'
-import { fetchReposWithBranches, getCachedRepos, setCachedRepos } from '@/lib/api'
+import {
+  addLaunchedRepo,
+  addTrackedJobId,
+  fetchJobsByIds,
+  fetchReposWithBranches,
+  getCachedRepos,
+  getLaunchedRepos,
+  getTrackedJobIds,
+  hasLaunchedRepo,
+  setCachedRepos,
+  startPipeline,
+} from '@/lib/api'
 import { getLanguageColor } from '@/lib/languageColors'
 import type { RepositoryItem } from '@/data/repositories'
 
@@ -66,6 +77,11 @@ export function NewPipelinePage() {
     'command-injection',
     'hardcoded-secret',
   ])
+  const [launchedRepoUrls, setLaunchedRepoUrls] = useState<string[]>(() =>
+    token ? getLaunchedRepos(cacheKey) : [],
+  )
+  const [isStarting, setIsStarting] = useState(false)
+  const [startError, setStartError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!token) {
@@ -109,6 +125,19 @@ export function NewPipelinePage() {
 
   const selectedRepo = repos.find((repo) => repo.id === selectedRepoId) ?? null
 
+  const isFirstRunForRepo = useMemo(() => {
+    if (!selectedRepo) return false
+    // hasLaunchedRepo normalizes both sides (lowercase, strips github.com/.git/trailing slash)
+    return !hasLaunchedRepo(cacheKey, selectedRepo.name)
+    // launchedRepoUrls in deps so this recomputes after addLaunchedRepo
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRepo, launchedRepoUrls, cacheKey])
+
+  const allVulnerabilityIds = useMemo(
+    () => vulnerabilityCheckOptions.map((o) => o.id) as string[],
+    [],
+  )
+
   useEffect(() => {
     if (repos.length === 0) return
     if (!selectedRepoId || !repos.some((repo) => repo.id === selectedRepoId)) {
@@ -117,6 +146,36 @@ export function NewPipelinePage() {
       setSelectedBranch(first.branches[0] ?? '')
     }
   }, [repos, selectedRepoId])
+
+  useEffect(() => {
+    if (isFirstRunForRepo) {
+      setSelectedVulnerabilityIds(allVulnerabilityIds)
+    }
+  }, [isFirstRunForRepo, allVulnerabilityIds])
+
+  // One-time migration: register repos of previously-run jobs as launched
+  // so users who ran pipelines before this feature don't see the forced state.
+  useEffect(() => {
+    if (!token) return
+    const trackedIds = getTrackedJobIds(cacheKey)
+    if (trackedIds.length === 0) return
+    if (getLaunchedRepos(cacheKey).length > 0) return
+
+    let cancelled = false
+    fetchJobsByIds(token, trackedIds)
+      .then((jobs) => {
+        if (cancelled) return
+        let next: string[] = []
+        for (const job of jobs) {
+          if (job.repoName) next = addLaunchedRepo(cacheKey, job.repoName)
+        }
+        if (next.length > 0) setLaunchedRepoUrls(next)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [token, cacheKey])
 
   const toggleVulnerabilityOption = (optionId: string, checked: boolean | 'indeterminate') => {
     setSelectedVulnerabilityIds((prev) => {
@@ -263,10 +322,26 @@ export function NewPipelinePage() {
             <hr className="my-4 border-[#404040]" />
 
             <div className="space-y-3">
+              {isFirstRunForRepo ? (
+                <div className="flex items-start gap-2 rounded-lg border border-[#3ECF8E]/40 bg-[#065F46]/20 p-3 text-[12px] text-[#A7F3D0]">
+                  <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <div>
+                    <p className="font-semibold text-[#D1FAE5]">이 레포지토리의 첫 파이프라인 실행입니다.</p>
+                    <p className="mt-1 text-[#A7F3D0]">
+                      베이스라인 보안 평가를 위해 전체 검사 항목으로 진행됩니다. 다음 실행부터는 항목을 자유롭게 선택할 수 있어요.
+                    </p>
+                  </div>
+                </div>
+              ) : null}
+
               <div className="rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
                 <div className="flex items-center justify-between">
                   <p className="text-[13px] font-semibold text-[#D1D5DB]">취약점 검사 항목 선택</p>
-                  <p className="text-[12px] text-[#6B7280]">{selectedVulnerabilityIds.length}개 선택</p>
+                  <p className="text-[12px] text-[#6B7280]">
+                    {isFirstRunForRepo
+                      ? `전체 ${allVulnerabilityIds.length}개 자동 선택`
+                      : `${selectedVulnerabilityIds.length}개 선택`}
+                  </p>
                 </div>
 
                 <div className="mt-3 grid gap-2 sm:grid-cols-2">
@@ -274,12 +349,17 @@ export function NewPipelinePage() {
                     <label
                       key={option.id}
                       htmlFor={option.id}
-                      className="flex cursor-pointer items-start gap-2 rounded-md border border-[#2F2F2F] bg-[#171717] p-2.5 hover:border-[#3ECF8E]/50"
+                      className={`flex items-start gap-2 rounded-md border border-[#2F2F2F] bg-[#171717] p-2.5 ${
+                        isFirstRunForRepo
+                          ? 'cursor-not-allowed opacity-60'
+                          : 'cursor-pointer hover:border-[#3ECF8E]/50'
+                      }`}
                     >
                       <Checkbox
                         id={option.id}
                         checked={selectedVulnerabilityIds.includes(option.id)}
                         onCheckedChange={(checked) => toggleVulnerabilityOption(option.id, checked)}
+                        disabled={isFirstRunForRepo}
                         className="mt-0.5"
                       />
                       <div>
@@ -294,24 +374,73 @@ export function NewPipelinePage() {
           </Card>
         ) : null}
 
+        {startError ? (
+          <p className="rounded-lg border border-[#7F1D1D] bg-[#450A0A]/40 p-3 text-center text-sm text-[#FCA5A5]">
+            {startError}
+          </p>
+        ) : null}
+
         <div className="flex justify-end gap-3">
-          <Button variant="outline" onClick={() => navigate('/dashboard')}>
+          <Button
+            variant="outline"
+            onClick={() => navigate('/dashboard')}
+            disabled={isStarting}
+          >
             취소
           </Button>
           <Button
-            onClick={() =>
-              navigate('/pipeline/progress', {
-                state: {
-                  repoName: selectedRepo?.name ?? 'myuser/web-app',
-                  branch: selectedBranch,
-                  selectedChecks: selectedVulnerabilityTitles,
-                },
-              })
-            }
+            onClick={async () => {
+              if (!selectedRepo || !token) return
+              setStartError(null)
+              setIsStarting(true)
+              try {
+                const checksToSend = isFirstRunForRepo
+                  ? allVulnerabilityIds
+                  : selectedVulnerabilityIds
+                const envVars =
+                  checksToSend.length > 0
+                    ? {
+                        SELECTED_CHECKS: checksToSend.join(','),
+                        IS_FIRST_RUN: isFirstRunForRepo ? 'true' : 'false',
+                      }
+                    : undefined
+                const repoUrlToSend =
+                  selectedRepo.repositoryUrl || `https://github.com/${selectedRepo.name}`
+                const { jobId } = await startPipeline(token, {
+                  repoUrl: repoUrlToSend,
+                  branch: selectedBranch || undefined,
+                  triggerSource: 'windows-api',
+                  envVars,
+                })
+                if (!jobId) throw new Error('서버가 job_id를 반환하지 않았습니다.')
+                addTrackedJobId(cacheKey, jobId)
+                const nextLaunched = addLaunchedRepo(cacheKey, selectedRepo.name)
+                setLaunchedRepoUrls(nextLaunched)
+                navigate('/pipeline/progress', {
+                  state: {
+                    jobId,
+                    repoName: selectedRepo.name,
+                    branch: selectedBranch,
+                    selectedChecks: selectedVulnerabilityTitles,
+                  },
+                })
+              } catch (error) {
+                setStartError(
+                  error instanceof Error ? error.message : '파이프라인을 시작하지 못했습니다.',
+                )
+              } finally {
+                setIsStarting(false)
+              }
+            }}
             className="bg-[#34D399] text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
-            disabled={!selectedRepo}
+            disabled={!selectedRepo || !token || isStarting}
           >
-            <Play className="mr-1 h-4 w-4" /> 파이프라인 실행
+            {isStarting ? (
+              <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+            ) : (
+              <Play className="mr-1 h-4 w-4" />
+            )}
+            {isStarting ? '시작 중...' : '파이프라인 실행'}
           </Button>
         </div>
       </section>

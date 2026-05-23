@@ -95,6 +95,364 @@ export async function fetchBranches(
     .filter(Boolean)
 }
 
+export type JobStatus = 'queued' | 'running' | 'success' | 'failed' | 'cancelled'
+
+export type JobVerdict = 'passed' | 'warning' | 'failed'
+
+export type SecuritySeverity = 'critical' | 'high' | 'medium' | 'low'
+
+export type SecuritySummaryItem = {
+  scanner: string
+  count: number
+  critical: number
+  high: number
+  medium: number
+  low: number
+}
+
+export type JobStep = {
+  stepId: string
+  stepName: string
+  stepType: string
+  status: 'pending' | 'running' | 'success' | 'failed' | 'skipped'
+  errorMessage: string | null
+  startedAt: string | null
+  endedAt: string | null
+  durationSecs: number | null
+}
+
+export type JobDetail = {
+  jobId: string
+  repoUrl: string
+  repoName: string
+  branch: string
+  triggerSource: string
+  status: JobStatus
+  overallResult: string | null
+  createdAt: string | null
+  startedAt: string | null
+  completedAt: string | null
+  durationSecs: number
+  steps: JobStep[]
+  verdict: JobVerdict | null
+  verdictReason: string | null
+  totalFindings: number
+  severityCounts: Record<SecuritySeverity, number>
+  summaries: SecuritySummaryItem[]
+  securityScore: number
+}
+
+function repoNameFromUrl(url: string): string {
+  if (!url) return ''
+  try {
+    const parsed = new URL(url)
+    return parsed.pathname.replace(/^\/+|\.git$|\/+$/g, '')
+  } catch {
+    return url.replace(/^https?:\/\/[^/]+\//, '').replace(/\.git$|\/+$/g, '')
+  }
+}
+
+function durationBetween(start: string | null, end: string | null): number {
+  if (!start || !end) return 0
+  const startMs = Date.parse(start)
+  const endMs = Date.parse(end)
+  if (Number.isNaN(startMs) || Number.isNaN(endMs)) return 0
+  return Math.max(0, Math.round((endMs - startMs) / 1000))
+}
+
+export function computeSecurityScore(counts: Record<SecuritySeverity, number>): number {
+  const penalty =
+    counts.critical * 15 + counts.high * 5 + counts.medium * 2 + counts.low * 0.5
+  return Math.max(0, Math.min(100, Math.round(100 - penalty)))
+}
+
+function aggregateSeverity(summaries: SecuritySummaryItem[]): Record<SecuritySeverity, number> {
+  return summaries.reduce<Record<SecuritySeverity, number>>(
+    (acc, item) => {
+      acc.critical += item.critical ?? 0
+      acc.high += item.high ?? 0
+      acc.medium += item.medium ?? 0
+      acc.low += item.low ?? 0
+      return acc
+    },
+    { critical: 0, high: 0, medium: 0, low: 0 },
+  )
+}
+
+function mapStep(raw: UnknownRecord): JobStep {
+  return {
+    stepId: pick<string>(raw, 'step_id', 'stepId') ?? '',
+    stepName: pick<string>(raw, 'step_name', 'stepName') ?? '',
+    stepType: pick<string>(raw, 'step_type', 'stepType') ?? '',
+    status:
+      (pick<JobStep['status']>(raw, 'status') as JobStep['status']) ?? 'pending',
+    errorMessage: pick<string>(raw, 'error_message', 'errorMessage') ?? null,
+    startedAt: pick<string>(raw, 'started_at', 'startedAt') ?? null,
+    endedAt: pick<string>(raw, 'ended_at', 'endedAt', 'finished_at', 'finishedAt') ?? null,
+    durationSecs: pick<number>(raw, 'duration_secs', 'durationSecs') ?? null,
+  }
+}
+
+function mapJobDetail(raw: UnknownRecord): JobDetail {
+  const job = (pick<UnknownRecord>(raw, 'job') ?? raw) as UnknownRecord
+  const security = (pick<UnknownRecord>(raw, 'security') ?? {}) as UnknownRecord
+  const verdictRaw = (pick<UnknownRecord>(security, 'verdict') ?? {}) as UnknownRecord
+  const summariesRaw = (pick<unknown[]>(security, 'summaries') ?? []) as UnknownRecord[]
+  const stepsRaw = (pick<unknown[]>(raw, 'steps') ?? []) as UnknownRecord[]
+
+  const summaries: SecuritySummaryItem[] = summariesRaw.map((item) => ({
+    scanner: pick<string>(item, 'scanner') ?? '',
+    count: pick<number>(item, 'count') ?? 0,
+    critical: pick<number>(item, 'critical') ?? 0,
+    high: pick<number>(item, 'high') ?? 0,
+    medium: pick<number>(item, 'medium') ?? 0,
+    low: pick<number>(item, 'low') ?? 0,
+  }))
+
+  const severityCounts = aggregateSeverity(summaries)
+  const totalFindings = pick<number>(verdictRaw, 'total_findings', 'totalFindings') ?? 0
+  const startedAt = pick<string>(job, 'started_at', 'startedAt') ?? null
+  const completedAt = pick<string>(job, 'completed_at', 'completedAt') ?? null
+  const apiDuration = pick<number>(job, 'duration_secs', 'durationSecs')
+  const durationSecs =
+    typeof apiDuration === 'number' && apiDuration > 0
+      ? apiDuration
+      : durationBetween(startedAt, completedAt)
+  const repoUrl = pick<string>(job, 'repo_url', 'repoUrl') ?? ''
+
+  return {
+    jobId: pick<string>(job, 'job_id', 'jobId') ?? '',
+    repoUrl,
+    repoName: repoNameFromUrl(repoUrl),
+    branch: pick<string>(job, 'branch') ?? '',
+    triggerSource: pick<string>(job, 'trigger_source', 'triggerSource') ?? '',
+    status: (pick<JobStatus>(job, 'status') as JobStatus) ?? 'queued',
+    overallResult: pick<string>(job, 'overall_result', 'overallResult') ?? null,
+    createdAt: pick<string>(job, 'created_at', 'createdAt') ?? null,
+    startedAt,
+    completedAt,
+    durationSecs,
+    steps: stepsRaw.map(mapStep),
+    verdict: (pick<JobVerdict>(verdictRaw, 'overall_status', 'overallStatus') as JobVerdict) ?? null,
+    verdictReason: pick<string>(verdictRaw, 'status_reason', 'statusReason') ?? null,
+    totalFindings,
+    severityCounts,
+    summaries,
+    securityScore: computeSecurityScore(severityCounts),
+  }
+}
+
+export async function fetchJobDetail(token: string, jobId: string): Promise<JobDetail | null> {
+  const res = await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+
+  if (res.status === 404) return null
+
+  if (!res.ok) {
+    console.error('[api] /api/jobs failed:', res.status)
+    throw new Error(`Failed to fetch job ${jobId} (${res.status})`)
+  }
+
+  return mapJobDetail((await res.json()) as UnknownRecord)
+}
+
+export type StartPipelinePayload = {
+  repoUrl: string
+  branch?: string
+  triggerSource?: string
+  envVars?: Record<string, string>
+}
+
+export type StartPipelineResponse = {
+  jobId: string
+  status: string
+  message: string
+}
+
+export async function startPipeline(
+  token: string,
+  payload: StartPipelinePayload,
+): Promise<StartPipelineResponse> {
+  const body: UnknownRecord = { repo_url: payload.repoUrl }
+  if (payload.branch) body.branch = payload.branch
+  if (payload.triggerSource) body.trigger_source = payload.triggerSource
+  if (payload.envVars && Object.keys(payload.envVars).length > 0) {
+    body.env_vars = payload.envVars
+  }
+
+  const res = await fetch(`${API_BASE}/start-pipeline`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  })
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    console.error('[api] /start-pipeline failed:', res.status, text)
+    let detail = ''
+    try {
+      const parsed = JSON.parse(text) as UnknownRecord
+      detail = pick<string>(parsed, 'detail', 'message') ?? ''
+    } catch {
+      detail = text
+    }
+    throw new Error(
+      detail
+        ? `파이프라인 시작 실패 (${res.status}): ${detail}`
+        : `파이프라인 시작 실패 (${res.status})`,
+    )
+  }
+
+  const data = (await res.json()) as UnknownRecord
+  return {
+    jobId: pick<string>(data, 'job_id', 'jobId') ?? '',
+    status: pick<string>(data, 'status') ?? '',
+    message: pick<string>(data, 'message') ?? '',
+  }
+}
+
+export async function fetchPipelineLogs(
+  token: string,
+  jobId: string,
+): Promise<string[]> {
+  const res = await fetch(
+    `${API_BASE}/pipeline-logs?job_id=${encodeURIComponent(jobId)}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  )
+
+  if (!res.ok) {
+    console.error('[api] /pipeline-logs failed:', res.status)
+    return []
+  }
+
+  const data = (await res.json()) as UnknownRecord
+  const lines = pick<unknown[]>(data, 'lines')
+  return Array.isArray(lines) ? (lines as string[]) : []
+}
+
+export async function fetchPipelineSteps(
+  token: string,
+  jobId: string,
+): Promise<JobStep[]> {
+  const res = await fetch(
+    `${API_BASE}/pipeline-steps?job_id=${encodeURIComponent(jobId)}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  )
+
+  if (!res.ok) {
+    console.error('[api] /pipeline-steps failed:', res.status)
+    return []
+  }
+
+  const data = (await res.json()) as UnknownRecord
+  const steps = pick<unknown[]>(data, 'steps')
+  return Array.isArray(steps) ? (steps as UnknownRecord[]).map(mapStep) : []
+}
+
+export async function fetchJobsByIds(
+  token: string,
+  jobIds: string[],
+): Promise<JobDetail[]> {
+  const results = await Promise.all(
+    jobIds.map(async (id) => {
+      try {
+        return await fetchJobDetail(token, id)
+      } catch (error) {
+        console.error(`[api] failed to fetch job ${id}:`, error)
+        return null
+      }
+    }),
+  )
+  return results.filter((job): job is JobDetail => job !== null)
+}
+
+const JOB_TRACK_PREFIX = 'secupipeline:jobs:'
+
+export function getTrackedJobIds(key: string): string[] {
+  try {
+    const raw = localStorage.getItem(JOB_TRACK_PREFIX + key)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as { ids?: string[] }
+    return Array.isArray(parsed.ids) ? parsed.ids : []
+  } catch {
+    return []
+  }
+}
+
+function writeTrackedJobIds(key: string, ids: string[]): void {
+  try {
+    localStorage.setItem(JOB_TRACK_PREFIX + key, JSON.stringify({ ids }))
+  } catch {
+    // storage quota or unavailable — ignore
+  }
+}
+
+export function addTrackedJobId(key: string, jobId: string): string[] {
+  const ids = getTrackedJobIds(key)
+  if (ids.includes(jobId)) return ids
+  const next = [jobId, ...ids]
+  writeTrackedJobIds(key, next)
+  return next
+}
+
+export function removeTrackedJobId(key: string, jobId: string): string[] {
+  const next = getTrackedJobIds(key).filter((id) => id !== jobId)
+  writeTrackedJobIds(key, next)
+  return next
+}
+
+const LAUNCHED_REPOS_PREFIX = 'secupipeline:launched-repos:'
+
+function normalizeRepoKey(raw: string): string {
+  if (!raw) return ''
+  let key = raw.trim().toLowerCase()
+  key = key.replace(/^https?:\/\/(www\.)?github\.com\//, '')
+  key = key.replace(/\.git$/, '')
+  key = key.replace(/\/+$/, '')
+  return key
+}
+
+export function getLaunchedRepos(cacheKey: string): string[] {
+  try {
+    const raw = localStorage.getItem(LAUNCHED_REPOS_PREFIX + cacheKey)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as { urls?: string[]; keys?: string[] }
+    const list = parsed.keys ?? parsed.urls ?? []
+    return Array.isArray(list) ? list.map(normalizeRepoKey).filter(Boolean) : []
+  } catch {
+    return []
+  }
+}
+
+export function hasLaunchedRepo(cacheKey: string, repoIdentifier: string): boolean {
+  const target = normalizeRepoKey(repoIdentifier)
+  if (!target) return false
+  return getLaunchedRepos(cacheKey).includes(target)
+}
+
+export function addLaunchedRepo(cacheKey: string, repoIdentifier: string): string[] {
+  const normalized = normalizeRepoKey(repoIdentifier)
+  if (!normalized) return getLaunchedRepos(cacheKey)
+  const list = getLaunchedRepos(cacheKey)
+  if (list.includes(normalized)) return list
+  const next = [...list, normalized]
+  try {
+    localStorage.setItem(LAUNCHED_REPOS_PREFIX + cacheKey, JSON.stringify({ keys: next }))
+  } catch {
+    // ignore
+  }
+  return next
+}
+
+// Back-compat aliases (kept so existing imports keep compiling)
+export const getLaunchedRepoUrls = getLaunchedRepos
+export const hasLaunchedRepoBefore = hasLaunchedRepo
+export const addLaunchedRepoUrl = addLaunchedRepo
+
 const REPO_CACHE_PREFIX = 'secupipeline:repos:'
 
 export function getCachedRepos(key: string): RepositoryItem[] | null {

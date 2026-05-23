@@ -9,6 +9,7 @@ import {
   House,
   Loader2,
   Minus,
+  RotateCw,
   Square,
   UserRound,
   X,
@@ -223,6 +224,14 @@ export function NativeFrameBar() {
             className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70"
           >
             <House className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            aria-label="새로고침"
+            onClick={() => window.location.reload()}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70"
+          >
+            <RotateCw className="h-4 w-4" />
           </button>
           <button
             type="button"
