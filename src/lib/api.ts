@@ -7,6 +7,33 @@ const API_BASE =
 
 type UnknownRecord = Record<string, unknown>
 
+export class AuthExpiredError extends Error {
+  readonly status: number
+  readonly detail: string
+  constructor(detail: string, status = 401) {
+    super(detail || '인증이 만료되었습니다. 다시 로그인해 주세요.')
+    this.name = 'AuthExpiredError'
+    this.status = status
+    this.detail = detail
+  }
+}
+
+export class PipelineConflictError extends Error {
+  readonly status = 409
+  readonly detail: string
+  readonly existingJobId: string | null
+  constructor(detail: string, existingJobId: string | null) {
+    super(detail || '이미 실행 중인 파이프라인이 있습니다.')
+    this.name = 'PipelineConflictError'
+    this.detail = detail
+    this.existingJobId = existingJobId
+  }
+}
+
+function isGithubTokenMissing(detail: string): boolean {
+  return /github access token not in cache|please log in again/i.test(detail)
+}
+
 function pick<T = unknown>(obj: UnknownRecord, ...keys: string[]): T | undefined {
   for (const key of keys) {
     const value = obj[key]
@@ -69,6 +96,16 @@ export async function fetchRepos(token: string): Promise<RepositoryItem[]> {
   if (!res.ok) {
     const text = await res.text().catch(() => '')
     console.error('[api] /repos failed:', res.status, text)
+    let detail = ''
+    try {
+      const parsed = JSON.parse(text) as UnknownRecord
+      detail = pick<string>(parsed, 'detail', 'message') ?? ''
+    } catch {
+      detail = text
+    }
+    if (res.status === 401 || isGithubTokenMissing(detail)) {
+      throw new AuthExpiredError(detail || 'GitHub 인증이 만료되었습니다. 다시 로그인해 주세요.')
+    }
     throw new Error(`Failed to fetch repos (${res.status})`)
   }
 
@@ -281,7 +318,7 @@ export async function startPipeline(
     body.env_vars = payload.envVars
   }
 
-  const res = await fetch(`${API_BASE}/start-pipeline`, {
+  const res = await fetch(`${API_BASE}/api/pipelines`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -292,13 +329,21 @@ export async function startPipeline(
 
   if (!res.ok) {
     const text = await res.text().catch(() => '')
-    console.error('[api] /start-pipeline failed:', res.status, text)
+    console.error('[api] /api/pipelines failed:', res.status, text)
     let detail = ''
+    let parsed: UnknownRecord | null = null
     try {
-      const parsed = JSON.parse(text) as UnknownRecord
+      parsed = JSON.parse(text) as UnknownRecord
       detail = pick<string>(parsed, 'detail', 'message') ?? ''
     } catch {
       detail = text
+    }
+    if (res.status === 409) {
+      const existingJobId =
+        (parsed
+          ? pick<string>(parsed, 'existing_job_id', 'existingJobId', 'job_id', 'jobId')
+          : undefined) ?? null
+      throw new PipelineConflictError(detail, existingJobId)
     }
     throw new Error(
       detail
@@ -315,17 +360,87 @@ export async function startPipeline(
   }
 }
 
+export type CancelPipelineResponse = {
+  jobId: string
+  status: string
+  message: string
+}
+
+export async function cancelPipeline(
+  token: string,
+  jobId: string,
+): Promise<CancelPipelineResponse> {
+  const res = await fetch(
+    `${API_BASE}/api/pipelines/${encodeURIComponent(jobId)}/cancel`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    },
+  )
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    console.error('[api] /api/pipelines/{id}/cancel failed:', res.status, text)
+    let detail = ''
+    try {
+      const parsed = JSON.parse(text) as UnknownRecord
+      detail = pick<string>(parsed, 'detail', 'message') ?? ''
+    } catch {
+      detail = text
+    }
+    throw new Error(
+      detail
+        ? `파이프라인 취소 실패 (${res.status}): ${detail}`
+        : `파이프라인 취소 실패 (${res.status})`,
+    )
+  }
+
+  const data = (await res.json()) as UnknownRecord
+  return {
+    jobId: pick<string>(data, 'job_id', 'jobId') ?? jobId,
+    status: pick<string>(data, 'status') ?? 'cancelled',
+    message: pick<string>(data, 'message') ?? '',
+  }
+}
+
+export async function deletePipeline(token: string, jobId: string): Promise<void> {
+  const res = await fetch(
+    `${API_BASE}/api/pipelines/${encodeURIComponent(jobId)}`,
+    {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    },
+  )
+
+  if (!res.ok && res.status !== 204) {
+    const text = await res.text().catch(() => '')
+    console.error('[api] DELETE /api/pipelines/{id} failed:', res.status, text)
+    let detail = ''
+    try {
+      const parsed = JSON.parse(text) as UnknownRecord
+      detail = pick<string>(parsed, 'detail', 'message') ?? ''
+    } catch {
+      detail = text
+    }
+    throw new Error(
+      detail
+        ? `파이프라인 삭제 실패 (${res.status}): ${detail}`
+        : `파이프라인 삭제 실패 (${res.status})`,
+    )
+  }
+}
+
 export async function fetchPipelineLogs(
   token: string,
   jobId: string,
 ): Promise<string[]> {
   const res = await fetch(
-    `${API_BASE}/pipeline-logs?job_id=${encodeURIComponent(jobId)}`,
+    `${API_BASE}/api/pipelines/${encodeURIComponent(jobId)}/logs`,
     { headers: { Authorization: `Bearer ${token}` } },
   )
 
   if (!res.ok) {
-    console.error('[api] /pipeline-logs failed:', res.status)
+    console.error('[api] /api/pipelines/{id}/logs failed:', res.status)
     return []
   }
 
@@ -339,12 +454,12 @@ export async function fetchPipelineSteps(
   jobId: string,
 ): Promise<JobStep[]> {
   const res = await fetch(
-    `${API_BASE}/pipeline-steps?job_id=${encodeURIComponent(jobId)}`,
+    `${API_BASE}/api/pipelines/${encodeURIComponent(jobId)}/steps`,
     { headers: { Authorization: `Bearer ${token}` } },
   )
 
   if (!res.ok) {
-    console.error('[api] /pipeline-steps failed:', res.status)
+    console.error('[api] /api/pipelines/{id}/steps failed:', res.status)
     return []
   }
 

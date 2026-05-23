@@ -28,18 +28,23 @@ export function Footer() {
             <h4 className="font-semibold text-gray-50">문서</h4>
             <ul className="mt-3 space-y-2 text-sm text-gray-200">
               <li>
-                <Link to="/docs" className="hover:text-green-300">
-                  시작 가이드
+                <Link to="/docs#getting-started" className="hover:text-green-300">
+                  시작하기
                 </Link>
               </li>
               <li>
-                <Link to="/docs" className="hover:text-green-300">
-                  API 권한 안내
+                <Link to="/docs#usage" className="hover:text-green-300">
+                  사용 가이드
                 </Link>
               </li>
               <li>
-                <Link to="/docs" className="hover:text-green-300">
-                  보안 스캔 정책
+                <Link to="/docs#security-checks" className="hover:text-green-300">
+                  보안 검사 항목
+                </Link>
+              </li>
+              <li>
+                <Link to="/docs#pipeline-steps" className="hover:text-green-300">
+                  파이프라인 단계
                 </Link>
               </li>
             </ul>
@@ -49,13 +54,18 @@ export function Footer() {
             <h4 className="font-semibold text-gray-50">지원</h4>
             <ul className="mt-3 space-y-2 text-sm text-gray-200">
               <li>
-                <Link to="/docs" className="hover:text-green-300">
-                  개인정보처리방침
+                <Link to="/docs#scoring" className="hover:text-green-300">
+                  보안 점수 & 등급
                 </Link>
               </li>
               <li>
-                <Link to="/docs" className="hover:text-green-300">
-                  이용약관
+                <Link to="/docs#troubleshooting" className="hover:text-green-300">
+                  자주 묻는 질문
+                </Link>
+              </li>
+              <li>
+                <Link to="/docs#architecture" className="hover:text-green-300">
+                  아키텍처
                 </Link>
               </li>
               <li>

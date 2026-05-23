@@ -22,6 +22,7 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { useAuth } from '@/contexts/AuthContext'
 import {
+  cancelPipeline,
   fetchJobDetail,
   fetchPipelineLogs,
   type JobDetail,
@@ -140,6 +141,7 @@ export function PipelineProcessPage() {
   const [error, setError] = useState<string | null>(null)
   const [, setIsInitialLoading] = useState(true)
   const [elapsedSec, setElapsedSec] = useState(0)
+  const [isCancelling, setIsCancelling] = useState(false)
 
   const logContainerRef = useRef<HTMLDivElement | null>(null)
   const lastLogCount = useRef(0)
@@ -283,6 +285,23 @@ export function PipelineProcessPage() {
       if (iconForStep(proxy) === stepIcon) return lines
     }
     return []
+  }
+
+  async function handleCancel() {
+    if (!token || !jobId || isCancelling) return
+    const ok = window.confirm('실행 중인 파이프라인을 취소할까요? 진행 중인 작업은 즉시 종료됩니다.')
+    if (!ok) return
+    setIsCancelling(true)
+    try {
+      await cancelPipeline(token, jobId)
+      const refreshed = await fetchJobDetail(token, jobId)
+      if (refreshed) setJob(refreshed)
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '파이프라인 취소에 실패했습니다.')
+    } finally {
+      setIsCancelling(false)
+    }
   }
 
   const steps: JobStep[] = useMemo(() => {
@@ -463,7 +482,16 @@ export function PipelineProcessPage() {
           </div>
         </Card>
 
-        <div className="flex justify-end pt-1">
+        <div className="flex justify-end gap-2 pt-1">
+          {!isTerminal ? (
+            <Button
+              onClick={handleCancel}
+              disabled={isCancelling}
+              className="border border-[#7F1D1D] bg-transparent text-[#FCA5A5] shadow-none hover:bg-[#450A0A]/40"
+            >
+              {isCancelling ? '취소 중...' : '파이프라인 취소'}
+            </Button>
+          ) : null}
           <Button
             onClick={() =>
               navigate('/pipeline/result', {

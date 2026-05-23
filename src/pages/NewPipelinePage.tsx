@@ -13,15 +13,26 @@ import { useAuth } from '@/contexts/AuthContext'
 import {
   addLaunchedRepo,
   addTrackedJobId,
+  AuthExpiredError,
+  cancelPipeline,
   fetchJobsByIds,
   fetchReposWithBranches,
   getCachedRepos,
   getLaunchedRepos,
   getTrackedJobIds,
   hasLaunchedRepo,
+  PipelineConflictError,
   setCachedRepos,
   startPipeline,
 } from '@/lib/api'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { getLanguageColor } from '@/lib/languageColors'
 import type { RepositoryItem } from '@/data/repositories'
 
@@ -60,7 +71,7 @@ const vulnerabilityCheckOptions = [
 
 export function NewPipelinePage() {
   const navigate = useNavigate()
-  const { token } = useAuth()
+  const { token, logout } = useAuth()
   const cacheKey = token ? token.slice(0, 16) : 'anonymous'
   const [search, setSearch] = useState('')
   const [repos, setRepos] = useState<RepositoryItem[]>(
@@ -82,6 +93,11 @@ export function NewPipelinePage() {
   )
   const [isStarting, setIsStarting] = useState(false)
   const [startError, setStartError] = useState<string | null>(null)
+  const [conflictDialog, setConflictDialog] = useState<{
+    existingJobId: string | null
+    detail: string
+  } | null>(null)
+  const [isResolvingConflict, setIsResolvingConflict] = useState(false)
 
   useEffect(() => {
     if (!token) {
@@ -100,11 +116,16 @@ export function NewPipelinePage() {
         }
       })
       .catch((error: unknown) => {
-        if (mounted) {
-          setReposError(
-            error instanceof Error ? error.message : '레포지토리를 불러오지 못했습니다.',
-          )
+        if (!mounted) return
+        if (error instanceof AuthExpiredError) {
+          console.warn('[NewPipelinePage] auth expired — redirecting to login')
+          logout()
+          navigate('/auth', { replace: true })
+          return
         }
+        setReposError(
+          error instanceof Error ? error.message : '레포지토리를 불러오지 못했습니다.',
+        )
       })
       .finally(() => {
         if (mounted) {
@@ -189,6 +210,78 @@ export function NewPipelinePage() {
   const selectedVulnerabilityTitles = vulnerabilityCheckOptions
     .filter((option) => selectedVulnerabilityIds.includes(option.id))
     .map((option) => option.title)
+
+  async function handleStartPipeline() {
+    if (!selectedRepo || !token) return
+    setStartError(null)
+    setIsStarting(true)
+    try {
+      const checksToSend = isFirstRunForRepo
+        ? allVulnerabilityIds
+        : selectedVulnerabilityIds
+      const envVars =
+        checksToSend.length > 0
+          ? {
+              SELECTED_CHECKS: checksToSend.join(','),
+              IS_FIRST_RUN: isFirstRunForRepo ? 'true' : 'false',
+            }
+          : undefined
+      const repoUrlToSend =
+        selectedRepo.repositoryUrl || `https://github.com/${selectedRepo.name}`
+      const { jobId } = await startPipeline(token, {
+        repoUrl: repoUrlToSend,
+        branch: selectedBranch || undefined,
+        triggerSource: 'windows-api',
+        envVars,
+      })
+      if (!jobId) throw new Error('서버가 job_id를 반환하지 않았습니다.')
+      addTrackedJobId(cacheKey, jobId)
+      const nextLaunched = addLaunchedRepo(cacheKey, selectedRepo.name)
+      setLaunchedRepoUrls(nextLaunched)
+      navigate('/pipeline/progress', {
+        state: {
+          jobId,
+          repoName: selectedRepo.name,
+          branch: selectedBranch,
+          selectedChecks: selectedVulnerabilityTitles,
+        },
+      })
+    } catch (error) {
+      if (error instanceof PipelineConflictError) {
+        setConflictDialog({
+          existingJobId: error.existingJobId,
+          detail: error.detail,
+        })
+        return
+      }
+      setStartError(
+        error instanceof Error ? error.message : '파이프라인을 시작하지 못했습니다.',
+      )
+    } finally {
+      setIsStarting(false)
+    }
+  }
+
+  async function handleConfirmConflict() {
+    if (!conflictDialog || !token) return
+    setIsResolvingConflict(true)
+    try {
+      if (conflictDialog.existingJobId) {
+        await cancelPipeline(token, conflictDialog.existingJobId)
+      }
+      setConflictDialog(null)
+      await handleStartPipeline()
+    } catch (error) {
+      setStartError(
+        error instanceof Error
+          ? error.message
+          : '기존 파이프라인 취소에 실패했습니다.',
+      )
+      setConflictDialog(null)
+    } finally {
+      setIsResolvingConflict(false)
+    }
+  }
 
   return (
     <MainLayout>
@@ -389,49 +482,7 @@ export function NewPipelinePage() {
             취소
           </Button>
           <Button
-            onClick={async () => {
-              if (!selectedRepo || !token) return
-              setStartError(null)
-              setIsStarting(true)
-              try {
-                const checksToSend = isFirstRunForRepo
-                  ? allVulnerabilityIds
-                  : selectedVulnerabilityIds
-                const envVars =
-                  checksToSend.length > 0
-                    ? {
-                        SELECTED_CHECKS: checksToSend.join(','),
-                        IS_FIRST_RUN: isFirstRunForRepo ? 'true' : 'false',
-                      }
-                    : undefined
-                const repoUrlToSend =
-                  selectedRepo.repositoryUrl || `https://github.com/${selectedRepo.name}`
-                const { jobId } = await startPipeline(token, {
-                  repoUrl: repoUrlToSend,
-                  branch: selectedBranch || undefined,
-                  triggerSource: 'windows-api',
-                  envVars,
-                })
-                if (!jobId) throw new Error('서버가 job_id를 반환하지 않았습니다.')
-                addTrackedJobId(cacheKey, jobId)
-                const nextLaunched = addLaunchedRepo(cacheKey, selectedRepo.name)
-                setLaunchedRepoUrls(nextLaunched)
-                navigate('/pipeline/progress', {
-                  state: {
-                    jobId,
-                    repoName: selectedRepo.name,
-                    branch: selectedBranch,
-                    selectedChecks: selectedVulnerabilityTitles,
-                  },
-                })
-              } catch (error) {
-                setStartError(
-                  error instanceof Error ? error.message : '파이프라인을 시작하지 못했습니다.',
-                )
-              } finally {
-                setIsStarting(false)
-              }
-            }}
+            onClick={() => void handleStartPipeline()}
             className="bg-[#34D399] text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
             disabled={!selectedRepo || !token || isStarting}
           >
@@ -444,6 +495,46 @@ export function NewPipelinePage() {
           </Button>
         </div>
       </section>
+
+      <Dialog
+        open={!!conflictDialog}
+        onOpenChange={(open) => {
+          if (!open && !isResolvingConflict) setConflictDialog(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>이미 실행 중인 파이프라인이 있어요</DialogTitle>
+            <DialogDescription>
+              {selectedRepo?.name || '이 레포'}
+              {selectedBranch ? ` (${selectedBranch})` : ''}에서 이미 파이프라인이 돌아가고 있습니다.
+              <br />
+              지금 돌고 있는 파이프라인을 취소하고 새로 실행할까요?
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setConflictDialog(null)}
+              disabled={isResolvingConflict}
+            >
+              아니오
+            </Button>
+            <Button
+              onClick={() => void handleConfirmConflict()}
+              disabled={isResolvingConflict || !conflictDialog?.existingJobId}
+              className="bg-[#34D399] text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
+            >
+              {isResolvingConflict ? '처리 중...' : '취소하고 새로 실행'}
+            </Button>
+          </DialogFooter>
+          {!conflictDialog?.existingJobId ? (
+            <p className="mt-3 text-center text-xs text-[#FCA5A5]">
+              기존 job ID를 알 수 없어 자동 취소가 불가합니다. 대시보드에서 직접 취소해 주세요.
+            </p>
+          ) : null}
+        </DialogContent>
+      </Dialog>
     </MainLayout>
   )
 }

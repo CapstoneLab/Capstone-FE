@@ -34,6 +34,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
 import { type RepositoryItem } from '@/data/repositories'
 import {
+  AuthExpiredError,
   fetchJobsByIds,
   fetchReposWithBranches,
   getCachedRepos,
@@ -130,7 +131,7 @@ const verdictMeta: Record<JobVerdict, { label: string; className: string }> = {
 
 export function DashboardPage() {
   const navigate = useNavigate()
-  const { token } = useAuth()
+  const { token, logout } = useAuth()
   const cacheKey = token ? token.slice(0, 16) : 'anonymous'
   const [activeTab, setActiveTab] = useState<'repo' | 'pipeline'>('repo')
   const [searchInput, setSearchInput] = useState('')
@@ -168,11 +169,16 @@ export function DashboardPage() {
         }
       })
       .catch((error: unknown) => {
-        if (mounted) {
-          setReposError(
-            error instanceof Error ? error.message : '레포지토리를 불러오지 못했습니다.',
-          )
+        if (!mounted) return
+        if (error instanceof AuthExpiredError) {
+          console.warn('[DashboardPage] auth expired — redirecting to login')
+          logout()
+          navigate('/auth', { replace: true })
+          return
         }
+        setReposError(
+          error instanceof Error ? error.message : '레포지토리를 불러오지 못했습니다.',
+        )
       })
       .finally(() => {
         if (mounted) {
