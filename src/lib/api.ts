@@ -363,6 +363,7 @@ export async function startPipeline(
 export type CancelPipelineResponse = {
   jobId: string
   status: string
+  killed: boolean
   message: string
 }
 
@@ -399,6 +400,7 @@ export async function cancelPipeline(
   return {
     jobId: pick<string>(data, 'job_id', 'jobId') ?? jobId,
     status: pick<string>(data, 'status') ?? 'cancelled',
+    killed: pick<boolean>(data, 'killed') ?? false,
     message: pick<string>(data, 'message') ?? '',
   }
 }

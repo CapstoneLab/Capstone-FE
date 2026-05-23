@@ -67,11 +67,12 @@
 | 1 | GET  | `/api/repos` | 사용자 GitHub 레포 목록 | X (GitHub API) |
 | 2 | GET  | `/api/repos/{owner}/{repo}/branches` | 브랜치 목록 | X (GitHub API) |
 | 3 | POST | `/api/pipelines` | **파이프라인 시작** (신규/수정 대상) | O → `/start-pipeline` |
-| 4 | GET  | `/api/jobs/{job_id}` | Job 상세 (보안 리포트 포함) | O |
+| 4 | GET  | `/api/jobs/{job_id}` | Job 상세 (요약) — **확정 대기** ⚠️ | O |
 | 5 | GET  | `/api/pipelines/{job_id}/logs` | 실시간 로그 라인 | O → `/pipeline-logs` |
 | 6 | GET  | `/api/pipelines/{job_id}/steps` | 단계별 진행 상태 | O → `/pipeline-steps` |
 | 7 | POST | `/api/pipelines/{job_id}/cancel` | **실행 중인 파이프라인 취소** | O (SSH `pkill -9 -f {job_id}`) |
 | 8 | DELETE | `/api/pipelines/{job_id}` | **Job 완전 삭제** (DB cascade + 결과파일) | O (실행 중이면 kill 선행) |
+| 9 | GET  | `/api/jobs/{job_id}/result` | **보안 분석 상세 결과** (findings 리스트, AI 제안) | O → `/pipeline-result` 또는 ubuntu push 후 DB 조회 |
 
 ---
 
@@ -124,16 +125,16 @@
 {
   "repo_url": "https://github.com/octocat/hello-world",
   "branch": "main",
-  "trigger_source": "manual",
-  "env_vars": { "NODE_ENV": "production" }
+  "trigger_source": "manual"
 }
 ```
 | 필드 | 타입 | 필수 | 설명 |
 |---|---|---|---|
 | repo_url | string | ✅ | GitHub HTTPS URL |
 | branch | string |  | 기본값: 레포 default_branch |
-| trigger_source | string |  | `manual` \| `webhook` \| `schedule` |
-| env_vars | object<string, string> |  | 러너에 전달할 환경변수 |
+| trigger_source | string |  | `manual` \| `webhook` \| `schedule` \| `windows-api` 등 (자유 문자열) |
+
+> ⚠️ **`env_vars` 필드는 백엔드 미지원**. 프론트는 envVars 옵션을 페이로드에서 제외해야 함 (현재 보내고 있지만 백엔드가 무시).
 
 **응답 202**
 ```json
@@ -161,8 +162,13 @@
 
 ---
 
-### 3.4 GET `/api/jobs/{job_id}` — Job 상세
-사용처: [src/lib/api.ts:245](../src/lib/api.ts#L245)
+### 3.4 GET `/api/jobs/{job_id}` — Job 상세 (요약)
+사용처: [src/lib/api.ts:245](../src/lib/api.ts#L245) — **PipelineProcessPage 폴링 / Dashboard 카드 핵심 의존**
+
+> ⚠️ **상태: 확정 대기**
+> 백엔드 최신 확정 명세(2026-05-24)에서 이 엔드포인트가 빠져 있음. 그러나 프론트의 진행 페이지가 **2초 주기로 호출**하여 job 전체 상태(`running`/`success`/`failed`)와 진행 단계를 가져오는 핵심 API.
+> §3.6 `/steps` 만으로는 job 전체 status(특히 `queued`, `running`) 와 메타데이터(repo_url, branch, trigger_source, created_at) 를 알 수 없음.
+> **백엔드 측에 존속 여부 확인 필요** → §6 참고.
 
 **응답 200**
 ```json
@@ -215,18 +221,21 @@
 ---
 
 ### 3.5 GET `/api/pipelines/{job_id}/logs` — 로그 라인
-사용처: [src/lib/api.ts:318](../src/lib/api.ts#L318) (현재 `/pipeline-logs?job_id=`)
-
-> ⚠️ 프론트가 쿼리스트링 방식을 쓰므로 **둘 중 하나 합의 필요**.
-> 권장: `/api/pipelines/{job_id}/logs` (REST 일관성). 합의 후 프론트도 함께 변경.
+사용처: [src/lib/api.ts:318](../src/lib/api.ts#L318)
 
 **쿼리 파라미터 (선택)**
-- `since`: ISO 8601, 이 시각 이후 라인만 반환 (롱폴링/증분 갱신용)
-- `limit`: number (기본 500)
+- `since`: ISO 8601, 이 시각 이후 라인만 반환 (롱폴링/증분 갱신용) — *백엔드 지원 여부 미확인*
+- `limit`: number — *백엔드 지원 여부 미확인*
 
 **응답 200**
 ```json
-{ "lines": ["[10:00:05] Cloning repo...", "[10:00:10] Done"] }
+{
+  "job_id": "uuid",
+  "lines": [
+    "[build.log] Building project...",
+    "[lightweight-security.log] Scanning secrets..."
+  ]
+}
 ```
 
 ---
@@ -237,8 +246,18 @@
 **응답 200**
 ```json
 {
+  "job_id": "uuid",
   "steps": [
-    { "step_id": "checkout", "step_name": "Checkout", "step_type": "git", "status": "success", "started_at": "...", "ended_at": "...", "duration_secs": 5, "error_message": null }
+    {
+      "step_id": "uuid",
+      "step_name": "build",
+      "step_type": "build",
+      "status": "success",
+      "error_message": null,
+      "started_at": "2026-05-24T10:00:00Z",
+      "ended_at": "2026-05-24T10:01:00Z",
+      "duration_secs": 60.0
+    }
   ]
 }
 ```
@@ -254,15 +273,16 @@
 **응답 200**
 ```json
 {
-  "job_id": "job_01H...",
+  "job_id": "uuid",
   "status": "cancelled",
+  "killed": true,
   "message": "파이프라인이 취소되었습니다"
 }
 ```
 
 **백엔드 내부 동작**
 1. job이 `queued` 또는 `running` 상태일 때만 허용 (그 외 → `409 Conflict`)
-2. 우분투에 SSH 접속 → `pkill -9 -f {job_id}` 실행
+2. 우분투에 SSH 접속 → `pkill -9 -f {job_id}` 실행 → `killed` 플래그로 결과 표시
 3. DB의 `status`를 `cancelled` 로 업데이트, `completed_at` 기록
 4. (선택) 현재 진행 중이던 step도 `cancelled` 마킹
 
@@ -280,9 +300,12 @@
 
 **응답 200**
 ```json
-{ "job_id": "job_01H...", "message": "삭제 완료" }
+{
+  "job_id": "uuid",
+  "deleted": true,
+  "message": "파이프라인이 삭제되었습니다"
+}
 ```
-또는 **204 No Content** (body 없이)
 
 **백엔드 내부 동작**
 1. 어떤 상태든 삭제 가능
@@ -293,6 +316,101 @@
 **에러**
 - 404: `job_id` 없음
 - 502: SSH 호출 실패 (실행 중이었을 때)
+
+---
+
+### 3.9 GET `/api/jobs/{job_id}/result` — 보안 분석 상세 결과 ★
+사용처: 보안 분석 결과 페이지(`/pipeline/result`) — 현재 프론트는 mock 데이터로 렌더링 중. 이 엔드포인트가 준비되면 실제 데이터로 교체 예정.
+
+> ⚠️ **§3.4 `GET /api/jobs/{job_id}` 와의 차이**
+> - §3.4 는 **요약** (job 메타, 단계 상태, severity 집계, verdict) 만 반환
+> - §3.9 는 **상세** (개별 finding 1건 1건의 CVE/파일경로/AI 제안 등) 를 반환
+> - 결과 페이지에서는 보통 두 API를 같이 호출 (요약 + 상세)
+
+**요청**
+- Header: `Authorization: Bearer <token>`
+- Query (선택): `?severity=critical,high` — 등급 필터, `?limit=100&offset=0` — 페이징
+
+**응답 200**
+```json
+{
+  "job_id": "job_01H...",
+  "repo_url": "https://github.com/octocat/hello-world",
+  "branch": "main",
+  "completed_at": "2026-05-23T10:03:21Z",
+
+  "scores": {
+    "security_score": 62,
+    "code_quality_score": 75
+  },
+
+  "verdict": {
+    "overall_status": "warning",
+    "status_reason": "1 critical, 4 high findings detected",
+    "total_findings": 61
+  },
+
+  "severity_summary": {
+    "critical": 4,
+    "high": 11,
+    "medium": 19,
+    "low": 27
+  },
+
+  "scanner_summaries": [
+    { "scanner": "semgrep",  "count": 50, "critical": 4, "high": 9, "medium": 15, "low": 22 },
+    { "scanner": "gitleaks", "count": 8,  "critical": 0, "high": 2, "medium": 3,  "low": 3  },
+    { "scanner": "trivy",    "count": 3,  "critical": 0, "high": 0, "medium": 1,  "low": 2  }
+  ],
+
+  "findings": [
+    {
+      "id": "uuid",
+      "scanner": "semgrep",
+      "rule_id": "python.sql-injection",
+      "cve": null,
+      "cvss": null,
+      "title": "SQL Injection",
+      "severity": "critical",
+      "file_path": "app/db.py",
+      "line_start": 42,
+      "line_end": 42,
+      "code_snippet": "query = f\"SELECT * FROM users WHERE id={user_id}\"",
+      "code_snippet_start_line": 40,
+      "description": "SQL 인젝션 취약점",
+      "ai_suggestion": "파라미터 바인딩을 사용하세요",
+      "references": []
+    }
+  ],
+
+  "pagination": {
+    "total": 61,
+    "limit": 100,
+    "offset": 0,
+    "has_more": false
+  }
+}
+```
+
+**필드 enum / 타입**
+- `severity` (findings 내): `critical` | `high` | `medium` | `low`
+- `scanner`: `semgrep` | `gitleaks` | `trivy` 등 (자유 문자열, 프론트에서 표시만)
+- `scores.*`: 0~100 정수
+- `cvss`: 문자열 (e.g. `"7.5"`) — 점수와 별개로 원본 표기 보존
+- `line_start`, `line_end`: 1-based 줄 번호
+
+**백엔드 내부 동작 (의무)**
+1. job 이 종료 상태(`success` / `failed` / `cancelled`) 일 때만 200 반환
+2. 진행 중(`queued` / `running`) → `425 Too Early` (또는 200에 `findings: []`)
+3. 결과 데이터 출처:
+   - **권장**: ubuntu가 스캔 완료 시점에 백엔드 콜백 (§4.6) 으로 push → 백엔드 DB에 저장 → 이 API는 DB에서 조회
+   - **대안**: 이 API 요청 시점에 백엔드가 ubuntu의 `/pipeline-result?job_id=X` 를 pull → 응답 가공
+4. `ai_suggestion` 은 LLM 호출로 생성 (느릴 수 있음). DB 캐시 권장.
+
+**에러**
+- 404: `job_id` 없음
+- 425 Too Early: 아직 종료되지 않은 job (스펙 합의 필요, 응답 정책 결정)
+- 502/504: ubuntu 호출 실패 (pull 모드 사용 시)
 
 ---
 
@@ -321,22 +439,145 @@
 ### 4.5 멱등성
 - `POST /api/pipelines`는 **`Idempotency-Key` 헤더 지원 권장** (네트워크 재시도로 중복 job 생성 방지)
 
+### 4.6 백엔드 ← 우분투 결과 콜백 (확정)
+
+우분투 러너는 두 가지 시점에 백엔드로 콜백을 호출함. **단일 엔드포인트**에서 `callback_type` 으로 분기.
+
+```
+[Ubuntu Runner] ──HTTP POST──► [Backend]
+                POST /get-results
+                인증: 없음 (내부 콜백, 외부 노출 금지)
+                Header: Content-Type: application/json
+```
+
+> ⚠️ `/get-results` 경로는 **외부에 노출되면 안 됨**. 방화벽으로 우분투 IP만 허용하거나, shared secret 토큰을 추가하는 게 안전.
+
+#### 4.6.1 `step_complete` — 단계 종료 시점마다 호출
+
+각 step이 끝날 때마다 우분투가 백엔드에 알림. 백엔드는 DB의 해당 step 레코드를 업데이트.
+
+```json
+{
+  "job_id": "uuid",
+  "callback_type": "step_complete",
+  "repo_url": "https://github.com/owner/repo",
+  "branch": "main",
+  "step": {
+    "name": "build",
+    "step_name": "build",
+    "status": "success",
+    "started_at": "2026-05-24T10:00:00Z",
+    "finished_at": "2026-05-24T10:01:00Z",
+    "duration_secs": 60
+  }
+}
+```
+
+#### 4.6.2 `pipeline_complete` — 파이프라인 전체 종료 시 1회 호출
+
+전체 실행이 끝나면 우분투가 최종 결과 (steps, logs, findings 전부) 를 한 번에 push. 백엔드는 이를 DB에 저장해 §3.9 응답에 사용.
+
+```json
+{
+  "job_id": "uuid",
+  "callback_type": "pipeline_complete",
+  "repo_url": "https://github.com/owner/repo",
+  "branch": "main",
+  "status": "success",
+  "started_at": "2026-05-24T10:00:00Z",
+  "ended_at": "2026-05-24T10:05:00Z",
+  "steps": [
+    {
+      "name": "build",
+      "status": "success",
+      "started_at": "2026-05-24T10:00:00Z",
+      "finished_at": "2026-05-24T10:01:00Z",
+      "duration_secs": 60
+    }
+  ],
+  "logs": [
+    "[build.log] Building project...",
+    "[lightweight-security.log] [1] rule=aws-access-key | src/config.py:12 | leaked key"
+  ],
+  "security": {
+    "findings": [
+      {
+        "scanner_name": "gitleaks",
+        "severity": "high",
+        "rule_id": "aws-access-key",
+        "title": "AWS Access Key",
+        "file_path": "src/config.py",
+        "line_number": 12,
+        "message": "Leaked AWS key",
+        "code_snippet": "...",
+        "code_snippet_start_line": 10,
+        "ai_recommendation": "환경변수로 이동하세요"
+      }
+    ]
+  },
+  "metadata": {
+    "run_id": "run-uuid",
+    "job_id": "uuid"
+  }
+}
+```
+
+#### 콜백 데이터와 프론트 API 응답의 매핑
+
+| 콜백 필드 (ubuntu → backend) | 프론트 응답 필드 (§3.9 result) |
+|---|---|
+| `security.findings[].scanner_name` | `findings[].scanner` |
+| `security.findings[].line_number` | `findings[].line_start` (그리고 `line_end` 도 같은 값 또는 별도 계산) |
+| `security.findings[].message` | `findings[].description` |
+| `security.findings[].ai_recommendation` | `findings[].ai_suggestion` |
+| `step.finished_at` | `steps[].ended_at` |
+| `ended_at` (pipeline) | `completed_at` |
+
+> 백엔드는 callback 받아서 위 매핑대로 가공해 DB에 저장하면, 프론트가 §3.9 호출할 때 그대로 응답 가능.
+
 ---
 
 ## 5. 마이그레이션 체크리스트
 
-- [ ] 백엔드: 위 6개 엔드포인트 구현
+- [x] 백엔드: §3.1 ~ §3.8 엔드포인트 구현
+- [ ] **백엔드: §3.9 `GET /api/jobs/{id}/result` 신규 구현**
+- [ ] **백엔드: §4.6 우분투 결과 콜백 — 옵션 A(push) 또는 옵션 B(pull) 선택 후 구현**
 - [ ] 백엔드: 우분투 러너 클라이언트 모듈 분리 (`services/ubuntu_runner.py` 등)
-- [ ] 프론트: `startPipeline` URL을 `/start-pipeline` → `/api/pipelines`로 변경 ([src/lib/api.ts:284](../src/lib/api.ts#L284))
-- [ ] 프론트: `fetchPipelineLogs`, `fetchPipelineSteps` URL을 `/api/pipelines/{id}/logs`, `/api/pipelines/{id}/steps` 로 변경 (선택, 합의 시)
-- [ ] 인증 토큰 만료 처리(401 → 로그인 화면 리디렉트) E2E 확인
+- [x] 프론트: API 호출 경로를 명세대로 정리 (v0.7.0)
+- [ ] 프론트: §3.9 결과 API 연동 — 결과 페이지의 mock 데이터 제거
+- [x] 프론트: 401 자동 재로그인, 409 충돌 다이얼로그 처리 (v0.7.0)
 - [ ] 우분투 러너 다운/타임아웃 시나리오 테스트 (502/504 정상 반환 확인)
 
 ---
 
 ## 6. 합의가 필요한 결정 사항
 
-1. **로그/스텝 엔드포인트 경로**: `/pipeline-logs?job_id=` (현행) vs `/api/pipelines/{id}/logs` (REST 권장) — 어느 쪽으로?
-2. **인증 토큰**: GitHub Access Token 그대로 사용 vs 백엔드 자체 JWT 발급
-3. **실시간성**: 폴링 유지 vs SSE/WebSocket 도입 시점
-4. **Job 중복 방지**: 같은 repo+branch 동시 실행 허용 여부 → 409 정책 합의
+### 🔥 긴급 — v0.7.0 동작에 직접 영향
+
+1. **§3.4 `GET /api/jobs/{job_id}` 존속 여부**
+   - 백엔드 2026-05-24 확정 명세에서 빠짐. 하지만 프론트 진행 페이지 폴링이 이걸로 status/메타데이터를 받음.
+   - **3가지 옵션:**
+     - (a) 백엔드가 §3.4를 그대로 유지 → 프론트 변경 없음
+     - (b) §3.6 `/steps` 응답에 job summary 필드 추가 (status, repo_url, branch, started_at, completed_at, trigger_source) → 프론트 폴링 로직 단순화
+     - (c) 별도 `GET /api/pipelines/{id}` (job summary) 신설
+   - **추천**: (b) — REST 일관성 + 호출 횟수 감소
+
+2. **`env_vars` 처리** ([src/lib/api.ts:280](../src/lib/api.ts#L280))
+   - 프론트는 `SELECTED_CHECKS`, `IS_FIRST_RUN` 을 env_vars 로 전달 중 (선택된 취약점 검사 항목)
+   - 백엔드 확정 명세에는 `env_vars` 필드 없음
+   - **확인 필요**: 백엔드가 받아서 우분투에 전달하는지? 안 한다면 사용자가 고른 검사 항목이 무시됨.
+   - 대안: `POST /api/pipelines` 바디에 `selected_checks: string[]`, `is_first_run: boolean` 등 명시적 필드 추가
+
+3. **`trigger_source` enum**
+   - 명세: `manual | webhook | schedule`
+   - 프론트 송신값: `windows-api` (커스텀)
+   - 백엔드가 그대로 echo 해주는지 / validation 거는지 확인 필요
+
+### ⏳ 기존 합의사항
+
+4. **§3.9 미완료 job 응답**: `425 Too Early` 반환 vs `200` + `findings: []` 반환
+5. **AI 제안 (`ai_suggestion`) 생성 시점**: 스캔 종료 직후 일괄 생성 (콜백에 포함됨) vs 결과 페이지 요청 시 lazy 생성
+6. **`existing_job_id` 응답 필드**: 409 응답 바디에 기존 실행 중인 `job_id` 포함 — 프론트 다이얼로그의 "취소 후 재실행" 동작에 필수
+7. **인증 토큰**: GitHub Access Token 그대로 사용 vs 백엔드 자체 JWT 발급 (현재 백엔드는 자체 JWT 발급 방향으로 진행 중인 듯 — credentials=False 변경)
+8. **실시간성**: 폴링 유지 vs SSE/WebSocket 도입 시점
+9. **Job 중복 방지**: 같은 repo+branch 동시 실행 허용 여부 → 409 정책 합의 (현재 프론트는 다이얼로그 처리 완료)
