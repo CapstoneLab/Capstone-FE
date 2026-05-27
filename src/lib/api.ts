@@ -279,6 +279,142 @@ function mapJobDetail(raw: UnknownRecord): JobDetail {
   }
 }
 
+// Cross-checks the backend's reported status against step outcomes and,
+// optionally, the security verdict. If any step failed, the run is a failure
+// regardless of what `job.status` claims. The verdict-based override is
+// opt-in via `considerVerdict` so callers that care only about pipeline
+// EXECUTION (not security threshold) can keep `job.status` semantics.
+export function deriveJobStatus(
+  job: JobDetail,
+  options?: { considerVerdict?: boolean },
+): JobStatus {
+  const considerVerdict = options?.considerVerdict ?? true
+  if (job.status === 'queued') return 'queued'
+  if (job.status === 'running') return 'running'
+  if (job.status === 'cancelled') return 'cancelled'
+  if (considerVerdict && job.verdict === 'failed') return 'failed'
+  if (job.steps.some((step) => step.status === 'failed')) return 'failed'
+  return job.status === 'failed' ? 'failed' : 'success'
+}
+
+export type GitHubCommitInfo = {
+  sha: string
+  message: string
+  authorName: string
+  authorLogin: string | null
+  date: string
+  htmlUrl: string
+}
+
+function parseCommitPayload(data: UnknownRecord): GitHubCommitInfo {
+  const commit = (pick<UnknownRecord>(data, 'commit') ?? {}) as UnknownRecord
+  const commitAuthor = (pick<UnknownRecord>(commit, 'author') ?? {}) as UnknownRecord
+  const apiAuthor = (pick<UnknownRecord>(data, 'author') ?? {}) as UnknownRecord
+  return {
+    sha: pick<string>(data, 'sha') ?? '',
+    message: pick<string>(commit, 'message') ?? '',
+    authorName: pick<string>(commitAuthor, 'name') ?? '',
+    authorLogin: pick<string>(apiAuthor, 'login') ?? null,
+    date: pick<string>(commitAuthor, 'date') ?? '',
+    htmlUrl: pick<string>(data, 'html_url', 'htmlUrl') ?? '',
+  }
+}
+
+// Best-effort fetch of the latest commit on a branch. Tries the backend
+// proxy first (matches our auth/CORS story) and falls back to api.github.com
+// when the proxy doesn't expose this route — the backend currently
+// documents only `/api/repos` and `.../branches`, so the proxy attempt
+// usually 404s and we land on the direct GitHub call. The token is a
+// GitHub OAuth access token per the backend spec, so the direct call
+// authenticates the same way.
+export async function fetchLatestCommit(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<GitHubCommitInfo | null> {
+  if (!owner || !repo || !branch) return null
+
+  const proxyUrl = `${API_BASE}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(branch)}`
+  try {
+    const res = await fetch(proxyUrl, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (res.ok) {
+      const data = (await res.json()) as UnknownRecord
+      return parseCommitPayload(data)
+    }
+  } catch (error) {
+    console.warn('[api] fetchLatestCommit proxy failed:', error)
+  }
+
+  // Direct GitHub fallback — api.github.com supports CORS for browser calls.
+  const directUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(branch)}`
+  try {
+    const res = await fetch(directUrl, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+      },
+    })
+    if (!res.ok) return null
+    const data = (await res.json()) as UnknownRecord
+    return parseCommitPayload(data)
+  } catch (error) {
+    console.warn('[api] fetchLatestCommit direct GitHub failed:', error)
+    return null
+  }
+}
+
+const REPO_DOMAIN_PREFIX = 'secupipeline:repo-domain:'
+
+export function getRepoDomainUrl(cacheKey: string, repoId: string): string {
+  try {
+    return localStorage.getItem(`${REPO_DOMAIN_PREFIX}${cacheKey}:${repoId}`) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+export function setRepoDomainUrl(
+  cacheKey: string,
+  repoId: string,
+  url: string,
+): void {
+  try {
+    const key = `${REPO_DOMAIN_PREFIX}${cacheKey}:${repoId}`
+    const trimmed = url.trim()
+    if (trimmed) localStorage.setItem(key, trimmed)
+    else localStorage.removeItem(key)
+  } catch {
+    // ignore storage errors
+  }
+}
+
+const REPO_DETECT_PREFIX = 'secupipeline:repo-detect:'
+
+export function getRepoDetectEnabled(cacheKey: string, repoId: string): boolean {
+  try {
+    return localStorage.getItem(`${REPO_DETECT_PREFIX}${cacheKey}:${repoId}`) === '1'
+  } catch {
+    return false
+  }
+}
+
+export function setRepoDetectEnabled(
+  cacheKey: string,
+  repoId: string,
+  enabled: boolean,
+): void {
+  try {
+    const key = `${REPO_DETECT_PREFIX}${cacheKey}:${repoId}`
+    if (enabled) localStorage.setItem(key, '1')
+    else localStorage.removeItem(key)
+  } catch {
+    // ignore storage errors
+  }
+}
+
 export async function fetchJobDetail(token: string, jobId: string): Promise<JobDetail | null> {
   const res = await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}`, {
     headers: { Authorization: `Bearer ${token}` },

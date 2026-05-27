@@ -11,6 +11,7 @@ import {
   Rocket,
   Shield,
   ShieldAlert,
+  ShieldCheck,
   XCircle,
 } from 'lucide-react'
 import type { ComponentType } from 'react'
@@ -25,6 +26,7 @@ import {
   cancelPipeline,
   fetchJobDetail,
   fetchPipelineLogs,
+  setRepoDomainUrl,
   type JobDetail,
   type JobStep,
 } from '@/lib/api'
@@ -35,13 +37,20 @@ type LocationState = {
   branch?: string
 }
 
-const POLL_INTERVAL_MS = 2000
-
+const POLL_INTERVAL_MS = 1500
+// After a job reaches a terminal status (success/failed/cancelled) the
+// runner may still flush trailing log lines for a beat. Keep polling for
+// a short grace window so the user actually sees the final logs instead
+// of "수집된 로그가 없습니다".
+const TERMINAL_GRACE_POLLS = 3
 const TERMINAL_JOB_STATUSES = new Set(['success', 'failed', 'cancelled'])
 
 const stepIconMap: { match: RegExp; icon: ComponentType<{ className?: string }> }[] = [
   { match: /clone|checkout|git|레포|클론/i, icon: GitBranch },
   { match: /install|deps|dependen|npm|pip|pnpm|yarn|의존성|설치/i, icon: Package },
+  // Security Gate must be checked BEFORE the generic /security/ pattern,
+  // otherwise the gate step would be classified as a regular scan step.
+  { match: /gate|verdict|threshold|게이트/i, icon: ShieldCheck },
   { match: /deep|deep-scan|sast-deep|심화/i, icon: ShieldAlert },
   { match: /scan|secret|gitleaks|semgrep|sast|security|보안|검사/i, icon: Shield },
   { match: /test|lint|coverage|테스트/i, icon: FlaskConical },
@@ -55,6 +64,7 @@ const PLACEHOLDER_STEPS: JobStep[] = [
   { stepId: 'ph-scan-light', stepName: '경량 보안 검사', stepType: 'security-light', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
   { stepId: 'ph-test', stepName: '테스트', stepType: 'test', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
   { stepId: 'ph-scan-deep', stepName: '심화 보안 검사', stepType: 'security-deep', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
+  { stepId: 'ph-security-gate', stepName: '보안 게이트', stepType: 'security-gate', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
   { stepId: 'ph-build', stepName: '빌드', stepType: 'build', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
   { stepId: 'ph-deploy', stepName: '배포', stepType: 'deploy', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
 ]
@@ -135,17 +145,51 @@ export function PipelineProcessPage() {
   const { state } = useLocation()
   const locationState = (state ?? {}) as LocationState
   const jobId = locationState.jobId ?? ''
+  // Same scheme as DashboardPage/RepositoryDetailPage: 16-char prefix
+  // of the auth token. Used to scope per-user localStorage entries (e.g.
+  // the auto-extracted deploy domain).
+  const cacheKey = token ? token.slice(0, 16) : 'anonymous'
 
   const [job, setJob] = useState<JobDetail | null>(null)
   const [logs, setLogs] = useState<string[]>([])
+  // Elapsed-seconds-since-job-start for each log line, captured the first
+  // time we observe it. Lets us render "+12s [build.log] ..." on the line
+  // even though the backend's lines are plain strings without timestamps.
+  const [logTimestamps, setLogTimestamps] = useState<number[]>([])
   const [error, setError] = useState<string | null>(null)
   const [, setIsInitialLoading] = useState(true)
   const [elapsedSec, setElapsedSec] = useState(0)
   const [isCancelling, setIsCancelling] = useState(false)
+  // Steps the user has expanded. We auto-add the running step's key so its
+  // logs are visible without a manual click, but never auto-close items.
+  const [openSteps, setOpenSteps] = useState<string[]>([])
+
+  // Frontend-observed per-step lifecycle: when we first saw the step
+  // transition to running, when it terminated, and where in the global
+  // log array the boundaries fell. This is our source of truth for
+  // per-step duration AND for slicing logs when the backend's per-step
+  // timestamps / log prefixes are missing. Without this, a step with no
+  // dedicated [stepname.log] tag and no startedAt/endedAt would render
+  // empty logs even though they sit in the global panel.
+  type StepLifecycleEntry = {
+    observedStartMs: number
+    observedEndMs: number | null
+    startLogIdx: number
+    endLogIdx: number | null
+  }
+  const [stepLifecycle, setStepLifecycle] = useState<
+    Record<string, StepLifecycleEntry>
+  >({})
 
   const logContainerRef = useRef<HTMLDivElement | null>(null)
   const lastLogCount = useRef(0)
   const startedAtMsRef = useRef<number | null>(null)
+  const terminalPollCountRef = useRef(0)
+  // Last live-computed duration per step. Lets a step keep showing its real
+  // elapsed (e.g. 12s) right when status flips running→success, before the
+  // backend has filled durationSecs/endedAt. Without this the cell snaps to
+  // "0s" for a poll cycle or two and looks wrong.
+  const lastLiveStepDurationRef = useRef<Record<string, number>>({})
 
   useEffect(() => {
     if (!jobId || !token) {
@@ -158,38 +202,75 @@ export function PipelineProcessPage() {
 
     async function tick() {
       let isTerminal = false
-      try {
-        const [nextJob, nextLogs] = await Promise.all([
-          fetchJobDetail(token!, jobId),
-          fetchPipelineLogs(token!, jobId),
-        ])
-        if (cancelled) return
-        console.log(
-          '[pipeline-poll]',
-          'status:', nextJob?.status,
-          'steps:', nextJob?.steps?.length ?? 0,
-          'logs:', nextLogs.length,
-          'startedAt:', nextJob?.startedAt,
-          'raw:', nextJob,
-        )
+      // Fetch independently so a transient failure in one endpoint does not
+      // discard the other's payload (e.g. logs must keep streaming even if
+      // job detail blips, and vice versa).
+      const [jobResult, logsResult] = await Promise.allSettled([
+        fetchJobDetail(token!, jobId),
+        fetchPipelineLogs(token!, jobId),
+      ])
+      if (cancelled) return
+
+      let detailError: unknown = null
+      if (jobResult.status === 'fulfilled') {
+        const nextJob = jobResult.value
         if (nextJob) {
           setJob(nextJob)
           isTerminal = TERMINAL_JOB_STATUSES.has(nextJob.status)
         }
-        setLogs(nextLogs)
-        setError(null)
-      } catch (err) {
-        if (cancelled) return
-        setError(
-          err instanceof Error ? err.message : '파이프라인 상태를 가져오지 못했습니다.',
-        )
-      } finally {
-        if (!cancelled) {
-          setIsInitialLoading(false)
-          if (!isTerminal) {
-            timer = window.setTimeout(tick, POLL_INTERVAL_MS)
-          }
+      } else {
+        detailError = jobResult.reason
+        console.error('[pipeline-poll] job detail failed:', detailError)
+      }
+
+      if (logsResult.status === 'fulfilled') {
+        const nextLogs = logsResult.value
+        // Don't wipe accumulated logs on an empty response. The backend
+        // returns [] both for "no logs yet" and for transient errors; in
+        // either case keep the lines we already have so failures still
+        // show the captured output.
+        setLogs((prev) => (nextLogs.length === 0 && prev.length > 0 ? prev : nextLogs))
+
+        // Stamp each NEW line with its elapsed-since-job-start so the user
+        // sees real-time "+5s [build.log] ..." in the log panel. We only
+        // append for lines we haven't seen before; existing line indexes
+        // keep their original timestamp.
+        const jobStartMs = startedAtMsRef.current
+        if (jobStartMs !== null) {
+          const elapsed = Math.max(0, Math.round((Date.now() - jobStartMs) / 1000))
+          setLogTimestamps((prev) => {
+            if (nextLogs.length <= prev.length) return prev.slice(0, nextLogs.length)
+            const additions = nextLogs.length - prev.length
+            return [...prev, ...new Array<number>(additions).fill(elapsed)]
+          })
         }
+      } else {
+        console.error('[pipeline-poll] logs fetch failed:', logsResult.reason)
+      }
+
+      // Only surface an error to the UI if BOTH fetches failed — otherwise
+      // the user still gets useful data and shouldn't see a red banner.
+      if (detailError && logsResult.status === 'rejected') {
+        setError(
+          detailError instanceof Error
+            ? detailError.message
+            : '파이프라인 상태를 가져오지 못했습니다.',
+        )
+      } else {
+        setError(null)
+      }
+
+      setIsInitialLoading(false)
+
+      // Keep polling for a short grace window after terminal status so any
+      // trailing logs (final failure message, last build line) actually
+      // reach the UI before we stop.
+      if (!isTerminal) {
+        terminalPollCountRef.current = 0
+        timer = window.setTimeout(tick, POLL_INTERVAL_MS)
+      } else if (terminalPollCountRef.current < TERMINAL_GRACE_POLLS) {
+        terminalPollCountRef.current += 1
+        timer = window.setTimeout(tick, POLL_INTERVAL_MS)
       }
     }
 
@@ -263,27 +344,118 @@ export function PipelineProcessPage() {
     return () => window.clearInterval(id)
   }, [hasJobStarted, isTerminal, job?.startedAt, job?.durationSecs])
 
-  const stepLogsMap = useMemo(() => {
-    const map = new Map<string, string[]>()
-    for (const line of logs) {
-      const match = line.match(/^\[([^.\]]+)(?:\.log)?\]/)
-      const key = match ? match[1] : '__general__'
-      const list = map.get(key) ?? []
-      list.push(line)
-      map.set(key, list)
-    }
-    return map
-  }, [logs])
+  type LogEntry = { line: string; elapsedSec: number }
 
-  const findLogsForStep = (step: JobStep): string[] => {
-    if (step.stepName && stepLogsMap.has(step.stepName)) return stepLogsMap.get(step.stepName)!
-    if (step.stepType && stepLogsMap.has(step.stepType)) return stepLogsMap.get(step.stepType)!
+  // Build a list of every log line with its elapsed-since-job-start. The
+  // single flat list is the source of truth for both the bottom "실시간
+  // 로그" panel and the per-step time-window fallback below.
+  const allLogEntries: LogEntry[] = useMemo(
+    () => logs.map((line, idx) => ({ line, elapsedSec: logTimestamps[idx] ?? 0 })),
+    [logs, logTimestamps],
+  )
+
+  const stepLogsMap = useMemo(() => {
+    const map = new Map<string, LogEntry[]>()
+    allLogEntries.forEach((entry) => {
+      const match = entry.line.match(/^\[([^.\]]+)(?:\.log)?\]/)
+      const key = match ? match[1].toLowerCase() : '__general__'
+      const list = map.get(key) ?? []
+      list.push(entry)
+      map.set(key, list)
+    })
+    return map
+  }, [allLogEntries])
+
+  const generalLogEntries: LogEntry[] = stepLogsMap.get('__general__') ?? []
+
+  // Compute a step's elapsed-since-job-start window so we can pull logs that
+  // arrived *during* the step's lifetime even if their bracketed prefix
+  // doesn't match the step name.
+  const stepWindow = (step: JobStep): { start: number; end: number } | null => {
+    const jobStartMs = startedAtMsRef.current
+    if (jobStartMs === null || !step.startedAt) return null
+    const startMs = Date.parse(step.startedAt)
+    if (Number.isNaN(startMs)) return null
+    const startElapsed = Math.max(0, Math.round((startMs - jobStartMs) / 1000))
+    let endElapsed = Number.POSITIVE_INFINITY
+    if (step.endedAt) {
+      const endMs = Date.parse(step.endedAt)
+      if (!Number.isNaN(endMs)) {
+        endElapsed = Math.max(0, Math.round((endMs - jobStartMs) / 1000))
+      }
+    }
+    return { start: startElapsed, end: endElapsed }
+  }
+
+  // Lifecycle keys are INDEX-based and stable across the placeholder→API
+  // merge. Using stepId would break tracking because a placeholder's id
+  // ('ph-clone') differs from the backend's stepId once it takes over —
+  // we'd lose the running-window observation and the log slice would be
+  // empty. Declared above any useMemo/effect that references it to avoid
+  // TDZ when those callbacks run during the first render.
+  const lifecycleKeyFor = (idx: number): string => `step-${idx}`
+
+  const findLogsForStep = (step: JobStep, key: string): LogEntry[] => {
+    // 1. Exact / case-insensitive name match against the bracketed prefix
+    const nameKey = step.stepName?.toLowerCase()
+    if (nameKey && stepLogsMap.has(nameKey)) return stepLogsMap.get(nameKey)!
+    const typeKey = step.stepType?.toLowerCase()
+    if (typeKey && stepLogsMap.has(typeKey)) return stepLogsMap.get(typeKey)!
+
+    // 2. Substring match — handles "[lightweight-security.log]" vs step
+    //    type "security-light", etc.
+    if (typeKey || nameKey) {
+      for (const [logKey, lines] of stepLogsMap) {
+        if (logKey === '__general__') continue
+        if (
+          (typeKey && (logKey.includes(typeKey) || typeKey.includes(logKey))) ||
+          (nameKey && (logKey.includes(nameKey) || nameKey.includes(logKey)))
+        ) {
+          return lines
+        }
+      }
+    }
+
+    // 3. Frontend-observed lifecycle slice — the most reliable fallback
+    //    when the backend doesn't tag logs per step. We recorded the
+    //    global log array index at the moment this step transitioned to
+    //    running, and again when it terminated; anything in between
+    //    belongs to this step. Works for completed steps too: the user's
+    //    complaint of "completed but no logs shown" is exactly this case.
+    const life = stepLifecycle[key]
+    if (life) {
+      const start = life.startLogIdx
+      const end = life.endLogIdx ?? allLogEntries.length
+      if (end > start) {
+        return allLogEntries.slice(start, end)
+      }
+    }
+
+    // 4. Icon-class match (e.g. clone/checkout both → GitBranch icon)
     const stepIcon = iconForStep(step)
     for (const [logKey, lines] of stepLogsMap) {
       if (logKey === '__general__') continue
       const proxy: JobStep = { ...step, stepName: logKey, stepType: logKey }
       if (iconForStep(proxy) === stepIcon) return lines
     }
+
+    // 5. Backend timestamp window fallback
+    const window = stepWindow(step)
+    if (window) {
+      const within = allLogEntries.filter(
+        (e) => e.elapsedSec >= window.start && e.elapsedSec <= window.end,
+      )
+      if (within.length > 0) return within
+    }
+
+    // 6. Running step with nothing matched yet → show the recent tail of
+    //    unbucketed logs so the user always sees "what's happening now"
+    //    instead of "로그 없음".
+    if (step.status === 'running') {
+      if (generalLogEntries.length > 0) return generalLogEntries.slice(-20)
+      if (allLogEntries.length > 0) return allLogEntries.slice(-20)
+    }
+
     return []
   }
 
@@ -318,14 +490,17 @@ export function PipelineProcessPage() {
         usedApi.add(apiIdx)
         return { ...apiSteps[apiIdx], stepName: apiSteps[apiIdx].stepName || placeholder.stepName }
       }
-      // No API step yet — keep placeholder, but flip to 'running' if logs already arrived for it
-      const matchedLogs = findLogsForStep(placeholder)
+      // No API step yet — keep placeholder, but flip to 'running' if logs
+      // already arrived for it. Use the placeholder's stable index for the
+      // lifecycle key so the lookup matches what we'll use after merge.
+      const placeholderIdx = PLACEHOLDER_STEPS.indexOf(placeholder)
+      const matchedLogs = findLogsForStep(placeholder, lifecycleKeyFor(placeholderIdx))
       if (matchedLogs.length > 0 && placeholder.status === 'pending') {
         return { ...placeholder, status: 'running' as const }
       }
       return placeholder
     })
-    // Append unmatched API steps (extras the backend reports beyond our 7-step template)
+    // Append unmatched API steps (extras the backend reports beyond our 8-step template)
     apiSteps.forEach((api, i) => {
       if (!usedApi.has(i)) merged.push(api)
     })
@@ -334,6 +509,177 @@ export function PipelineProcessPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiSteps, stepLogsMap])
   const successCount = steps.filter((step) => step.status === 'success').length
+
+  // Currently running step — surfaced to the top "execution status" panel
+  // and to the auto-open accordion logic so the user always sees what's
+  // happening RIGHT NOW without having to click into a step.
+  const currentStep = steps.find((step) => step.status === 'running') ?? null
+
+  // When the deploy step finishes successfully, scan its logs for an
+  // http(s) URL and persist it as this repo's deployment domain. The
+  // RepositoryDetailPage reads from the same localStorage key
+  // (keyed by job.repoName) and renders it in the "도메인 주소" card so
+  // the user no longer needs to type it manually.
+  const lastDomainExtractedRef = useRef<string | null>(null)
+  useEffect(() => {
+    const repoName = job?.repoName
+    if (!repoName) return
+    const deployIdx = steps.findIndex((s) =>
+      /deploy|배포|release|publish/i.test(`${s.stepName} ${s.stepType}`),
+    )
+    if (deployIdx < 0) return
+    const deployStep = steps[deployIdx]
+    if (deployStep.status !== 'success') return
+    const lines = findLogsForStep(deployStep, lifecycleKeyFor(deployIdx))
+    if (lines.length === 0) return
+
+    // Search from the latest line back — the deploy "Live at: URL" message
+    // is usually printed near the end of the step's output.
+    const urlPattern = /(https?:\/\/[^\s<>"'`)]+)/i
+    let found: string | null = null
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const m = lines[i].line.match(urlPattern)
+      if (m) {
+        found = m[1].replace(/[.,;]+$/, '')
+        break
+      }
+    }
+    if (!found) return
+    if (lastDomainExtractedRef.current === found) return
+    lastDomainExtractedRef.current = found
+    setRepoDomainUrl(cacheKey, repoName, found)
+    // findLogsForStep is intentionally not in deps — its closures are
+    // covered by `steps`/`stepLifecycle`/`logs` which already trigger re-runs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [steps, stepLifecycle, logs, job?.repoName, cacheKey])
+
+  // Auto-open accordion entries for any step that's currently running so its
+  // streaming logs are visible without a manual click. We append-only — once
+  // the user opens or auto-opens a step it stays open.
+  useEffect(() => {
+    if (!currentStep) return
+    const idx = steps.indexOf(currentStep)
+    const key = currentStep.stepId || `${currentStep.stepName}-${idx}`
+    setOpenSteps((prev) => (prev.includes(key) ? prev : [...prev, key]))
+  }, [currentStep, steps])
+
+  // Track each running step's live elapsed in a ref so the render can fall
+  // back to this value during the brief running→complete transition window
+  // when the backend hasn't yet filled durationSecs/endedAt. We mutate the
+  // ref here (in an effect) rather than during render to satisfy the
+  // react-hooks/purity rule.
+  useEffect(() => {
+    steps.forEach((step, idx) => {
+      if (step.status !== 'running') return
+      const backendStart = step.startedAt ? Date.parse(step.startedAt) : Number.NaN
+      const lKey = lifecycleKeyFor(idx)
+      const lifeStart = stepLifecycle[lKey]?.observedStartMs
+      const startMs = !Number.isNaN(backendStart) ? backendStart : lifeStart
+      if (startMs === undefined || Number.isNaN(startMs)) return
+      lastLiveStepDurationRef.current[lKey] = Math.max(
+        0,
+        Math.round((Date.now() - startMs) / 1000),
+      )
+    })
+  }, [steps, elapsedSec, stepLifecycle])
+
+  // Record step lifecycle transitions. For each poll we:
+  //   - Notice a step that just transitioned to running → stamp its
+  //     observedStartMs (using backend's startedAt when present, otherwise
+  //     wall clock) and inherit startLogIdx from the previous step's
+  //     endLogIdx so the slice covers logs we already had at mount time.
+  //   - Notice a step that just transitioned to terminal → stamp its end.
+  //   - Handle steps that appeared already-complete (missed the running
+  //     window because the page was opened mid-pipeline or the step
+  //     completed faster than our poll interval) — slice from prev step's
+  //     endLogIdx to now.
+  useEffect(() => {
+    setStepLifecycle((prev) => {
+      let next = prev
+      let changed = false
+      const terminal = new Set(['success', 'failed', 'cancelled', 'skipped'])
+
+      // Look up where the previous tracked step ended, walking backwards
+      // through indices until we find one with a closed endLogIdx. Used
+      // as the natural startLogIdx for the next step.
+      const priorEndLogIdx = (currentIdx: number): number => {
+        for (let i = currentIdx - 1; i >= 0; i -= 1) {
+          const prevKey = lifecycleKeyFor(i)
+          const prevLife = next[prevKey] ?? prev[prevKey]
+          if (prevLife && prevLife.endLogIdx !== null) return prevLife.endLogIdx
+        }
+        return 0
+      }
+
+      const ensureMutable = () => {
+        if (!changed) {
+          next = { ...prev }
+          changed = true
+        }
+      }
+
+      steps.forEach((step, idx) => {
+        const key = lifecycleKeyFor(idx)
+        const existing = next[key]
+        const backendStartMs = step.startedAt ? Date.parse(step.startedAt) : Number.NaN
+        const backendEndMs = step.endedAt ? Date.parse(step.endedAt) : Number.NaN
+
+        if (step.status === 'running' && !existing) {
+          ensureMutable()
+          next[key] = {
+            observedStartMs: !Number.isNaN(backendStartMs) ? backendStartMs : Date.now(),
+            observedEndMs: null,
+            startLogIdx: priorEndLogIdx(idx),
+            endLogIdx: null,
+          }
+        } else if (step.status === 'running' && existing) {
+          // While running, opportunistically improve observedStartMs if the
+          // backend has now reported a startedAt that's earlier than the
+          // frontend-only estimate — this fixes the "1초로 뜨는" case where
+          // the page mounted mid-step and we initially had to guess.
+          if (
+            !Number.isNaN(backendStartMs) &&
+            backendStartMs < existing.observedStartMs
+          ) {
+            ensureMutable()
+            next[key] = { ...existing, observedStartMs: backendStartMs }
+          }
+        } else if (
+          terminal.has(step.status) &&
+          existing &&
+          existing.observedEndMs === null
+        ) {
+          ensureMutable()
+          next[key] = {
+            ...existing,
+            observedStartMs:
+              !Number.isNaN(backendStartMs) && backendStartMs < existing.observedStartMs
+                ? backendStartMs
+                : existing.observedStartMs,
+            observedEndMs: !Number.isNaN(backendEndMs) ? backendEndMs : Date.now(),
+            endLogIdx: logs.length,
+          }
+        } else if (terminal.has(step.status) && !existing) {
+          // Missed-window step — caught it already terminal. Best effort:
+          //   - log slice = [prev step's end, now]
+          //   - duration: prefer backend timestamps, otherwise zero-window
+          //     (the duration column then falls through to backend
+          //     durationSecs in render).
+          ensureMutable()
+          const startMs = !Number.isNaN(backendStartMs) ? backendStartMs : Date.now()
+          const endMs = !Number.isNaN(backendEndMs) ? backendEndMs : Date.now()
+          next[key] = {
+            observedStartMs: startMs,
+            observedEndMs: endMs,
+            startLogIdx:
+              step.status === 'skipped' ? logs.length : priorEndLogIdx(idx),
+            endLogIdx: logs.length,
+          }
+        }
+      })
+      return changed ? next : prev
+    })
+  }, [steps, logs.length])
 
   if (!jobId) {
     return (
@@ -374,11 +720,69 @@ export function PipelineProcessPage() {
         ) : null}
 
         <Card className="border-[#404040] bg-[#262626] p-4">
-          <div className="mb-4 flex items-center justify-between">
+          <div className="mb-4 flex items-center justify-between gap-3">
             <p className="text-[24px] font-bold text-white">진행 과정</p>
             <p className="text-[14px] text-[#878787]">
               {successCount}/{steps.length} 단계 통과
             </p>
+          </div>
+
+          {/* "지금 무엇이 돌고 있는가" panel — replaces the inline status
+              dot with a more prominent live readout of the currently running
+              step + its latest log line. Falls back to job-status text when
+              no step is actively running (queued/terminal). */}
+          <div className="mb-4 rounded-xl border border-[#404040] bg-[#1E1E1E] p-3">
+            {currentStep ? (
+              (() => {
+                const Icon = iconForStep(currentStep)
+                const cIdx = steps.indexOf(currentStep)
+                const stepLogs = findLogsForStep(currentStep, lifecycleKeyFor(cIdx))
+                const latestLine = stepLogs[stepLogs.length - 1]
+                const startMs = currentStep.startedAt
+                  ? Date.parse(currentStep.startedAt)
+                  : Number.NaN
+                const stepElapsed = !Number.isNaN(startMs)
+                  ? Math.max(0, Math.round((Date.now() - startMs) / 1000))
+                  : 0
+                return (
+                  <>
+                    <div className="flex items-center gap-2">
+                      <Loader2 className="h-5 w-5 animate-spin text-[#F59E0B]" />
+                      <Icon className="h-5 w-5 text-[#F59E0B]" />
+                      <p className="text-[16px] font-semibold text-white">
+                        현재: {currentStep.stepName || currentStep.stepType}
+                      </p>
+                      <span className="ml-auto inline-flex items-center gap-1 text-[12px] text-[#FCD34D]">
+                        <Clock3 className="h-3.5 w-3.5" />
+                        {formatDuration(stepElapsed)}
+                      </span>
+                    </div>
+                    {latestLine ? (
+                      <p className="mt-2 truncate font-mono text-[12px] text-[#9CA3AF]">
+                        <span className="mr-2 text-[#6B7280]">+{latestLine.elapsedSec}s</span>
+                        {latestLine.line}
+                      </p>
+                    ) : (
+                      <p className="mt-2 font-mono text-[12px] text-[#6B7280]">
+                        명령 실행 대기 중...
+                      </p>
+                    )}
+                  </>
+                )
+              })()
+            ) : (
+              <div className="flex items-center gap-2">
+                <span
+                  className="h-2.5 w-2.5 rounded-full"
+                  style={{ backgroundColor: jobBadge.dotColor }}
+                />
+                <p className="text-[14px] text-[#D1D5DB]">
+                  {isTerminal
+                    ? `파이프라인 ${jobBadge.label} · 총 ${formatDuration(elapsedSec)}`
+                    : `${jobBadge.label} · ${formatDuration(elapsedSec)}`}
+                </p>
+              </div>
+            )}
           </div>
 
           <div
@@ -396,10 +800,20 @@ export function PipelineProcessPage() {
           </div>
         </Card>
 
-        <Accordion type="single" collapsible className="space-y-3">
+        <Accordion
+          type="multiple"
+          value={openSteps}
+          onValueChange={setOpenSteps}
+          className="space-y-3"
+        >
           {steps.map((step, idx) => {
             const Icon = iconForStep(step)
+            // Render key (for React reconciliation) vs lifecycle key (for
+            // state lookup). The lifecycle key MUST be index-based so the
+            // entry survives the placeholder→API transition where step.stepId
+            // changes — see lifecycleKeyFor.
             const key = step.stepId || `${step.stepName}-${idx}`
+            const lKey = lifecycleKeyFor(idx)
             const borderColor =
               step.status === 'success'
                 ? 'border-[#3ECF8E]'
@@ -408,8 +822,51 @@ export function PipelineProcessPage() {
                   : step.status === 'running'
                     ? 'border-[#F59E0B]'
                     : 'border-[#404040]'
-            const matchedLogs = findLogsForStep(step)
-            const duration = step.durationSecs ?? 0
+            const matchedLogs = findLogsForStep(step, lKey)
+            // Duration resolution. Frontend-observed lifecycle FIRST
+            // because the backend sometimes sends durationSecs=1 even
+            // when the step visibly took longer. Lifecycle uses backend
+            // startedAt/endedAt when available (more accurate than our
+            // poll-time observation) and falls back to wall clock.
+            //
+            //   1. lifecycle (observedEnd - observedStart) when meaningful
+            //   2. running → live elapsed from lifecycle start
+            //   3. backend-supplied durationSecs (only if > 0)
+            //   4. computed (endedAt - startedAt) from backend timestamps
+            //   5. last-known live ref value (transition-window safety net)
+            const life = stepLifecycle[lKey]
+            const lifecycleDuration =
+              life && life.observedEndMs !== null
+                ? Math.max(
+                    0,
+                    Math.round((life.observedEndMs - life.observedStartMs) / 1000),
+                  )
+                : 0
+            let duration = 0
+            if (lifecycleDuration > 0) {
+              duration = lifecycleDuration
+            } else if (step.status === 'running') {
+              const fromBackend = step.startedAt ? Date.parse(step.startedAt) : Number.NaN
+              const startMs = !Number.isNaN(fromBackend)
+                ? fromBackend
+                : life?.observedStartMs ?? Number.NaN
+              if (!Number.isNaN(startMs)) {
+                duration = Math.max(0, Math.round((Date.now() - startMs) / 1000))
+              } else {
+                duration = elapsedSec
+              }
+            } else if ((step.durationSecs ?? 0) > 0) {
+              duration = step.durationSecs ?? 0
+            } else if (step.startedAt && step.endedAt) {
+              const startMs = Date.parse(step.startedAt)
+              const endMs = Date.parse(step.endedAt)
+              if (!Number.isNaN(startMs) && !Number.isNaN(endMs)) {
+                duration = Math.max(0, Math.round((endMs - startMs) / 1000))
+              }
+            }
+            if (duration <= 0 && lastLiveStepDurationRef.current[lKey]) {
+              duration = lastLiveStepDurationRef.current[lKey]
+            }
 
             return (
               <AccordionItem
@@ -446,11 +903,18 @@ export function PipelineProcessPage() {
                   ) : null}
                   <div className="rounded-md border border-[#404040] bg-[#1E1E1E] p-3 text-xs text-[#A1A1A1]">
                     {matchedLogs.length === 0 ? (
-                      <p className="font-mono text-[#6B7280]">로그 없음</p>
+                      <p className="font-mono text-[#6B7280]">
+                        {step.status === 'running'
+                          ? '명령 실행 대기 중... (로그 수집 중)'
+                          : step.status === 'pending'
+                            ? '이전 단계 완료 후 시작됩니다'
+                            : '이 단계에서 출력된 로그가 없습니다'}
+                      </p>
                     ) : (
-                      matchedLogs.map((line, lineIdx) => (
+                      matchedLogs.map((entry, lineIdx) => (
                         <p key={lineIdx} className="font-mono leading-6 break-all">
-                          {line}
+                          <span className="mr-2 text-[#6B7280]">+{entry.elapsedSec}s</span>
+                          {entry.line}
                         </p>
                       ))
                     )}
@@ -471,10 +935,13 @@ export function PipelineProcessPage() {
             className="max-h-96 overflow-y-auto rounded-md border border-[#404040] bg-[#0F0F0F] p-3 text-xs text-[#D1D5DB]"
           >
             {logs.length === 0 ? (
-              <p className="font-mono text-[#6B7280]">로그를 기다리는 중...</p>
+              <p className="font-mono text-[#6B7280]">
+                {isTerminal ? '수집된 로그가 없습니다.' : '로그를 기다리는 중...'}
+              </p>
             ) : (
               logs.map((line, idx) => (
                 <p key={idx} className="font-mono leading-5 break-all">
+                  <span className="mr-2 text-[#6B7280]">+{logTimestamps[idx] ?? 0}s</span>
                   {line}
                 </p>
               ))

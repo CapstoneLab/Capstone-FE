@@ -35,12 +35,15 @@ import { MainLayout } from '@/components/layout/MainLayout'
 import { type RepositoryItem } from '@/data/repositories'
 import {
   AuthExpiredError,
+  deriveJobStatus,
   fetchJobsByIds,
   fetchReposWithBranches,
   getCachedRepos,
+  getRepoDetectEnabled,
   getTrackedJobIds,
   removeTrackedJobId,
   setCachedRepos,
+  setRepoDetectEnabled,
   type JobDetail,
   type JobVerdict,
 } from '@/lib/api'
@@ -77,6 +80,9 @@ type PipelineItem = {
   totalFindings: number
   severityCounts: { critical: number; high: number; medium: number; low: number }
   executedAt: string
+  totalSteps: number
+  completedSteps: number
+  currentStepName: string | null
 }
 
 function formatDuration(durationSec: number) {
@@ -90,12 +96,11 @@ function shortJobId(jobId: string) {
 }
 
 function mapJobToPipelineItem(job: JobDetail): PipelineItem {
-  const finalStatus =
-    job.status === 'success' || job.status === 'failed' || job.status === 'cancelled'
-      ? job.status
-      : job.status === 'running'
-        ? 'running'
-        : 'queued'
+  const finalStatus = deriveJobStatus(job)
+  const completedSteps = job.steps.filter(
+    (step) => step.status === 'success' || step.status === 'skipped',
+  ).length
+  const runningStep = job.steps.find((step) => step.status === 'running')
 
   return {
     id: shortJobId(job.jobId),
@@ -111,6 +116,9 @@ function mapJobToPipelineItem(job: JobDetail): PipelineItem {
     totalFindings: job.totalFindings,
     severityCounts: job.severityCounts,
     executedAt: job.completedAt ?? job.startedAt ?? job.createdAt ?? '',
+    totalSteps: job.steps.length,
+    completedSteps,
+    currentStepName: runningStep?.stepName ?? null,
   }
 }
 
@@ -136,9 +144,18 @@ export function DashboardPage() {
   const [activeTab, setActiveTab] = useState<'repo' | 'pipeline'>('repo')
   const [searchInput, setSearchInput] = useState('')
   const [searchKeyword, setSearchKeyword] = useState('')
-  const [repos, setRepos] = useState<RepositoryItem[]>(
-    () => (token ? (getCachedRepos(cacheKey) ?? []) : []),
-  )
+  const [repos, setRepos] = useState<RepositoryItem[]>(() => {
+    if (!token) return []
+    const cached = getCachedRepos(cacheKey)
+    if (!cached) return []
+    // Merge persisted "탐지" toggle back in — the API doesn't carry this,
+    // so without rehydrating from localStorage every toggle would reset on
+    // navigation/refresh.
+    return cached.map((repo) => ({
+      ...repo,
+      detectEnabled: getRepoDetectEnabled(cacheKey, repo.id),
+    }))
+  })
   const [pipelines, setPipelines] = useState<PipelineItem[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [isReposLoading, setIsReposLoading] = useState(
@@ -164,7 +181,11 @@ export function DashboardPage() {
     fetchReposWithBranches(token)
       .then((list) => {
         if (mounted) {
-          setRepos(list)
+          const hydrated = list.map((repo) => ({
+            ...repo,
+            detectEnabled: getRepoDetectEnabled(cacheKey, repo.id),
+          }))
+          setRepos(hydrated)
           setCachedRepos(cacheKey, list)
         }
       })
@@ -222,7 +243,7 @@ export function DashboardPage() {
 
         const hasActive = mapped.some((p) => !TERMINAL.has(p.status))
         if (!cancelled && hasActive) {
-          timer = window.setTimeout(() => tick(false), 5000)
+          timer = window.setTimeout(() => tick(false), 3000)
         }
       } catch (error) {
         if (cancelled) return
@@ -483,10 +504,12 @@ export function DashboardPage() {
                           type="button"
                           onClick={(event) => {
                             event.stopPropagation()
+                            const nextEnabled = !repo.detectEnabled
+                            setRepoDetectEnabled(cacheKey, repo.id, nextEnabled)
                             setRepos((prev) =>
                               prev.map((item) =>
                                 item.id === repo.id
-                                  ? { ...item, detectEnabled: !item.detectEnabled }
+                                  ? { ...item, detectEnabled: nextEnabled }
                                   : item,
                               ),
                             )
@@ -685,11 +708,30 @@ export function DashboardPage() {
                       {run.status === 'running' || run.status === 'queued' ? (
                         <div>
                           <div className="mb-2 flex items-center justify-between text-sm">
-                            <span className="text-[10px] text-[#E5E7EB]">진행 중...</span>
-                            <span className="text-[12px] text-[#FCD34D]">결과 대기</span>
+                            <span className="text-[10px] text-[#E5E7EB]">
+                              {run.currentStepName
+                                ? `${run.currentStepName} 진행 중...`
+                                : run.status === 'queued'
+                                  ? '대기 중...'
+                                  : '진행 중...'}
+                            </span>
+                            <span className="text-[12px] text-[#FCD34D]">
+                              {run.totalSteps > 0
+                                ? `${run.completedSteps}/${run.totalSteps} 단계`
+                                : '결과 대기'}
+                            </span>
                           </div>
                           <div className="h-2.5 w-full max-w-203.75 overflow-hidden rounded-full bg-[#404040]">
-                            <div className="h-full w-1/3 animate-pulse rounded-full bg-[#F59E0B]" />
+                            {run.totalSteps > 0 ? (
+                              <div
+                                className="h-full rounded-full bg-[#F59E0B] transition-all duration-500"
+                                style={{
+                                  width: `${Math.max(4, Math.round((run.completedSteps / run.totalSteps) * 100))}%`,
+                                }}
+                              />
+                            ) : (
+                              <div className="h-full w-1/3 animate-pulse rounded-full bg-[#F59E0B]" />
+                            )}
                           </div>
                         </div>
                       ) : (
