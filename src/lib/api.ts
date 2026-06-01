@@ -372,6 +372,63 @@ export async function fetchLatestCommit(
   }
 }
 
+export type GitHubRepoExtras = {
+  /** Branch names from GitHub. */
+  branches: string[]
+  /** Repo's last push timestamp (ISO) — the accurate "푸시 시각". */
+  pushedAt: string | null
+  defaultBranch: string | null
+}
+
+// Fetch a public repo's branch list + push metadata directly from GitHub,
+// UNAUTHENTICATED (the app token is a backend JWT GitHub would reject). Public
+// repos resolve fine (rate-limited 60 req/hr per IP, CORS-enabled); on any
+// failure the corresponding field is empty/null so callers degrade to their
+// existing values. Two endpoints in parallel: /branches (names) and /repos
+// (pushed_at, default_branch).
+export async function fetchGithubRepoExtras(
+  owner: string,
+  repo: string,
+): Promise<GitHubRepoExtras> {
+  const empty: GitHubRepoExtras = { branches: [], pushedAt: null, defaultBranch: null }
+  if (!owner || !repo) return empty
+
+  const o = encodeURIComponent(owner)
+  const r = encodeURIComponent(repo)
+  const headers = { Accept: 'application/vnd.github+json' }
+
+  const [branchesRes, metaRes] = await Promise.allSettled([
+    fetch(`https://api.github.com/repos/${o}/${r}/branches?per_page=100`, { headers }),
+    fetch(`https://api.github.com/repos/${o}/${r}`, { headers }),
+  ])
+
+  let branches: string[] = []
+  if (branchesRes.status === 'fulfilled' && branchesRes.value.ok) {
+    try {
+      const data = (await branchesRes.value.json()) as UnknownRecord[]
+      branches = Array.isArray(data)
+        ? data.map((b) => pick<string>(b, 'name') ?? '').filter(Boolean)
+        : []
+    } catch {
+      branches = []
+    }
+  }
+
+  let pushedAt: string | null = null
+  let defaultBranch: string | null = null
+  if (metaRes.status === 'fulfilled' && metaRes.value.ok) {
+    try {
+      const data = (await metaRes.value.json()) as UnknownRecord
+      pushedAt = pick<string>(data, 'pushed_at', 'pushedAt') ?? null
+      defaultBranch = pick<string>(data, 'default_branch', 'defaultBranch') ?? null
+    } catch {
+      // keep nulls
+    }
+  }
+
+  return { branches, pushedAt, defaultBranch }
+}
+
 const REPO_PIPELINE_INFO_PREFIX = 'secupipeline:repo-pipeline-info:'
 
 export type RepoPipelineInfo = {

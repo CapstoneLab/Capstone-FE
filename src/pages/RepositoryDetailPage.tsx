@@ -14,6 +14,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import {
   AuthExpiredError,
   deriveJobStatus,
+  fetchGithubRepoExtras,
   fetchJobsByIds,
   fetchLatestCommit,
   fetchReposWithBranches,
@@ -92,6 +93,9 @@ export function RepositoryDetailPage() {
   )
   const [latestJob, setLatestJob] = useState<JobDetail | null>(null)
   const [latestCommit, setLatestCommit] = useState<GitHubCommitInfo | null>(null)
+  // Branch list + push time fetched fresh from GitHub (public repos).
+  const [githubBranches, setGithubBranches] = useState<string[] | null>(null)
+  const [githubPushedAt, setGithubPushedAt] = useState<string | null>(null)
   const [repoError, setRepoError] = useState<string | null>(null)
   // User-provided deployment domain — the backend has no source for this,
   // so we let the user save it per-repo in localStorage and edit inline.
@@ -204,6 +208,15 @@ export function RepositoryDetailPage() {
         if (!cancelled) setLatestCommit(null)
       })
 
+    // Refresh branch list + push time straight from GitHub (public repos).
+    fetchGithubRepoExtras(parsed.owner, parsed.repo)
+      .then((extras) => {
+        if (cancelled) return
+        if (extras.branches.length > 0) setGithubBranches(extras.branches)
+        if (extras.pushedAt) setGithubPushedAt(extras.pushedAt)
+      })
+      .catch(() => {})
+
     return () => {
       cancelled = true
     }
@@ -282,10 +295,15 @@ export function RepositoryDetailPage() {
     '-'
 
   const pushedAtRaw =
+    githubPushedAt?.trim() ||
     latestCommit?.date?.trim() ||
     pipelineInfo?.triggeredAt?.trim() ||
     repo.source.pushedAt ||
     repo.updatedAt
+
+  // Prefer the freshly-fetched GitHub branch list; fall back to the cached
+  // repo branches.
+  const displayBranches = githubBranches ?? repo.branches
   const pushedAt = pushedAtRaw
     ? dayjs(pushedAtRaw).isValid()
       ? dayjs(pushedAtRaw).format('YYYY-MM-DD HH:mm')
@@ -446,10 +464,10 @@ export function RepositoryDetailPage() {
             <GitBranch className="h-4 w-4 text-[#34D399]" /> 브랜치 목록
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
-            {repo.branches.length === 0 ? (
+            {displayBranches.length === 0 ? (
               <p className="text-[12px] text-[#6B7280]">브랜치 정보를 불러오지 못했습니다.</p>
             ) : (
-              repo.branches.map((b) => (
+              displayBranches.map((b) => (
                 <Badge
                   key={b}
                   className={`rounded-full px-3 py-1 text-[12px] ${
