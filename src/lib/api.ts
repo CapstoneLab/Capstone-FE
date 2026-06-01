@@ -326,12 +326,14 @@ function parseCommitPayload(data: UnknownRecord): GitHubCommitInfo {
 }
 
 // Best-effort fetch of the latest commit on a branch. Tries the backend
-// proxy first (matches our auth/CORS story) and falls back to api.github.com
-// when the proxy doesn't expose this route — the backend currently
-// documents only `/api/repos` and `.../branches`, so the proxy attempt
-// usually 404s and we land on the direct GitHub call. The token is a
-// GitHub OAuth access token per the backend spec, so the direct call
-// authenticates the same way.
+// proxy first, then falls back to api.github.com.
+//
+// GitHub fallback is UNAUTHENTICATED: the app token is the backend's own JWT
+// (not a GitHub OAuth token), which GitHub rejects with 401. Sending no
+// Authorization lets PUBLIC repos resolve (commit message shown), rate-limited
+// 60 req/hr per IP, CORS-enabled. Private repos return 404 → null → the source
+// card shows "커밋 메시지가 없습니다". The backend `/commits/{branch}` proxy
+// (currently 404) is the proper path for private repos once implemented.
 export async function fetchLatestCommit(
   token: string,
   owner: string,
@@ -353,14 +355,13 @@ export async function fetchLatestCommit(
     console.warn('[api] fetchLatestCommit proxy failed:', error)
   }
 
-  // Direct GitHub fallback — api.github.com supports CORS for browser calls.
+  // Direct GitHub fallback — UNAUTHENTICATED (see note above). Sending the
+  // backend JWT here would make GitHub 401; omitting it lets public repos
+  // resolve. api.github.com supports CORS for browser calls.
   const directUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(branch)}`
   try {
     const res = await fetch(directUrl, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/vnd.github+json',
-      },
+      headers: { Accept: 'application/vnd.github+json' },
     })
     if (!res.ok) return null
     const data = (await res.json()) as UnknownRecord

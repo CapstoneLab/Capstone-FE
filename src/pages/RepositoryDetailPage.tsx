@@ -264,13 +264,15 @@ export function RepositoryDetailPage() {
   // API call succeeds.
   const pipelineInfo = getRepoPipelineInfo(cacheKey, repo.name)
 
+  // 커밋 메시지는 실제로 조회된 커밋(GitHub/백엔드 프록시)만 사용한다.
+  // clone 로그에서 추정해 localStorage에 캐시한 값(pipelineInfo.commitMessage)이나
+  // SHA 기반 대체 문구는 "실제 메시지"가 아니므로 쓰지 않는다 — 없으면 그대로
+  // "커밋 메시지가 없습니다"로 표시.
   const commitMessageRaw =
     latestCommit?.message?.split('\n')[0]?.trim() ||
-    pipelineInfo?.commitMessage?.trim() ||
     repo.source.commitMessage?.trim() ||
-    (pipelineInfo?.commitSha ? `커밋 ${pipelineInfo.commitSha.slice(0, 7)}` : '') ||
     ''
-  const commitMessage = commitMessageRaw || '(커밋 메시지를 가져오지 못했습니다)'
+  const commitMessage = commitMessageRaw || '커밋 메시지가 없습니다'
 
   const pushedBy =
     latestCommit?.authorLogin?.trim() ||
