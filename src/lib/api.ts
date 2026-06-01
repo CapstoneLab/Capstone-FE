@@ -1062,14 +1062,15 @@ export async function startPipeline(
   if (payload.branch) body.branch = payload.branch
   if (payload.environment) body.environment = payload.environment
   if (payload.triggerSource) body.trigger_source = payload.triggerSource
-  // Only the selected checks run (CWE ids). Per spec A-3.
+  // Only the selected checks run — catalog keys (e.g. "sql-injection").
   if (payload.selectedItems && payload.selectedItems.length > 0) {
     body.selected_items = payload.selectedItems
   }
   if (payload.commitSha) body.commit_sha = payload.commitSha
   if (payload.isFirstRun !== undefined) body.is_first_run = payload.isFirstRun
 
-  const res = await fetch(`${API_BASE}/api/pipelines`, {
+  // Backend pipeline-start endpoint (per backend spec 3-2).
+  const res = await fetch(`${API_BASE}/start-pipeline`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -1080,7 +1081,7 @@ export async function startPipeline(
 
   if (!res.ok) {
     const text = await res.text().catch(() => '')
-    console.error('[api] /api/pipelines failed:', res.status, text)
+    console.error('[api] /start-pipeline failed:', res.status, text)
     let detail = ''
     let parsed: UnknownRecord | null = null
     try {
