@@ -1,4 +1,9 @@
 import type { RepositoryItem } from '@/data/repositories'
+import {
+  descriptionForKey,
+  type CheckSeverity,
+  type SecurityCheckItem,
+} from '@/data/securityCatalog'
 
 const API_BASE =
   window.location.protocol === 'file:'
@@ -488,11 +493,22 @@ export type SecurityFinding = {
   id: string
   scanner: string
   ruleId: string
+  /** Matched policy item name (CWE selection). null => detected outside the
+   *  16-item policy set ("16항목 외"). */
+  policyItem: string | null
+  /** CWE id, e.g. "CWE-89". Classification is by CWE, not CVE. */
+  cwe: string | null
+  /** Whether this finding is within the selected check scope. false => shown
+   *  dimmed under the "정책 범위 밖" section, no gate impact. */
+  inScope: boolean
   cve: string | null
   cvss: string | null
+  cvssScore: number | null
   title: string
   severity: SecuritySeverity
   filePath: string
+  lineNumber: number | null
+  columnNumber: number | null
   lineStart: number | null
   lineEnd: number | null
   codeSnippet: string | null
@@ -500,6 +516,42 @@ export type SecurityFinding = {
   description: string
   aiSuggestion: string
   references: string[]
+}
+
+// The 4-state deployment gate verdict (화면 B). NOT the same as JobVerdict
+// (passed/warning/failed) used by the summary endpoint — this is the richer
+// gate model from GET /api/jobs/{id}/result → security.verdict.
+export type VerdictKind = 'pass' | 'warn' | 'block_pending_approval' | 'block'
+
+// The verdict object is consumed VERBATIM — colors, labels and reasons are
+// pre-computed by the backend and must NOT be re-derived on the frontend
+// (spec B-0: "그대로 사용, 재계산 금지").
+export type JobVerdictDetail = {
+  verdict: VerdictKind | null
+  /** Gauge/banner color — use directly, never recompute from score. */
+  gaugeColor: string | null
+  score: number | null
+  /** e.g. "82.0/100 (검사 항목 9개 기준)" — print as-is. */
+  scoreLabel: string | null
+  /** In-scope severity counts. */
+  counts: Record<SecuritySeverity, number>
+  /** CWE ids the user selected for this run. */
+  selectedItems: string[]
+  selectedCount: number | null
+  /** Findings detected outside the selected scope. >0 => B-3 banner. */
+  outOfScopeCount: number
+  /** true => approval path exists (화면 C CTA). */
+  requiresApproval: boolean
+  blockReasons: string[]
+  warnReasons: string[]
+  /** Per-severity score deductions. */
+  scoreBreakdown: Record<SecuritySeverity, number>
+  /** Commit actually scanned; compare with requested (B-4). */
+  scannedCommitSha: string | null
+  requestedCommitSha: string | null
+  commitMismatch: boolean
+  /** CWEs that passed the gate under approval (B-5). */
+  acknowledgedCwes: string[]
 }
 
 export type JobResult = {
@@ -512,6 +564,9 @@ export type JobResult = {
   codeQualityScore: number | null
   verdict: JobVerdict | null
   verdictReason: string | null
+  /** Rich gate verdict (new model). null when the backend returns only the
+   *  legacy flat shape — the page then falls back to the legacy verdict. */
+  verdictDetail: JobVerdictDetail | null
   totalFindings: number
   severitySummary: Record<SecuritySeverity, number>
   scannerSummaries: SecuritySummaryItem[]
@@ -519,52 +574,162 @@ export type JobResult = {
 }
 
 function mapFinding(raw: UnknownRecord, idx: number): SecurityFinding {
-  const lineStart =
-    pick<number>(raw, 'line_start', 'lineStart', 'line_number', 'lineNumber') ?? null
-  const lineEnd = pick<number>(raw, 'line_end', 'lineEnd') ?? lineStart
+  const lineNumber =
+    pick<number>(raw, 'line_number', 'lineNumber', 'line_start', 'lineStart') ?? null
+  const lineEnd = pick<number>(raw, 'line_end', 'lineEnd') ?? lineNumber
   const cvssRaw = pick<string | number>(raw, 'cvss')
   const refsRaw = pick<unknown[]>(raw, 'references')
+  // in_scope defaults to true: legacy payloads have no scope concept, so
+  // treat every finding as in-scope unless the backend explicitly flags it.
+  const inScopeRaw = pick<boolean>(raw, 'in_scope', 'inScope')
+  const policyItem = pick<string>(raw, 'policy_item', 'policyItem') ?? null
   return {
     id: pick<string | number>(raw, 'id', 'finding_id', 'findingId') !== undefined
       ? String(pick<string | number>(raw, 'id', 'finding_id', 'findingId'))
       : String(idx),
     scanner: pick<string>(raw, 'scanner', 'scanner_name', 'scannerName') ?? '',
     ruleId: pick<string>(raw, 'rule_id', 'ruleId') ?? '',
+    policyItem,
+    cwe: pick<string>(raw, 'cwe', 'cwe_id', 'cweId') ?? null,
+    inScope: inScopeRaw ?? true,
     cve: pick<string>(raw, 'cve') ?? null,
     cvss: cvssRaw !== undefined && cvssRaw !== null ? String(cvssRaw) : null,
+    cvssScore: pick<number>(raw, 'cvss_score', 'cvssScore') ?? null,
     title: pick<string>(raw, 'title', 'rule_id', 'ruleId') ?? '(제목 없음)',
     severity: normalizeSeverity(pick<string>(raw, 'severity')),
     filePath: pick<string>(raw, 'file_path', 'filePath') ?? '',
-    lineStart,
+    lineNumber,
+    columnNumber: pick<number>(raw, 'column_number', 'columnNumber') ?? null,
+    lineStart: lineNumber,
     lineEnd,
     codeSnippet: pick<string>(raw, 'code_snippet', 'codeSnippet') ?? null,
     codeSnippetStartLine:
       pick<number>(raw, 'code_snippet_start_line', 'codeSnippetStartLine') ?? null,
-    description: pick<string>(raw, 'description', 'message') ?? '',
+    description: pick<string>(raw, 'message', 'description') ?? '',
     aiSuggestion:
       pick<string>(
         raw,
-        'ai_suggestion',
-        'aiSuggestion',
         'ai_recommendation',
         'aiRecommendation',
+        'ai_suggestion',
+        'aiSuggestion',
       ) ?? '',
     references: Array.isArray(refsRaw) ? (refsRaw as string[]) : [],
   }
 }
 
+function parseSeverityCounts(obj: UnknownRecord | undefined): Record<SecuritySeverity, number> {
+  const o = obj ?? {}
+  return {
+    critical: pick<number>(o, 'critical') ?? 0,
+    high: pick<number>(o, 'high') ?? 0,
+    medium: pick<number>(o, 'medium') ?? 0,
+    low: pick<number>(o, 'low') ?? 0,
+  }
+}
+
 function mapJobResult(raw: UnknownRecord): JobResult {
+  // The new shape nests everything under `security`; the legacy flat shape
+  // puts verdict/findings at the top level. Support both.
+  const security = (pick<UnknownRecord>(raw, 'security') ?? raw) as UnknownRecord
   const scores = (pick<UnknownRecord>(raw, 'scores') ?? {}) as UnknownRecord
-  const verdictRaw = (pick<UnknownRecord>(raw, 'verdict') ?? {}) as UnknownRecord
-  const findingsRaw = (pick<unknown[]>(raw, 'findings') ?? []) as UnknownRecord[]
+  // §3-4 actual shape: `security.verdict` is a STRING ("block") and
+  // score / gauge_color / *_count / block_reasons sit DIRECTLY on `security`
+  // as siblings. A nested-object form (security.verdict = {...}) is also
+  // tolerated. The legacy summary endpoint's verdict.overall_status is handled
+  // by mapJobDetail, not here.
+  const rawVerdictField = security['verdict']
+  const verdictObj: UnknownRecord =
+    rawVerdictField && typeof rawVerdictField === 'object'
+      ? (rawVerdictField as UnknownRecord)
+      : security
+  const verdictKind =
+    typeof rawVerdictField === 'string'
+      ? rawVerdictField
+      : pick<string>(verdictObj, 'verdict')
+
+  const findingsRaw = (pick<unknown[]>(security, 'findings') ??
+    pick<unknown[]>(raw, 'findings') ??
+    []) as UnknownRecord[]
   const scannerRaw = (pick<unknown[]>(
-    raw,
+    security,
+    'summaries',
     'scanner_summaries',
     'scannerSummaries',
-    'summaries',
-  ) ?? []) as UnknownRecord[]
+  ) ??
+    pick<unknown[]>(raw, 'scanner_summaries', 'scannerSummaries', 'summaries') ??
+    []) as UnknownRecord[]
 
   const findings = findingsRaw.map(mapFinding)
+
+  // Build the rich gate verdict ONLY when the new model is recognizable —
+  // otherwise leave it null so the page falls back to the legacy verdict.
+  const isNewVerdict =
+    verdictKind === 'pass' ||
+    verdictKind === 'warn' ||
+    verdictKind === 'block_pending_approval' ||
+    verdictKind === 'block' ||
+    pick(verdictObj, 'gauge_color', 'gaugeColor', 'score_label', 'scoreLabel', 'out_of_scope_count') !==
+      undefined
+
+  // counts: prefer a nested `counts` object, else the flat *_count fields the
+  // backend actually returns (critical_count/high_count/...).
+  const countsObj = pick<UnknownRecord>(verdictObj, 'counts')
+  const counts: Record<SecuritySeverity, number> = countsObj
+    ? parseSeverityCounts(countsObj)
+    : {
+        critical: pick<number>(verdictObj, 'critical_count', 'criticalCount') ?? 0,
+        high: pick<number>(verdictObj, 'high_count', 'highCount') ?? 0,
+        medium: pick<number>(verdictObj, 'medium_count', 'mediumCount') ?? 0,
+        low: pick<number>(verdictObj, 'low_count', 'lowCount') ?? 0,
+      }
+
+  const requestedCommitSha =
+    pick<string>(verdictObj, 'requested_commit_sha', 'requestedCommitSha') ??
+    pick<string>(raw, 'commit_sha', 'commitSha', 'requested_commit_sha') ??
+    null
+  const scannedCommitSha =
+    pick<string>(verdictObj, 'scanned_commit_sha', 'scannedCommitSha') ??
+    pick<string>(raw, 'scanned_commit_sha', 'scannedCommitSha') ??
+    null
+  const explicitMismatch = pick<boolean>(verdictObj, 'commit_mismatch', 'commitMismatch')
+  const commitMismatch =
+    explicitMismatch ??
+    (!!requestedCommitSha && !!scannedCommitSha && requestedCommitSha !== scannedCommitSha)
+
+  // acknowledged_cwes may live on the verdict OR on a top-level `approval`.
+  const approvalObj = pick<UnknownRecord>(raw, 'approval')
+  const ackRaw =
+    pick<unknown[]>(verdictObj, 'acknowledged_cwes', 'acknowledgedCwes') ??
+    (approvalObj
+      ? pick<unknown[]>(approvalObj, 'acknowledged_cwes', 'acknowledgedCwes')
+      : undefined)
+  const selRaw = pick<unknown[]>(verdictObj, 'selected_items', 'selectedItems')
+  const blockReasonsRaw = pick<unknown[]>(verdictObj, 'block_reasons', 'blockReasons')
+  const warnReasonsRaw = pick<unknown[]>(verdictObj, 'warn_reasons', 'warnReasons')
+
+  const verdictDetail: JobVerdictDetail | null = isNewVerdict
+    ? {
+        verdict: (verdictKind as VerdictKind) ?? null,
+        gaugeColor: pick<string>(verdictObj, 'gauge_color', 'gaugeColor') ?? null,
+        score: pick<number>(verdictObj, 'score') ?? null,
+        scoreLabel: pick<string>(verdictObj, 'score_label', 'scoreLabel') ?? null,
+        counts,
+        selectedItems: Array.isArray(selRaw) ? (selRaw as string[]) : [],
+        selectedCount: pick<number>(verdictObj, 'selected_count', 'selectedCount') ?? null,
+        outOfScopeCount: pick<number>(verdictObj, 'out_of_scope_count', 'outOfScopeCount') ?? 0,
+        requiresApproval: pick<boolean>(verdictObj, 'requires_approval', 'requiresApproval') ?? false,
+        blockReasons: Array.isArray(blockReasonsRaw) ? (blockReasonsRaw as string[]) : [],
+        warnReasons: Array.isArray(warnReasonsRaw) ? (warnReasonsRaw as string[]) : [],
+        scoreBreakdown: parseSeverityCounts(
+          pick<UnknownRecord>(verdictObj, 'score_breakdown', 'scoreBreakdown'),
+        ),
+        scannedCommitSha,
+        requestedCommitSha,
+        commitMismatch,
+        acknowledgedCwes: Array.isArray(ackRaw) ? (ackRaw as string[]) : [],
+      }
+    : null
 
   const scannerSummaries: SecuritySummaryItem[] = scannerRaw.map((item) => ({
     scanner: pick<string>(item, 'scanner', 'scanner_name', 'scannerName') ?? '',
@@ -609,7 +774,7 @@ function mapJobResult(raw: UnknownRecord): JobResult {
   const securityScore = pick<number>(scores, 'security_score', 'securityScore')
   const codeQualityScore = pick<number>(scores, 'code_quality_score', 'codeQualityScore')
   const totalFindings =
-    pick<number>(verdictRaw, 'total_findings', 'totalFindings') ?? findings.length
+    pick<number>(verdictObj, 'total_findings', 'totalFindings') ?? findings.length
 
   return {
     jobId: pick<string>(raw, 'job_id', 'jobId') ?? '',
@@ -617,14 +782,16 @@ function mapJobResult(raw: UnknownRecord): JobResult {
     repoName: repoNameFromUrl(repoUrl),
     branch: pick<string>(raw, 'branch') ?? '',
     completedAt: pick<string>(raw, 'completed_at', 'completedAt') ?? null,
+    // Prefer the verdict's pre-computed score (new model) — never recompute
+    // when the backend already gave us one.
     securityScore:
-      typeof securityScore === 'number'
-        ? securityScore
-        : computeSecurityScore(severitySummary),
+      verdictDetail?.score ??
+      (typeof securityScore === 'number' ? securityScore : computeSecurityScore(severitySummary)),
     codeQualityScore: typeof codeQualityScore === 'number' ? codeQualityScore : null,
     verdict:
-      (pick<JobVerdict>(verdictRaw, 'overall_status', 'overallStatus') as JobVerdict) ?? null,
-    verdictReason: pick<string>(verdictRaw, 'status_reason', 'statusReason') ?? null,
+      (pick<JobVerdict>(verdictObj, 'overall_status', 'overallStatus') as JobVerdict) ?? null,
+    verdictReason: pick<string>(verdictObj, 'status_reason', 'statusReason') ?? null,
+    verdictDetail,
     totalFindings,
     severitySummary,
     scannerSummaries,
@@ -656,7 +823,213 @@ export async function fetchJobResult(
   return mapJobResult((await res.json()) as UnknownRecord)
 }
 
+// Raised when the approval endpoints return 403 — the caller (보안책임자/
+// 팀리드가 아닌 개발자 본인 등) lacks approval rights. The UI surfaces this as
+// a permission notice instead of a generic error (화면 C C-2 / C-5).
+export class ApprovalForbiddenError extends Error {
+  readonly status = 403
+  readonly detail: string
+  constructor(detail: string) {
+    super(detail || '승인 권한이 없습니다. 보안책임자/팀리드 권한이 필요합니다.')
+    this.name = 'ApprovalForbiddenError'
+    this.detail = detail
+  }
+}
+
+export type ApprovalResponse = {
+  status: string
+  /** Backend auto-enqueues a follow-up job on approve — track via this id. */
+  followupJobId: string | null
+  /** CWEs accepted under approval (echoed back). Connects to B-5. */
+  acknowledgedCwes: string[]
+  message: string
+}
+
+async function postApproval(
+  token: string,
+  jobId: string,
+  action: 'request' | 'approve' | 'reject',
+  body: UnknownRecord,
+): Promise<ApprovalResponse> {
+  const res = await fetch(
+    `${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/approval/${action}`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  )
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    let detail = ''
+    try {
+      detail = pick<string>(JSON.parse(text) as UnknownRecord, 'detail', 'message') ?? ''
+    } catch {
+      detail = text
+    }
+    console.error(`[api] /approval/${action} failed:`, res.status, text)
+    if (res.status === 403) throw new ApprovalForbiddenError(detail)
+    throw new Error(
+      detail ? `승인 처리 실패 (${res.status}): ${detail}` : `승인 처리 실패 (${res.status})`,
+    )
+  }
+
+  const data = (await res.json().catch(() => ({}))) as UnknownRecord
+  const ack = pick<unknown[]>(data, 'acknowledged_cwes', 'acknowledgedCwes')
+  return {
+    status: pick<string>(data, 'status') ?? 'ok',
+    followupJobId: pick<string>(data, 'followup_job_id', 'followupJobId') ?? null,
+    acknowledgedCwes: Array.isArray(ack) ? (ack as string[]) : [],
+    message: pick<string>(data, 'message') ?? '',
+  }
+}
+
+// C-1: create an approval request → "승인 대기" 상태.
+export function requestApproval(
+  token: string,
+  jobId: string,
+  reason?: string,
+): Promise<ApprovalResponse> {
+  return postApproval(token, jobId, 'request', reason ? { reason } : {})
+}
+
+// C-2 (전체 승인) / C-3 (부분 승인). Omit approvedCwes → 전체 수용; pass a subset
+// of CWE ids → only those are accepted, the rest stay blocked.
+export function approveJob(
+  token: string,
+  jobId: string,
+  reason: string,
+  approvedCwes?: string[],
+): Promise<ApprovalResponse> {
+  const body: UnknownRecord = { reason }
+  if (approvedCwes && approvedCwes.length > 0) body.approved_cwes = approvedCwes
+  return postApproval(token, jobId, 'approve', body)
+}
+
+// C-2: reject — 수용 불가, 즉시 수정 필요.
+export function rejectJob(
+  token: string,
+  jobId: string,
+  reason: string,
+): Promise<ApprovalResponse> {
+  return postApproval(token, jobId, 'reject', { reason })
+}
+
+// 화면 D — 감사 로그 (append-only 승인 이력).
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected'
+
+export type ApprovalLogEntry = {
+  id: string
+  jobId: string
+  /** Commit actually scanned (B-4 추적 뷰). */
+  scannedCommitSha: string | null
+  requestedCommitSha: string | null
+  commitMismatch: boolean
+  /** 대상 CWE 목록. */
+  cwes: string[]
+  reason: string
+  approver: string
+  status: ApprovalStatus
+  /** 일시 (요청/처리 시각). */
+  createdAt: string | null
+  /** 만료 — null이면 무기한 아님(보통 커밋 한정). */
+  expiresAt: string | null
+}
+
+function mapApprovalEntry(raw: UnknownRecord, idx: number): ApprovalLogEntry {
+  const scannedCommitSha =
+    pick<string>(raw, 'scanned_commit_sha', 'scannedCommitSha', 'commit', 'commit_sha') ?? null
+  const requestedCommitSha =
+    pick<string>(raw, 'requested_commit_sha', 'requestedCommitSha') ?? null
+  const explicitMismatch = pick<boolean>(raw, 'commit_mismatch', 'commitMismatch')
+  const cwesRaw = pick<unknown[]>(raw, 'cwes', 'target_cwes', 'targetCwes', 'approved_cwes', 'approvedCwes')
+  const rawStatus = (pick<string>(raw, 'status') ?? 'pending').toLowerCase()
+  const status: ApprovalStatus =
+    rawStatus === 'approved' || rawStatus === 'rejected' ? rawStatus : 'pending'
+  return {
+    id:
+      pick<string | number>(raw, 'id', 'approval_id', 'approvalId') !== undefined
+        ? String(pick<string | number>(raw, 'id', 'approval_id', 'approvalId'))
+        : String(idx),
+    jobId: pick<string>(raw, 'job_id', 'jobId') ?? '',
+    scannedCommitSha,
+    requestedCommitSha,
+    commitMismatch:
+      explicitMismatch ??
+      (!!requestedCommitSha && !!scannedCommitSha && requestedCommitSha !== scannedCommitSha),
+    cwes: Array.isArray(cwesRaw) ? (cwesRaw as string[]) : [],
+    reason: pick<string>(raw, 'reason') ?? '',
+    approver: pick<string>(raw, 'approver', 'approved_by', 'approvedBy', 'reviewer') ?? '',
+    status,
+    createdAt:
+      pick<string>(raw, 'created_at', 'createdAt', 'requested_at', 'requestedAt', 'at') ?? null,
+    expiresAt: pick<string>(raw, 'expires_at', 'expiresAt', 'expiry') ?? null,
+  }
+}
+
+// GET /api/approvals?status=... — append-only approval history. `status`
+// omitted returns all. Returns [] on failure so the audit view degrades
+// gracefully rather than blanking.
+export async function fetchApprovals(
+  token: string,
+  status?: ApprovalStatus,
+): Promise<ApprovalLogEntry[]> {
+  const qs = status ? `?status=${encodeURIComponent(status)}` : ''
+  const res = await fetch(`${API_BASE}/api/approvals${qs}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+
+  if (!res.ok) {
+    console.error('[api] /api/approvals failed:', res.status)
+    if (res.status === 401) {
+      const text = await res.text().catch(() => '')
+      throw new AuthExpiredError(text || '인증이 만료되었습니다. 다시 로그인해 주세요.')
+    }
+    throw new Error(`Failed to fetch approvals (${res.status})`)
+  }
+
+  const data = (await res.json()) as unknown
+  const list = Array.isArray(data)
+    ? (data as UnknownRecord[])
+    : (pick<unknown[]>(data as UnknownRecord, 'approvals', 'items', 'results') ?? [])
+  return (list as UnknownRecord[]).map(mapApprovalEntry)
+}
+
 export type PipelineEnvironment = 'development' | 'feature' | 'staging' | 'production'
+
+// GET /api/security/catalog — the 16-item security policy catalog. Returns
+// [] on failure so callers fall back to the bundled local catalog. Maps the
+// backend's {key,name,cwe,grade} to our SecurityCheckItem, reusing local
+// descriptions (the API carries none).
+function normalizeGrade(grade: string | undefined): CheckSeverity {
+  const g = (grade ?? '').toLowerCase()
+  return g === 'critical' || g === 'high' || g === 'medium' || g === 'low' ? g : 'low'
+}
+
+export async function fetchSecurityCatalog(token: string): Promise<SecurityCheckItem[]> {
+  const res = await fetch(`${API_BASE}/api/security/catalog`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!res.ok) {
+    console.error('[api] /api/security/catalog failed:', res.status)
+    return []
+  }
+  const data = (await res.json()) as UnknownRecord
+  const items = (pick<unknown[]>(data, 'items') ?? []) as UnknownRecord[]
+  return items
+    .map((it) => {
+      const key = pick<string>(it, 'key', 'id') ?? ''
+      return {
+        id: key,
+        title: pick<string>(it, 'name', 'title') ?? key,
+        cwe: pick<string>(it, 'cwe', 'cwe_id') ?? '',
+        severity: normalizeGrade(pick<string>(it, 'grade', 'severity')),
+        description: pick<string>(it, 'description') ?? descriptionForKey(key),
+      }
+    })
+    .filter((c) => c.id)
+}
 
 export type StartPipelinePayload = {
   repoUrl: string

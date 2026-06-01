@@ -502,7 +502,7 @@ ipcMain.handle('window:is-maximized', (event) => {
   return target.isMaximized()
 })
 
-const apiBaseUrl = process.env.VITE_API_BASE_URL || 'http://ec2-54-221-222-244.compute-1.amazonaws.com/capstonelab/capstone-back'
+const apiBaseUrl = process.env.VITE_API_BASE_URL || 'https://api.pwd.kr/capstonelab/capstone-back'
 const DEFAULT_AUTH_LOGIN_URL = `${apiBaseUrl}/auth/github/login`
 
 const ALLOWED_AUTH_HOSTS = new Set([

@@ -18,6 +18,7 @@ import {
   fetchJobsByIds,
   fetchLatestCommit,
   fetchReposWithBranches,
+  fetchSecurityCatalog,
   getCachedRepos,
   getLaunchedRepos,
   getTrackedJobIds,
@@ -39,11 +40,12 @@ import { getLanguageColor } from '@/lib/languageColors'
 import type { RepositoryItem } from '@/data/repositories'
 import {
   allCheckIds,
-  catalogBySeverity,
+  buildCatalogBySeverity,
   securityCheckCatalog,
   severityMeta,
   severityOrder,
   type CheckSeverity,
+  type SecurityCheckItem,
 } from '@/data/securityCatalog'
 
 const environmentOptions: { value: PipelineEnvironment; label: string }[] = [
@@ -74,7 +76,10 @@ export function NewPipelinePage() {
   // Latest commit for the current repo+branch, tagged with the selection key
   // it was fetched for so a stale SHA is never sent after switching repos.
   const [commitInfo, setCommitInfo] = useState<{ key: string; sha: string } | null>(null)
-  // Default to ALL 16 checks selected (spec: "전체 선택" 기본값 권장).
+  // Security policy catalog — fetched from GET /api/security/catalog, with the
+  // bundled list as a fallback so the selection UI always renders.
+  const [catalog, setCatalog] = useState<SecurityCheckItem[]>(securityCheckCatalog)
+  // Default to ALL checks selected (spec: "전체 선택" 기본값 권장).
   const [selectedVulnerabilityIds, setSelectedVulnerabilityIds] =
     useState<string[]>(allCheckIds)
   const [launchedRepoUrls, setLaunchedRepoUrls] = useState<string[]>(() =>
@@ -143,7 +148,23 @@ export function NewPipelinePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRepo, launchedRepoUrls, cacheKey])
 
-  const allVulnerabilityIds = allCheckIds
+  const allVulnerabilityIds = useMemo(() => catalog.map((c) => c.id), [catalog])
+  const bySeverity = useMemo(() => buildCatalogBySeverity(catalog), [catalog])
+
+  // Load the policy catalog from the API; keep the local fallback if it fails
+  // or returns nothing. Only sets state in the async callback.
+  useEffect(() => {
+    if (!token) return
+    let cancelled = false
+    fetchSecurityCatalog(token)
+      .then((items) => {
+        if (!cancelled && items.length > 0) setCatalog(items)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [token])
 
   // Selection key for the commit we want — so we never send a SHA fetched for
   // a different repo/branch than the one currently selected.
@@ -222,7 +243,7 @@ export function NewPipelinePage() {
   // Per-severity "전체 선택/해제" toggle. If every item in the grade is already
   // selected, clicking clears them; otherwise it selects all of them.
   const toggleSeverityGroup = (severity: CheckSeverity) => {
-    const groupIds = catalogBySeverity[severity].map((c) => c.id)
+    const groupIds = bySeverity[severity].map((c) => c.id)
     setSelectedVulnerabilityIds((prev) => {
       const allSelected = groupIds.every((id) => prev.includes(id))
       if (allSelected) {
@@ -240,7 +261,7 @@ export function NewPipelinePage() {
     )
   }
 
-  const selectedVulnerabilityTitles = securityCheckCatalog
+  const selectedVulnerabilityTitles = catalog
     .filter((option) => selectedVulnerabilityIds.includes(option.id))
     .map((option) => option.title)
 
@@ -526,7 +547,7 @@ export function NewPipelinePage() {
                 <div className="mt-3 space-y-3">
                   {severityOrder.map((severity) => {
                     const meta = severityMeta[severity]
-                    const items = catalogBySeverity[severity]
+                    const items = bySeverity[severity]
                     const selectedInGroup = items.filter((item) =>
                       selectedVulnerabilityIds.includes(item.id),
                     ).length

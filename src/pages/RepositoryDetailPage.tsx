@@ -370,7 +370,7 @@ export function RepositoryDetailPage() {
                         if (e.key === 'Enter') handleDomainSave()
                         if (e.key === 'Escape') handleDomainCancel()
                       }}
-                      placeholder="예: my-app.compute.amazonaws.com"
+                      placeholder="예: my-app.example.com"
                       autoFocus
                       className="flex-1 rounded-md border border-[#3A3A3A] bg-[#0F0F0F] px-2 py-1 text-[14px] text-[#D1D5DB] outline-none focus:border-[#34D399]"
                     />

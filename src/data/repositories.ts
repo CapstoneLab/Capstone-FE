@@ -35,7 +35,7 @@ export const repositorySeed: RepositoryItem[] = [
     branches: ['main', 'develop', 'feature/login'],
     detectEnabled: true,
     repositoryUrl: 'https://github.com/myuser/web-app',
-    domainUrl: 'ec2-3-39-24-101.ap-northeast-2.compute.amazonaws.com',
+    domainUrl: 'web-app.example.com',
     pipelineStatus: 'success',
     source: {
       branch: 'feature/login',
@@ -55,7 +55,7 @@ export const repositorySeed: RepositoryItem[] = [
     branches: ['main', 'develop', 'feature/login', 'release/v1'],
     detectEnabled: true,
     repositoryUrl: 'https://github.com/myuser/api-server',
-    domainUrl: 'ec2-54-180-11-245.ap-northeast-2.compute.amazonaws.com',
+    domainUrl: 'api-server.example.com',
     pipelineStatus: 'pending',
     source: {
       branch: 'develop',

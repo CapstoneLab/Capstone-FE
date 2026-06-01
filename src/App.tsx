@@ -1,4 +1,6 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
+import { ApprovalPage } from '@/pages/ApprovalPage'
+import { AuditLogPage } from '@/pages/AuditLogPage'
 import { AuthPage } from '@/pages/AuthPage'
 import { DashboardPage } from '@/pages/DashboardPage'
 import { DocsPage } from '@/pages/DocsPage'
@@ -29,6 +31,8 @@ function App() {
       <Route path="/pipeline/new" element={<NewPipelinePage />} />
       <Route path="/pipeline/progress" element={<PipelineProcessPage />} />
       <Route path="/pipeline/result" element={<PipelineProgressPage />} />
+      <Route path="/pipeline/approval" element={<ApprovalPage />} />
+      <Route path="/approvals" element={<AuditLogPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )

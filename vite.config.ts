@@ -6,7 +6,7 @@ import tailwindcss from '@tailwindcss/vite'
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  const apiBaseUrl = env.VITE_API_BASE_URL || 'http://ec2-54-221-222-244.compute-1.amazonaws.com/capstonelab/capstone-back'
+  const apiBaseUrl = env.VITE_API_BASE_URL || 'https://api.pwd.kr/capstonelab/capstone-back'
   const apiOrigin = new URL(apiBaseUrl).origin
   const apiPath = new URL(apiBaseUrl).pathname
 
