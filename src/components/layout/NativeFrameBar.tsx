@@ -9,14 +9,18 @@ import {
   House,
   Loader2,
   Minus,
+  Monitor,
+  Moon,
   RotateCw,
   Square,
+  Sun,
   UserRound,
   X,
 } from 'lucide-react'
 import { useLocation, useNavigate, useNavigationType } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
 import { useAuth } from '@/contexts/AuthContext'
+import { useTheme, type ThemePreference } from '@/contexts/ThemeContext'
 import defaultProfileSvg from '@/assets/default-profile.svg'
 import appLogo from '@/assets/logo.png'
 import {
@@ -50,8 +54,10 @@ export function NativeFrameBar() {
   const location = useLocation()
   const navigationType = useNavigationType()
   const { user, logout } = useAuth()
+  const { theme, setTheme } = useTheme()
   const [isMaximized, setIsMaximized] = useState(false)
   const [isProfileDialogOpen, setIsProfileDialogOpen] = useState(false)
+  const [isThemeDialogOpen, setIsThemeDialogOpen] = useState(false)
   const [isUpdateDialogOpen, setIsUpdateDialogOpen] = useState(false)
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false)
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false)
@@ -213,15 +219,40 @@ export function NativeFrameBar() {
     }
   }
 
+  // The titlebar uses theme tokens (defined in index.css) so it switches
+  // correctly between dark and light modes without touching every utility
+  // class individually.
+  const titlebarStyle: React.CSSProperties = {
+    backgroundColor: 'var(--app-titlebar-bg)',
+    borderColor: 'var(--app-border)',
+    color: 'var(--app-titlebar-text)',
+  }
+  const iconBtnStyle: React.CSSProperties = {
+    color: 'var(--app-titlebar-icon)',
+  }
+  const themeIcon =
+    theme === 'light' ? <Sun className="h-4 w-4" />
+    : theme === 'dark' ? <Moon className="h-4 w-4" />
+    : <Monitor className="h-4 w-4" />
+  const themeLabel: Record<ThemePreference, string> = {
+    light: '라이트 모드',
+    dark: '다크 모드',
+    system: '시스템 설정',
+  }
+
   return (
-    <div className="fixed left-0 right-0 top-0 z-50 border-b border-gray-600/75 bg-[#1E1E1E] [-webkit-app-region:drag]">
+    <div
+      className="fixed left-0 right-0 top-0 z-50 border-b [-webkit-app-region:drag]"
+      style={titlebarStyle}
+    >
       <div className="relative flex h-9 w-full items-center justify-between px-3">
         <div className="flex items-center gap-1 [-webkit-app-region:no-drag]">
           <button
             type="button"
             aria-label="홈"
             onClick={() => navigate(user ? '/dashboard' : '/')}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70"
+            style={iconBtnStyle}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-xl transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70"
           >
             <House className="h-4 w-4" />
           </button>
@@ -229,7 +260,8 @@ export function NativeFrameBar() {
             type="button"
             aria-label="새로고침"
             onClick={() => window.location.reload()}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70"
+            style={iconBtnStyle}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-xl transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70"
           >
             <RotateCw className="h-4 w-4" />
           </button>
@@ -238,7 +270,8 @@ export function NativeFrameBar() {
             aria-label="뒤로"
             onClick={() => canGoBack && navigate(-1)}
             disabled={!canGoBack}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70 disabled:cursor-not-allowed disabled:text-gray-500 disabled:hover:bg-transparent disabled:hover:text-gray-500"
+            style={iconBtnStyle}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-xl transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
           >
             <ChevronLeft className="h-4 w-4" />
           </button>
@@ -247,7 +280,8 @@ export function NativeFrameBar() {
             aria-label="앞으로"
             onClick={() => canGoForward && navigate(1)}
             disabled={!canGoForward}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-200 transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70 disabled:cursor-not-allowed disabled:text-gray-500 disabled:hover:bg-transparent disabled:hover:text-gray-500"
+            style={iconBtnStyle}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-xl transition-colors hover:bg-gray-700/70 hover:text-white active:bg-gray-600/70 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
           >
             <ChevronRight className="h-4 w-4" />
           </button>
@@ -255,16 +289,76 @@ export function NativeFrameBar() {
 
         <div className="pointer-events-none absolute left-1/2 flex -translate-x-1/2 items-center gap-2">
           <img src={appIconSrc} alt="앱 아이콘" className="h-7 w-7 rounded-xl object-cover" />
-          <p className="text-sm font-semibold text-gray-100">SecuPipeline</p>
+          <p className="text-sm font-semibold" style={{ color: 'var(--app-titlebar-text)' }}>
+            SecuPipeline
+          </p>
         </div>
 
         <div className="flex items-center gap-1 [-webkit-app-region:no-drag]">
+          {/* Theme switcher — placed in the right-side group so it lives in
+              the titlebar but never overlaps the centered title. Three
+              options: dark / light / system (system is the default). */}
+          <Dialog open={isThemeDialogOpen} onOpenChange={setIsThemeDialogOpen}>
+            <DialogTrigger asChild>
+              <button
+                type="button"
+                aria-label={`테마: ${themeLabel[theme]}`}
+                style={iconBtnStyle}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-xl transition-colors hover:bg-[#2F2F2F] hover:text-white active:bg-[#3A3A3A]"
+              >
+                {themeIcon}
+              </button>
+            </DialogTrigger>
+
+            <DialogContent
+              className="left-auto right-13 top-13.5 w-[min(92vw,240px)] translate-x-0 translate-y-0 border-gray-600/70 p-0"
+              style={{ backgroundColor: 'var(--app-bg-elevated)' }}
+            >
+              <div className="border-b border-gray-700/40 px-4 py-3">
+                <DialogHeader>
+                  <DialogTitle className="text-base">테마</DialogTitle>
+                </DialogHeader>
+              </div>
+              <div className="flex flex-col p-2">
+                {(
+                  [
+                    { key: 'system', label: '시스템 설정', icon: Monitor },
+                    { key: 'light', label: '라이트 모드', icon: Sun },
+                    { key: 'dark', label: '다크 모드', icon: Moon },
+                  ] as const
+                ).map(({ key, label, icon: Icon }) => {
+                  const active = theme === key
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => {
+                        setTheme(key)
+                        setIsThemeDialogOpen(false)
+                      }}
+                      className={`flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
+                        active ? 'bg-emerald-500/15 text-emerald-300' : 'hover:bg-white/5'
+                      }`}
+                    >
+                      <Icon className="h-4 w-4" />
+                      <span className="flex-1 text-left">{label}</span>
+                      {active ? (
+                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                      ) : null}
+                    </button>
+                  )
+                })}
+              </div>
+            </DialogContent>
+          </Dialog>
+
           <Dialog open={isProfileDialogOpen} onOpenChange={setIsProfileDialogOpen}>
             <DialogTrigger asChild>
               <button
                 type="button"
                 aria-label="프로필"
-                className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-300 transition-colors hover:bg-[#2F2F2F] hover:text-white active:bg-[#3A3A3A]"
+                style={iconBtnStyle}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-xl transition-colors hover:bg-[#2F2F2F] hover:text-white active:bg-[#3A3A3A]"
               >
                 {user?.avatarUrl ? (
                   <img src={user.avatarUrl} alt={user.name || user.login} className="h-5 w-5 rounded-full" />
@@ -356,7 +450,8 @@ export function NativeFrameBar() {
             type="button"
             aria-label="최소화"
             onClick={() => window.desktop?.window?.minimize?.()}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-300 transition-colors hover:bg-[#2F2F2F] hover:text-white active:bg-[#3A3A3A]"
+            style={iconBtnStyle}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-xl transition-colors hover:bg-[#2F2F2F] hover:text-white active:bg-[#3A3A3A]"
           >
             <Minus className="h-4 w-4" />
           </button>
@@ -364,7 +459,8 @@ export function NativeFrameBar() {
             type="button"
             aria-label={isMaximized ? '복원' : '최대화'}
             onClick={() => window.desktop?.window?.toggleMaximize?.()}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-300 transition-colors hover:bg-[#2F2F2F] hover:text-white active:bg-[#3A3A3A]"
+            style={iconBtnStyle}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-xl transition-colors hover:bg-[#2F2F2F] hover:text-white active:bg-[#3A3A3A]"
           >
             {isMaximized ? <Copy className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
           </button>
@@ -372,7 +468,8 @@ export function NativeFrameBar() {
             type="button"
             aria-label="닫기"
             onClick={() => window.desktop?.window?.close?.()}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-xl text-gray-300 hover:bg-red-500/80 hover:text-white"
+            style={iconBtnStyle}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-xl hover:bg-red-500/80 hover:text-white"
           >
             <X className="h-4 w-4" />
           </button>

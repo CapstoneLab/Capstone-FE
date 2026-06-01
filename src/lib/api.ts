@@ -366,6 +366,54 @@ export async function fetchLatestCommit(
   }
 }
 
+const REPO_PIPELINE_INFO_PREFIX = 'secupipeline:repo-pipeline-info:'
+
+export type RepoPipelineInfo = {
+  /** Short or full SHA of the deployed commit (if extractable). */
+  commitSha?: string
+  /** First line of the commit message extracted from clone logs. */
+  commitMessage?: string
+  /** Branch the pipeline ran against. */
+  branch?: string
+  /** GitHub login of the user who triggered the run. */
+  triggeredBy?: string
+  /** ISO timestamp of when the run was created / started. */
+  triggeredAt?: string
+  /** Most recent observed JobStatus (used as a last-resort fallback for the
+   *  repo detail page's "최근 상태" badge). */
+  lastStatus?: 'queued' | 'running' | 'success' | 'failed' | 'cancelled'
+}
+
+export function getRepoPipelineInfo(
+  cacheKey: string,
+  repoIdentifier: string,
+): RepoPipelineInfo | null {
+  try {
+    const raw = localStorage.getItem(
+      `${REPO_PIPELINE_INFO_PREFIX}${cacheKey}:${repoIdentifier}`,
+    )
+    if (!raw) return null
+    return JSON.parse(raw) as RepoPipelineInfo
+  } catch {
+    return null
+  }
+}
+
+export function setRepoPipelineInfo(
+  cacheKey: string,
+  repoIdentifier: string,
+  patch: Partial<RepoPipelineInfo>,
+): void {
+  try {
+    const key = `${REPO_PIPELINE_INFO_PREFIX}${cacheKey}:${repoIdentifier}`
+    const existing = getRepoPipelineInfo(cacheKey, repoIdentifier) ?? {}
+    const merged: RepoPipelineInfo = { ...existing, ...patch }
+    localStorage.setItem(key, JSON.stringify(merged))
+  } catch {
+    // ignore storage errors
+  }
+}
+
 const REPO_DOMAIN_PREFIX = 'secupipeline:repo-domain:'
 
 export function getRepoDomainUrl(cacheKey: string, repoId: string): string {
@@ -430,11 +478,201 @@ export async function fetchJobDetail(token: string, jobId: string): Promise<JobD
   return mapJobDetail((await res.json()) as UnknownRecord)
 }
 
+function normalizeSeverity(raw: string | undefined | null): SecuritySeverity {
+  const s = (raw ?? '').toLowerCase()
+  if (s === 'critical' || s === 'high' || s === 'medium' || s === 'low') return s
+  return 'low'
+}
+
+export type SecurityFinding = {
+  id: string
+  scanner: string
+  ruleId: string
+  cve: string | null
+  cvss: string | null
+  title: string
+  severity: SecuritySeverity
+  filePath: string
+  lineStart: number | null
+  lineEnd: number | null
+  codeSnippet: string | null
+  codeSnippetStartLine: number | null
+  description: string
+  aiSuggestion: string
+  references: string[]
+}
+
+export type JobResult = {
+  jobId: string
+  repoUrl: string
+  repoName: string
+  branch: string
+  completedAt: string | null
+  securityScore: number | null
+  codeQualityScore: number | null
+  verdict: JobVerdict | null
+  verdictReason: string | null
+  totalFindings: number
+  severitySummary: Record<SecuritySeverity, number>
+  scannerSummaries: SecuritySummaryItem[]
+  findings: SecurityFinding[]
+}
+
+function mapFinding(raw: UnknownRecord, idx: number): SecurityFinding {
+  const lineStart =
+    pick<number>(raw, 'line_start', 'lineStart', 'line_number', 'lineNumber') ?? null
+  const lineEnd = pick<number>(raw, 'line_end', 'lineEnd') ?? lineStart
+  const cvssRaw = pick<string | number>(raw, 'cvss')
+  const refsRaw = pick<unknown[]>(raw, 'references')
+  return {
+    id: pick<string | number>(raw, 'id', 'finding_id', 'findingId') !== undefined
+      ? String(pick<string | number>(raw, 'id', 'finding_id', 'findingId'))
+      : String(idx),
+    scanner: pick<string>(raw, 'scanner', 'scanner_name', 'scannerName') ?? '',
+    ruleId: pick<string>(raw, 'rule_id', 'ruleId') ?? '',
+    cve: pick<string>(raw, 'cve') ?? null,
+    cvss: cvssRaw !== undefined && cvssRaw !== null ? String(cvssRaw) : null,
+    title: pick<string>(raw, 'title', 'rule_id', 'ruleId') ?? '(제목 없음)',
+    severity: normalizeSeverity(pick<string>(raw, 'severity')),
+    filePath: pick<string>(raw, 'file_path', 'filePath') ?? '',
+    lineStart,
+    lineEnd,
+    codeSnippet: pick<string>(raw, 'code_snippet', 'codeSnippet') ?? null,
+    codeSnippetStartLine:
+      pick<number>(raw, 'code_snippet_start_line', 'codeSnippetStartLine') ?? null,
+    description: pick<string>(raw, 'description', 'message') ?? '',
+    aiSuggestion:
+      pick<string>(
+        raw,
+        'ai_suggestion',
+        'aiSuggestion',
+        'ai_recommendation',
+        'aiRecommendation',
+      ) ?? '',
+    references: Array.isArray(refsRaw) ? (refsRaw as string[]) : [],
+  }
+}
+
+function mapJobResult(raw: UnknownRecord): JobResult {
+  const scores = (pick<UnknownRecord>(raw, 'scores') ?? {}) as UnknownRecord
+  const verdictRaw = (pick<UnknownRecord>(raw, 'verdict') ?? {}) as UnknownRecord
+  const findingsRaw = (pick<unknown[]>(raw, 'findings') ?? []) as UnknownRecord[]
+  const scannerRaw = (pick<unknown[]>(
+    raw,
+    'scanner_summaries',
+    'scannerSummaries',
+    'summaries',
+  ) ?? []) as UnknownRecord[]
+
+  const findings = findingsRaw.map(mapFinding)
+
+  const scannerSummaries: SecuritySummaryItem[] = scannerRaw.map((item) => ({
+    scanner: pick<string>(item, 'scanner', 'scanner_name', 'scannerName') ?? '',
+    count: pick<number>(item, 'count') ?? 0,
+    critical: pick<number>(item, 'critical') ?? 0,
+    high: pick<number>(item, 'high') ?? 0,
+    medium: pick<number>(item, 'medium') ?? 0,
+    low: pick<number>(item, 'low') ?? 0,
+  }))
+
+  // Prefer the backend's explicit severity_summary; fall back to aggregating
+  // scanner summaries, then to counting findings — so the chart always has
+  // numbers even if the backend omits one of the breakdowns.
+  const severityRaw = (pick<UnknownRecord>(raw, 'severity_summary', 'severitySummary') ??
+    {}) as UnknownRecord
+  let severitySummary: Record<SecuritySeverity, number> = {
+    critical: pick<number>(severityRaw, 'critical') ?? 0,
+    high: pick<number>(severityRaw, 'high') ?? 0,
+    medium: pick<number>(severityRaw, 'medium') ?? 0,
+    low: pick<number>(severityRaw, 'low') ?? 0,
+  }
+  const severityTotal =
+    severitySummary.critical + severitySummary.high + severitySummary.medium + severitySummary.low
+  if (severityTotal === 0 && scannerSummaries.length > 0) {
+    severitySummary = aggregateSeverity(scannerSummaries)
+  }
+  if (
+    severitySummary.critical + severitySummary.high + severitySummary.medium + severitySummary.low ===
+      0 &&
+    findings.length > 0
+  ) {
+    severitySummary = findings.reduce<Record<SecuritySeverity, number>>(
+      (acc, f) => {
+        acc[f.severity] += 1
+        return acc
+      },
+      { critical: 0, high: 0, medium: 0, low: 0 },
+    )
+  }
+
+  const repoUrl = pick<string>(raw, 'repo_url', 'repoUrl') ?? ''
+  const securityScore = pick<number>(scores, 'security_score', 'securityScore')
+  const codeQualityScore = pick<number>(scores, 'code_quality_score', 'codeQualityScore')
+  const totalFindings =
+    pick<number>(verdictRaw, 'total_findings', 'totalFindings') ?? findings.length
+
+  return {
+    jobId: pick<string>(raw, 'job_id', 'jobId') ?? '',
+    repoUrl,
+    repoName: repoNameFromUrl(repoUrl),
+    branch: pick<string>(raw, 'branch') ?? '',
+    completedAt: pick<string>(raw, 'completed_at', 'completedAt') ?? null,
+    securityScore:
+      typeof securityScore === 'number'
+        ? securityScore
+        : computeSecurityScore(severitySummary),
+    codeQualityScore: typeof codeQualityScore === 'number' ? codeQualityScore : null,
+    verdict:
+      (pick<JobVerdict>(verdictRaw, 'overall_status', 'overallStatus') as JobVerdict) ?? null,
+    verdictReason: pick<string>(verdictRaw, 'status_reason', 'statusReason') ?? null,
+    totalFindings,
+    severitySummary,
+    scannerSummaries,
+    findings,
+  }
+}
+
+// Fetch the detailed security result for a finished job (§3.9). Returns null
+// when the job has no result yet — either because the endpoint isn't there
+// (404) or the job hasn't finished (425 Too Early). Callers fall back to the
+// job-detail summary in that case.
+export async function fetchJobResult(
+  token: string,
+  jobId: string,
+): Promise<JobResult | null> {
+  const res = await fetch(
+    `${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/result`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  )
+
+  // 404: endpoint/job not found. 425: job not finished — no result yet.
+  if (res.status === 404 || res.status === 425) return null
+
+  if (!res.ok) {
+    console.error('[api] /api/jobs/{id}/result failed:', res.status)
+    throw new Error(`Failed to fetch job result ${jobId} (${res.status})`)
+  }
+
+  return mapJobResult((await res.json()) as UnknownRecord)
+}
+
+export type PipelineEnvironment = 'development' | 'feature' | 'staging' | 'production'
+
 export type StartPipelinePayload = {
   repoUrl: string
   branch?: string
+  /** Deployment environment. production/staging는 더 엄격 — Medium도 승인 필요로
+   *  승격됨 (백엔드 게이트 정책). */
+  environment?: PipelineEnvironment
   triggerSource?: string
-  envVars?: Record<string, string>
+  /** Security check identifiers the user selected — only these run. Sent as
+   *  the top-level `selected_items` field; CWE id ("CWE-89") or key
+   *  ("sql-injection") 둘 다 허용되지만 일관되게 CWE id를 보냄. */
+  selectedItems?: string[]
+  /** Latest commit SHA of the selected repo+branch (best-effort). */
+  commitSha?: string
+  /** First run for this repo → backend runs the full baseline regardless. */
+  isFirstRun?: boolean
 }
 
 export type StartPipelineResponse = {
@@ -449,10 +687,14 @@ export async function startPipeline(
 ): Promise<StartPipelineResponse> {
   const body: UnknownRecord = { repo_url: payload.repoUrl }
   if (payload.branch) body.branch = payload.branch
+  if (payload.environment) body.environment = payload.environment
   if (payload.triggerSource) body.trigger_source = payload.triggerSource
-  if (payload.envVars && Object.keys(payload.envVars).length > 0) {
-    body.env_vars = payload.envVars
+  // Only the selected checks run (CWE ids). Per spec A-3.
+  if (payload.selectedItems && payload.selectedItems.length > 0) {
+    body.selected_items = payload.selectedItems
   }
+  if (payload.commitSha) body.commit_sha = payload.commitSha
+  if (payload.isFirstRun !== undefined) body.is_first_run = payload.isFirstRun
 
   const res = await fetch(`${API_BASE}/api/pipelines`, {
     method: 'POST',

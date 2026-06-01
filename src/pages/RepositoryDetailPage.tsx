@@ -19,6 +19,7 @@ import {
   fetchReposWithBranches,
   getCachedRepos,
   getRepoDomainUrl,
+  getRepoPipelineInfo,
   getTrackedJobIds,
   setCachedRepos,
   setRepoDomainUrl,
@@ -255,23 +256,34 @@ export function RepositoryDetailPage() {
   const status = pipelineStatusMeta[pipelineStatusKey]
   const StatusIcon = status.icon
 
-  // Prefer the live commit lookup (full first line of commit message, author,
-  // commit date). Fall back to whatever the repo metadata gave us so the
-  // cards never feel "empty" — the user wanted concrete content here.
+  // Fallback chain for the source card. GitHub's commits endpoint often
+  // 401s (the backend may not proxy it, and the token may be a JWT rather
+  // than a GitHub OAuth token), so we layer in the pipeline metadata that
+  // PipelineProcessPage extracts from the clone step's logs and persists
+  // to localStorage. That gives us SOMETHING to show even when no external
+  // API call succeeds.
+  const pipelineInfo = getRepoPipelineInfo(cacheKey, repo.name)
+
   const commitMessageRaw =
     latestCommit?.message?.split('\n')[0]?.trim() ||
+    pipelineInfo?.commitMessage?.trim() ||
     repo.source.commitMessage?.trim() ||
+    (pipelineInfo?.commitSha ? `커밋 ${pipelineInfo.commitSha.slice(0, 7)}` : '') ||
     ''
   const commitMessage = commitMessageRaw || '(커밋 메시지를 가져오지 못했습니다)'
 
   const pushedBy =
     latestCommit?.authorLogin?.trim() ||
     latestCommit?.authorName?.trim() ||
+    pipelineInfo?.triggeredBy?.trim() ||
     repo.source.pushedBy?.trim() ||
     '-'
 
   const pushedAtRaw =
-    latestCommit?.date?.trim() || repo.source.pushedAt || repo.updatedAt
+    latestCommit?.date?.trim() ||
+    pipelineInfo?.triggeredAt?.trim() ||
+    repo.source.pushedAt ||
+    repo.updatedAt
   const pushedAt = pushedAtRaw
     ? dayjs(pushedAtRaw).isValid()
       ? dayjs(pushedAtRaw).format('YYYY-MM-DD HH:mm')
@@ -283,7 +295,12 @@ export function RepositoryDetailPage() {
     getRepoDomainUrl(cacheKey, repo.name) || getRepoDomainUrl(cacheKey, repo.id)
   const domainUrl = savedDomain || repo.domainUrl?.trim() || ''
   const description = repo.description?.trim() || '(설명 없음)'
-  const branch = repo.source.branch?.trim() || repo.branches[0] || '-'
+  const branch =
+    pipelineInfo?.branch?.trim() ||
+    latestJob?.branch?.trim() ||
+    repo.source.branch?.trim() ||
+    repo.branches[0] ||
+    '-'
 
   const handleDomainSave = () => {
     setRepoDomainUrl(cacheKey, repo.name, domainDraft)

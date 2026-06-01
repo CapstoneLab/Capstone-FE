@@ -1,4 +1,4 @@
-import { GitBranch, Loader2, Lock, Play, Search, SquareMousePointer, Star } from 'lucide-react'
+import { GitBranch, Layers, Loader2, Lock, Play, Search, SquareMousePointer, Star } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
@@ -16,12 +16,14 @@ import {
   AuthExpiredError,
   cancelPipeline,
   fetchJobsByIds,
+  fetchLatestCommit,
   fetchReposWithBranches,
   getCachedRepos,
   getLaunchedRepos,
   getTrackedJobIds,
   hasLaunchedRepo,
   PipelineConflictError,
+  type PipelineEnvironment,
   setCachedRepos,
   startPipeline,
 } from '@/lib/api'
@@ -35,39 +37,24 @@ import {
 } from '@/components/ui/dialog'
 import { getLanguageColor } from '@/lib/languageColors'
 import type { RepositoryItem } from '@/data/repositories'
+import {
+  allCheckIds,
+  catalogBySeverity,
+  securityCheckCatalog,
+  severityMeta,
+  severityOrder,
+  type CheckSeverity,
+} from '@/data/securityCatalog'
 
-const vulnerabilityCheckOptions = [
-  {
-    id: 'sql-injection',
-    title: 'SQL Injection',
-    description: '사용자 입력이 쿼리에 직접 결합되어 데이터베이스 조작이 가능한지 검사합니다.',
-  },
-  {
-    id: 'command-injection',
-    title: 'Command Injection',
-    description: '외부 명령 실행 구문에 악의적 입력이 주입되어 시스템 명령이 실행되는지 확인합니다.',
-  },
-  {
-    id: 'xss',
-    title: 'Cross-Site Scripting (XSS)',
-    description: '검증되지 않은 스크립트가 브라우저에서 실행되어 세션 탈취 위험이 있는지 탐지합니다.',
-  },
-  {
-    id: 'hardcoded-secret',
-    title: 'Hardcoded Secret',
-    description: '소스코드에 API 키, 토큰, 비밀번호 같은 민감 정보가 하드코딩되어 있는지 탐지합니다.',
-  },
-  {
-    id: 'path-traversal',
-    title: 'Path Traversal',
-    description: '파일 경로 조작으로 허용되지 않은 상위 디렉터리에 접근 가능한지 점검합니다.',
-  },
-  {
-    id: 'insecure-deserialization',
-    title: 'Insecure Deserialization',
-    description: '신뢰할 수 없는 직렬화 데이터 역직렬화 과정에서 원격 코드 실행 위험을 분석합니다.',
-  },
-] as const
+const environmentOptions: { value: PipelineEnvironment; label: string }[] = [
+  { value: 'development', label: 'development' },
+  { value: 'feature', label: 'feature' },
+  { value: 'staging', label: 'staging' },
+  { value: 'production', label: 'production' },
+]
+
+// production/staging은 더 엄격한 게이트가 적용됨 (Medium도 승인 필요로 승격).
+const STRICT_ENVIRONMENTS: PipelineEnvironment[] = ['production', 'staging']
 
 export function NewPipelinePage() {
   const navigate = useNavigate()
@@ -83,11 +70,13 @@ export function NewPipelinePage() {
   const [reposError, setReposError] = useState<string | null>(null)
   const [selectedRepoId, setSelectedRepoId] = useState('')
   const [selectedBranch, setSelectedBranch] = useState('')
-  const [selectedVulnerabilityIds, setSelectedVulnerabilityIds] = useState<string[]>([
-    'sql-injection',
-    'command-injection',
-    'hardcoded-secret',
-  ])
+  const [environment, setEnvironment] = useState<PipelineEnvironment>('development')
+  // Latest commit for the current repo+branch, tagged with the selection key
+  // it was fetched for so a stale SHA is never sent after switching repos.
+  const [commitInfo, setCommitInfo] = useState<{ key: string; sha: string } | null>(null)
+  // Default to ALL 16 checks selected (spec: "전체 선택" 기본값 권장).
+  const [selectedVulnerabilityIds, setSelectedVulnerabilityIds] =
+    useState<string[]>(allCheckIds)
   const [launchedRepoUrls, setLaunchedRepoUrls] = useState<string[]>(() =>
     token ? getLaunchedRepos(cacheKey) : [],
   )
@@ -154,10 +143,33 @@ export function NewPipelinePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRepo, launchedRepoUrls, cacheKey])
 
-  const allVulnerabilityIds = useMemo(
-    () => vulnerabilityCheckOptions.map((o) => o.id) as string[],
-    [],
-  )
+  const allVulnerabilityIds = allCheckIds
+
+  // Selection key for the commit we want — so we never send a SHA fetched for
+  // a different repo/branch than the one currently selected.
+  const selectionKey =
+    selectedRepo && selectedBranch ? `${selectedRepo.id}@${selectedBranch}` : ''
+  const currentCommitSha =
+    commitInfo && commitInfo.key === selectionKey ? commitInfo.sha : ''
+
+  // Best-effort fetch of the selected repo+branch's latest commit SHA so the
+  // POST /api/pipelines body can include `commit_sha`. Only sets state inside
+  // the async callback (no synchronous setState in the effect body).
+  useEffect(() => {
+    if (!token || !selectedRepo || !selectedBranch) return
+    const [owner, repo] = selectedRepo.name.split('/')
+    if (!owner || !repo) return
+    const key = `${selectedRepo.id}@${selectedBranch}`
+    let cancelled = false
+    fetchLatestCommit(token, owner, repo, selectedBranch)
+      .then((commit) => {
+        if (!cancelled && commit?.sha) setCommitInfo({ key, sha: commit.sha })
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [token, selectedRepo, selectedBranch])
 
   useEffect(() => {
     if (repos.length === 0) return
@@ -207,9 +219,34 @@ export function NewPipelinePage() {
     })
   }
 
-  const selectedVulnerabilityTitles = vulnerabilityCheckOptions
+  // Per-severity "전체 선택/해제" toggle. If every item in the grade is already
+  // selected, clicking clears them; otherwise it selects all of them.
+  const toggleSeverityGroup = (severity: CheckSeverity) => {
+    const groupIds = catalogBySeverity[severity].map((c) => c.id)
+    setSelectedVulnerabilityIds((prev) => {
+      const allSelected = groupIds.every((id) => prev.includes(id))
+      if (allSelected) {
+        return prev.filter((id) => !groupIds.includes(id))
+      }
+      const merged = new Set(prev)
+      groupIds.forEach((id) => merged.add(id))
+      return Array.from(merged)
+    })
+  }
+
+  const toggleAll = () => {
+    setSelectedVulnerabilityIds((prev) =>
+      prev.length === allVulnerabilityIds.length ? [] : allVulnerabilityIds,
+    )
+  }
+
+  const selectedVulnerabilityTitles = securityCheckCatalog
     .filter((option) => selectedVulnerabilityIds.includes(option.id))
     .map((option) => option.title)
+
+  // Min-1 enforcement (spec: 0개 선택은 제출 비활성). First-run repos always
+  // send the full baseline, so they're never blocked.
+  const hasNoSelection = !isFirstRunForRepo && selectedVulnerabilityIds.length === 0
 
   async function handleStartPipeline() {
     if (!selectedRepo || !token) return
@@ -219,20 +256,21 @@ export function NewPipelinePage() {
       const checksToSend = isFirstRunForRepo
         ? allVulnerabilityIds
         : selectedVulnerabilityIds
-      const envVars =
-        checksToSend.length > 0
-          ? {
-              SELECTED_CHECKS: checksToSend.join(','),
-              IS_FIRST_RUN: isFirstRunForRepo ? 'true' : 'false',
-            }
-          : undefined
+      // Guard: never start a non-first-run pipeline with zero checks.
+      if (checksToSend.length === 0) {
+        setStartError('최소 1개 이상의 검사 항목을 선택해 주세요.')
+        return
+      }
       const repoUrlToSend =
         selectedRepo.repositoryUrl || `https://github.com/${selectedRepo.name}`
       const { jobId } = await startPipeline(token, {
         repoUrl: repoUrlToSend,
         branch: selectedBranch || undefined,
+        environment,
         triggerSource: 'windows-api',
-        envVars,
+        selectedItems: checksToSend,
+        commitSha: currentCommitSha || undefined,
+        isFirstRun: isFirstRunForRepo,
       })
       if (!jobId) throw new Error('서버가 job_id를 반환하지 않았습니다.')
       addTrackedJobId(cacheKey, jobId)
@@ -243,6 +281,7 @@ export function NewPipelinePage() {
           jobId,
           repoName: selectedRepo.name,
           branch: selectedBranch,
+          environment,
           selectedChecks: selectedVulnerabilityTitles,
         },
       })
@@ -391,23 +430,57 @@ export function NewPipelinePage() {
                 <p className="mt-2 text-[12px] text-[#6B7280]">{selectedRepo.description}</p>
               </div>
 
-              <div className="w-full md:w-52">
-                <p className="inline-flex items-center gap-1 text-[12px] text-[#6B7280]">
-                  <GitBranch className="h-4 w-4" /> 실행 브랜치
-                </p>
-                <div className="mt-2">
-                  <Select value={selectedBranch} onValueChange={setSelectedBranch}>
-                    <SelectTrigger>
-                      <SelectValue placeholder="브랜치 선택" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {selectedRepo.branches.map((branch) => (
-                        <SelectItem key={branch} value={branch}>
-                          {branch}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+              <div className="w-full space-y-3 md:w-56">
+                <div>
+                  <p className="inline-flex items-center gap-1 text-[12px] text-[#6B7280]">
+                    <GitBranch className="h-4 w-4" /> 실행 브랜치
+                  </p>
+                  <div className="mt-2">
+                    <Select value={selectedBranch} onValueChange={setSelectedBranch}>
+                      <SelectTrigger>
+                        <SelectValue placeholder="브랜치 선택" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {selectedRepo.branches.map((branch) => (
+                          <SelectItem key={branch} value={branch}>
+                            {branch}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+
+                <div>
+                  <p className="inline-flex items-center gap-1 text-[12px] text-[#6B7280]">
+                    <Layers className="h-4 w-4" /> 환경 (environment)
+                  </p>
+                  <div className="mt-2">
+                    <Select
+                      value={environment}
+                      onValueChange={(value) => setEnvironment(value as PipelineEnvironment)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="환경 선택" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {environmentOptions.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>
+                            {option.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <p
+                    className={`mt-2 text-[11px] leading-4 ${
+                      STRICT_ENVIRONMENTS.includes(environment)
+                        ? 'text-[#FCD34D]'
+                        : 'text-[#6B7280]'
+                    }`}
+                  >
+                    production/staging은 더 엄격 — Medium도 승인 필요로 승격됩니다.
+                  </p>
                 </div>
               </div>
             </div>
@@ -430,38 +503,106 @@ export function NewPipelinePage() {
               <div className="rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
                 <div className="flex items-center justify-between">
                   <p className="text-[13px] font-semibold text-[#D1D5DB]">취약점 검사 항목 선택</p>
-                  <p className="text-[12px] text-[#6B7280]">
-                    {isFirstRunForRepo
-                      ? `전체 ${allVulnerabilityIds.length}개 자동 선택`
-                      : `${selectedVulnerabilityIds.length}개 선택`}
-                  </p>
+                  <div className="flex items-center gap-3">
+                    <p className="text-[12px] text-[#6B7280]">
+                      {isFirstRunForRepo
+                        ? `전체 ${allVulnerabilityIds.length}개 자동 선택`
+                        : `${selectedVulnerabilityIds.length} / ${allVulnerabilityIds.length}개 선택`}
+                    </p>
+                    {!isFirstRunForRepo ? (
+                      <button
+                        type="button"
+                        onClick={toggleAll}
+                        className="rounded-md border border-[#404040] px-2 py-1 text-[11px] text-[#9CA3AF] hover:border-[#3ECF8E]/50 hover:text-[#D1FAE5]"
+                      >
+                        {selectedVulnerabilityIds.length === allVulnerabilityIds.length
+                          ? '전체 해제'
+                          : '전체 선택'}
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
 
-                <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                  {vulnerabilityCheckOptions.map((option) => (
-                    <label
-                      key={option.id}
-                      htmlFor={option.id}
-                      className={`flex items-start gap-2 rounded-md border border-[#2F2F2F] bg-[#171717] p-2.5 ${
-                        isFirstRunForRepo
-                          ? 'cursor-not-allowed opacity-60'
-                          : 'cursor-pointer hover:border-[#3ECF8E]/50'
-                      }`}
-                    >
-                      <Checkbox
-                        id={option.id}
-                        checked={selectedVulnerabilityIds.includes(option.id)}
-                        onCheckedChange={(checked) => toggleVulnerabilityOption(option.id, checked)}
-                        disabled={isFirstRunForRepo}
-                        className="mt-0.5"
-                      />
-                      <div>
-                        <p className="text-[13px] font-semibold text-[#E5E7EB]">{option.title}</p>
-                        <p className="mt-1 text-[12px] leading-5 text-[#9CA3AF]">{option.description}</p>
+                <div className="mt-3 space-y-3">
+                  {severityOrder.map((severity) => {
+                    const meta = severityMeta[severity]
+                    const items = catalogBySeverity[severity]
+                    const selectedInGroup = items.filter((item) =>
+                      selectedVulnerabilityIds.includes(item.id),
+                    ).length
+                    const allInGroupSelected = selectedInGroup === items.length
+                    return (
+                      <div
+                        key={severity}
+                        className="rounded-lg border border-[#2F2F2F] bg-[#171717] p-2.5"
+                      >
+                        <div className="flex items-center justify-between">
+                          <p className="inline-flex items-center gap-2 text-[13px] font-semibold text-[#E5E7EB]">
+                            <span
+                              className="h-2.5 w-2.5 rounded-full"
+                              style={{ backgroundColor: meta.color }}
+                            />
+                            {meta.label}
+                            <span className="text-[12px] font-normal text-[#6B7280]">
+                              ({selectedInGroup}/{items.length})
+                            </span>
+                          </p>
+                          {!isFirstRunForRepo ? (
+                            <button
+                              type="button"
+                              onClick={() => toggleSeverityGroup(severity)}
+                              className="text-[11px] text-[#6B7280] hover:text-[#D1FAE5]"
+                            >
+                              {allInGroupSelected ? '해제' : '전체 선택'}
+                            </button>
+                          ) : null}
+                        </div>
+
+                        <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                          {items.map((option) => (
+                            <label
+                              key={option.id}
+                              htmlFor={option.id}
+                              title={option.description}
+                              className={`flex items-start gap-2 rounded-md border border-[#2F2F2F] bg-[#101010] p-2.5 ${
+                                isFirstRunForRepo
+                                  ? 'cursor-not-allowed opacity-60'
+                                  : 'cursor-pointer hover:border-[#3ECF8E]/50'
+                              }`}
+                            >
+                              <Checkbox
+                                id={option.id}
+                                checked={selectedVulnerabilityIds.includes(option.id)}
+                                onCheckedChange={(checked) =>
+                                  toggleVulnerabilityOption(option.id, checked)
+                                }
+                                disabled={isFirstRunForRepo}
+                                className="mt-0.5"
+                              />
+                              <div>
+                                <p className="flex items-center gap-1.5 text-[13px] font-semibold text-[#E5E7EB]">
+                                  {option.title}
+                                  <span className="text-[11px] font-normal text-[#6B7280]">
+                                    {option.cwe}
+                                  </span>
+                                </p>
+                                <p className="mt-1 text-[12px] leading-5 text-[#9CA3AF]">
+                                  {option.description}
+                                </p>
+                              </div>
+                            </label>
+                          ))}
+                        </div>
                       </div>
-                    </label>
-                  ))}
+                    )
+                  })}
                 </div>
+
+                {hasNoSelection ? (
+                  <p className="mt-3 rounded-md border border-[#7F1D1D] bg-[#450A0A]/40 p-2 text-center text-[12px] text-[#FCA5A5]">
+                    최소 1개 이상의 검사 항목을 선택해야 파이프라인을 실행할 수 있습니다.
+                  </p>
+                ) : null}
               </div>
             </div>
           </Card>
@@ -484,7 +625,7 @@ export function NewPipelinePage() {
           <Button
             onClick={() => void handleStartPipeline()}
             className="bg-[#34D399] text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
-            disabled={!selectedRepo || !token || isStarting}
+            disabled={!selectedRepo || !token || isStarting || hasNoSelection}
           >
             {isStarting ? (
               <Loader2 className="mr-1 h-4 w-4 animate-spin" />

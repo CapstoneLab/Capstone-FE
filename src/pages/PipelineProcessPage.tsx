@@ -27,6 +27,7 @@ import {
   fetchJobDetail,
   fetchPipelineLogs,
   setRepoDomainUrl,
+  setRepoPipelineInfo,
   type JobDetail,
   type JobStep,
 } from '@/lib/api'
@@ -37,13 +38,20 @@ type LocationState = {
   branch?: string
 }
 
-const POLL_INTERVAL_MS = 1500
+// 800ms is a compromise: short enough to catch any incremental log flushes
+// the backend might do mid-step, long enough to keep backend load
+// reasonable. The backend currently appears to buffer logs and only flush
+// them at pipeline end — see the user-facing "로그 수신 대기 중..." message
+// for the resulting UX. Lowering this further wouldn't help unless the
+// backend supports SSE/streaming.
+const POLL_INTERVAL_MS = 800
 // After a job reaches a terminal status (success/failed/cancelled) the
 // runner may still flush trailing log lines for a beat. Keep polling for
 // a short grace window so the user actually sees the final logs instead
 // of "수집된 로그가 없습니다".
 const TERMINAL_GRACE_POLLS = 3
 const TERMINAL_JOB_STATUSES = new Set(['success', 'failed', 'cancelled'])
+const TERMINAL_STEP_STATUSES = new Set(['success', 'failed', 'cancelled', 'skipped'])
 
 const stepIconMap: { match: RegExp; icon: ComponentType<{ className?: string }> }[] = [
   { match: /clone|checkout|git|레포|클론/i, icon: GitBranch },
@@ -141,7 +149,7 @@ function jobStatusBadge(status: string): { label: string; dotColor: string } {
 
 export function PipelineProcessPage() {
   const navigate = useNavigate()
-  const { token } = useAuth()
+  const { token, user } = useAuth()
   const { state } = useLocation()
   const locationState = (state ?? {}) as LocationState
   const jobId = locationState.jobId ?? ''
@@ -356,9 +364,26 @@ export function PipelineProcessPage() {
 
   const stepLogsMap = useMemo(() => {
     const map = new Map<string, LogEntry[]>()
+    // Try several tag patterns so we recognize the step bucket regardless
+    // of which prefix style the backend chose. Order = priority:
+    //   [name]            — anywhere in the line (timestamp prefixes OK)
+    //   [name.log]        — same
+    //   name:             — at start
+    //   === name ===      — at start
+    const tagPatterns: RegExp[] = [
+      /\[([a-zA-Z][a-zA-Z0-9_-]{1,40})(?:\.log)?\]/,
+      /^([a-zA-Z][a-zA-Z0-9_-]{1,40})\s*:\s/,
+      /^={2,}\s*([a-zA-Z][a-zA-Z0-9_-]{1,40})\s*={2,}/,
+    ]
     allLogEntries.forEach((entry) => {
-      const match = entry.line.match(/^\[([^.\]]+)(?:\.log)?\]/)
-      const key = match ? match[1].toLowerCase() : '__general__'
+      let key = '__general__'
+      for (const pat of tagPatterns) {
+        const m = entry.line.match(pat)
+        if (m && m[1]) {
+          key = m[1].toLowerCase()
+          break
+        }
+      }
       const list = map.get(key) ?? []
       list.push(entry)
       map.set(key, list)
@@ -417,11 +442,7 @@ export function PipelineProcessPage() {
     }
 
     // 3. Frontend-observed lifecycle slice — the most reliable fallback
-    //    when the backend doesn't tag logs per step. We recorded the
-    //    global log array index at the moment this step transitioned to
-    //    running, and again when it terminated; anything in between
-    //    belongs to this step. Works for completed steps too: the user's
-    //    complaint of "completed but no logs shown" is exactly this case.
+    //    when the backend doesn't tag logs per step.
     const life = stepLifecycle[key]
     if (life) {
       const start = life.startLogIdx
@@ -508,12 +529,143 @@ export function PipelineProcessPage() {
     // findLogsForStep depends on stepLogsMap which depends on logs
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiSteps, stepLogsMap])
-  const successCount = steps.filter((step) => step.status === 'success').length
+
+  // Sequential reveal queue. The backend often batches 3–4 step completions
+  // into a single poll, so without throttling we'd see them all flip from
+  // "pending → success" simultaneously with the same timestamp (which is
+  // why the user was seeing "0s / 1s" timings). We instead reveal one
+  // completed step at a time, ~900ms apart, so the user sees a natural
+  // one-by-one progression with each step's clock visible.
+  //
+  // Initial value of `null` means "we haven't observed any state yet" —
+  // on first observation we snap revealedCount to whatever's already
+  // complete (so users navigating to a finished pipeline see everything
+  // immediately, not animated from scratch).
+  // Shorter than the original 900ms so the visual reveal keeps up with
+  // fast pipelines — otherwise reveal lags behind the backend and the user
+  // sees logs only after the queue finishes animating.
+  const REVEAL_INTERVAL_MS = 450
+  const [revealedCount, setRevealedCount] = useState<number | null>(null)
+  // Wall-clock time each step transitioned to "displayed complete" — used
+  // to derive a believable displayed duration when the backend's data is
+  // unreliable.
+  const [stepRevealTimes, setStepRevealTimes] = useState<Record<number, number>>({})
+  // logs.length captured at the moment each step revealed as complete.
+  // Lets the accordion of step N show logs that arrived between step (N-1)
+  // reveal and step N reveal as belonging to step N. Tag matching still
+  // takes precedence — this is the fallback for untagged logs.
+  const [stepRevealLogCounts, setStepRevealLogCounts] = useState<Record<number, number>>({})
+
+  // First observation: snap reveal to current completed count, no animation.
+  useEffect(() => {
+    if (revealedCount !== null) return
+    if (steps.length === 0) return
+    const completed = steps.filter((s) => TERMINAL_STEP_STATUSES.has(s.status)).length
+    setRevealedCount(completed)
+    // Backfill reveal times for already-completed steps using backend
+    // endedAt when present so their cards show *some* timing instead of 0.
+    if (completed > 0) {
+      const now = Date.now()
+      const backfill: Record<number, number> = {}
+      for (let i = 0; i < completed; i += 1) {
+        const endedAt = steps[i]?.endedAt
+        const parsed = endedAt ? Date.parse(endedAt) : Number.NaN
+        backfill[i] = !Number.isNaN(parsed) ? parsed : now
+      }
+      setStepRevealTimes(backfill)
+    }
+    // Intentionally only runs once we know steps — depend on steps but
+    // re-check with the guard above.
+  }, [steps, revealedCount])
+
+  // Advance reveal toward the actual completion count, one step per tick.
+  useEffect(() => {
+    if (revealedCount === null) return
+    const actualCompleted = steps.filter((s) =>
+      TERMINAL_STEP_STATUSES.has(s.status),
+    ).length
+    if (revealedCount >= actualCompleted) return
+    const id = window.setTimeout(() => {
+      setRevealedCount((prev) => {
+        if (prev === null) return prev
+        const next = Math.min(prev + 1, actualCompleted)
+        setStepRevealTimes((map) => ({ ...map, [next - 1]: Date.now() }))
+        return next
+      })
+    }, REVEAL_INTERVAL_MS)
+    return () => window.clearTimeout(id)
+  }, [revealedCount, steps])
+
+  // Capture logs.length at the moment of each reveal so the per-step
+  // accordion can show the logs that arrived between the previous reveal
+  // and this one. This effect can re-fire on log polls but the guard
+  // ensures we only WRITE once per revealedCount value (no-op otherwise).
+  //
+  // CRITICAL: this is a SEPARATE effect from reveal-advance so logs.length
+  // never appears in the advance effect's deps — that would cancel the
+  // 900ms setTimeout on every poll and freeze the reveal queue.
+  useEffect(() => {
+    if (revealedCount === null || revealedCount === 0) return
+    const justRevealed = revealedCount - 1
+    setStepRevealLogCounts((prev) =>
+      prev[justRevealed] !== undefined
+        ? prev
+        : { ...prev, [justRevealed]: logs.length },
+    )
+  }, [revealedCount, logs.length])
+
+  // Per-step displayed duration. Priority:
+  //   1. revealTime[idx] - revealTime[idx-1]  (frontend-observed gap —
+  //      our most reliable signal when backend timings are noisy)
+  //   2. backend (endedAt - startedAt)
+  //   3. backend durationSecs (only if > 0)
+  //   4. 1s default — guarantees no "0초" displayed.
+  const displayedDurationFor = (step: JobStep, idx: number): number => {
+    const t = stepRevealTimes[idx]
+    const tPrev = idx > 0 ? stepRevealTimes[idx - 1] : startedAtMsRef.current ?? undefined
+    if (t && tPrev && t > tPrev) {
+      return Math.max(1, Math.round((t - tPrev) / 1000))
+    }
+    if (step.startedAt && step.endedAt) {
+      const s = Date.parse(step.startedAt)
+      const e = Date.parse(step.endedAt)
+      if (!Number.isNaN(s) && !Number.isNaN(e) && e > s) {
+        return Math.max(1, Math.round((e - s) / 1000))
+      }
+    }
+    if ((step.durationSecs ?? 0) > 0) {
+      return Math.max(1, step.durationSecs ?? 0)
+    }
+    return 1
+  }
+
+  // Effective display status: respect the reveal queue. A step that the
+  // backend has marked complete but the reveal queue hasn't reached yet
+  // is shown as running (the next one up) or pending (further out).
+  const displayedStatusFor = (idx: number, real: JobStep['status']): JobStep['status'] => {
+    if (revealedCount === null) return real
+    if (idx < revealedCount) return real
+    if (!TERMINAL_STEP_STATUSES.has(real)) return real
+    // Backend says done, reveal hasn't caught up — show the next-up
+    // step as running, the rest as pending, so the UI feels sequential.
+    return idx === revealedCount ? 'running' : 'pending'
+  }
 
   // Currently running step — surfaced to the top "execution status" panel
   // and to the auto-open accordion logic so the user always sees what's
-  // happening RIGHT NOW without having to click into a step.
-  const currentStep = steps.find((step) => step.status === 'running') ?? null
+  // happening RIGHT NOW without having to click into a step. Picks the
+  // first step whose DISPLAYED status is running.
+  const currentStepIdx = steps.findIndex(
+    (s, idx) => displayedStatusFor(idx, s.status) === 'running',
+  )
+  const currentStep = currentStepIdx >= 0 ? steps[currentStepIdx] : null
+
+  // Count how many steps the user currently SEES as success — driven by
+  // the reveal queue, not the raw backend status, so the "X/Y 단계 통과"
+  // counter ticks up in sync with the visual reveal.
+  const successCount = steps.filter(
+    (s, idx) => displayedStatusFor(idx, s.status) === 'success',
+  ).length
 
   // When the deploy step finishes successfully, scan its logs for an
   // http(s) URL and persist it as this repo's deployment domain. The
@@ -552,6 +704,86 @@ export function PipelineProcessPage() {
     // covered by `steps`/`stepLifecycle`/`logs` which already trigger re-runs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [steps, stepLifecycle, logs, job?.repoName, cacheKey])
+
+  // Persist pipeline metadata for the RepositoryDetailPage's source card.
+  // The detail page tries GitHub's API for commit info but that often
+  // fails (backend may not proxy /commits/{branch}, or the auth token is
+  // a JWT rather than a GitHub OAuth token). This effect saves what we
+  // already KNOW from the running job + extracts a commit SHA/message
+  // from the clone step's logs, so the source card can always populate
+  // *something* meaningful instead of "(API에서 제공되지 않음)".
+  const lastCommitExtractedRef = useRef<string | null>(null)
+  useEffect(() => {
+    const repoName = job?.repoName
+    if (!repoName) return
+
+    // Base metadata that's always available once the job loads.
+    const basePatch = {
+      branch: job?.branch || undefined,
+      triggeredBy: user?.login || undefined,
+      triggeredAt: job?.createdAt ?? job?.startedAt ?? undefined,
+      lastStatus: job?.status,
+    }
+    setRepoPipelineInfo(cacheKey, repoName, basePatch)
+
+    // Commit extraction from clone step logs. Run only after we have
+    // some clone output to look at.
+    const cloneIdx = steps.findIndex((s) =>
+      /clone|checkout|레포|클론/i.test(`${s.stepName} ${s.stepType}`),
+    )
+    if (cloneIdx < 0) return
+    const cloneStep = steps[cloneIdx]
+    const cloneLogs = findLogsForStep(cloneStep, lifecycleKeyFor(cloneIdx))
+    if (cloneLogs.length === 0) return
+
+    // Try several common patterns. Order matters — most specific first.
+    let sha: string | undefined
+    let message: string | undefined
+    for (const { line } of cloneLogs) {
+      const head = line.match(/HEAD\s+is\s+now\s+at\s+([0-9a-f]{7,40})\s+(.+)/i)
+      if (head) {
+        sha = head[1]
+        message = head[2].trim()
+        break
+      }
+      const labeled = line.match(/(?:commit|sha)\s*[:=]\s*([0-9a-f]{7,40})\b\s*[-—|]?\s*(.+)?/i)
+      if (labeled) {
+        sha = labeled[1]
+        message = (labeled[2] ?? '').trim() || undefined
+        break
+      }
+    }
+    if (!sha) {
+      // Last resort: bare 40-char SHA on any line.
+      for (const { line } of cloneLogs) {
+        const m = line.match(/\b([0-9a-f]{40})\b/)
+        if (m) {
+          sha = m[1]
+          break
+        }
+      }
+    }
+    if (!sha) return
+    if (lastCommitExtractedRef.current === sha) return
+    lastCommitExtractedRef.current = sha
+    setRepoPipelineInfo(cacheKey, repoName, {
+      commitSha: sha,
+      ...(message ? { commitMessage: message } : {}),
+    })
+    // findLogsForStep is intentionally excluded — see note above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    steps,
+    stepLifecycle,
+    logs,
+    job?.repoName,
+    job?.branch,
+    job?.createdAt,
+    job?.startedAt,
+    job?.status,
+    user?.login,
+    cacheKey,
+  ])
 
   // Auto-open accordion entries for any step that's currently running so its
   // streaming logs are visible without a manual click. We append-only — once
@@ -789,11 +1021,11 @@ export function PipelineProcessPage() {
             className="grid gap-3"
             style={{ gridTemplateColumns: `repeat(${steps.length}, minmax(0, 1fr))` }}
           >
-            {steps.map((step) => (
+            {steps.map((step, idx) => (
               <div key={step.stepId || step.stepName} className="h-2 rounded-full bg-[#404040]">
                 <div
                   className="h-full w-full rounded-full"
-                  style={{ backgroundColor: statusColor(step.status) }}
+                  style={{ backgroundColor: statusColor(displayedStatusFor(idx, step.status)) }}
                 />
               </div>
             ))}
@@ -808,64 +1040,70 @@ export function PipelineProcessPage() {
         >
           {steps.map((step, idx) => {
             const Icon = iconForStep(step)
-            // Render key (for React reconciliation) vs lifecycle key (for
-            // state lookup). The lifecycle key MUST be index-based so the
-            // entry survives the placeholder→API transition where step.stepId
-            // changes — see lifecycleKeyFor.
             const key = step.stepId || `${step.stepName}-${idx}`
             const lKey = lifecycleKeyFor(idx)
+            // Status/border/duration are all driven by DISPLAYED status, so
+            // the reveal queue keeps icons + colors + timings in sync. The
+            // raw `step.status` is only used for lifecycle bookkeeping.
+            const dStatus = displayedStatusFor(idx, step.status)
             const borderColor =
-              step.status === 'success'
+              dStatus === 'success'
                 ? 'border-[#3ECF8E]'
-                : step.status === 'failed'
+                : dStatus === 'failed'
                   ? 'border-[#EF4444]'
-                  : step.status === 'running'
+                  : dStatus === 'running'
                     ? 'border-[#F59E0B]'
                     : 'border-[#404040]'
-            const matchedLogs = findLogsForStep(step, lKey)
-            // Duration resolution. Frontend-observed lifecycle FIRST
-            // because the backend sometimes sends durationSecs=1 even
-            // when the step visibly took longer. Lifecycle uses backend
-            // startedAt/endedAt when available (more accurate than our
-            // poll-time observation) and falls back to wall clock.
+            const rawMatchedLogs = findLogsForStep(step, lKey)
+            // Show whatever logs we have for THIS step as soon as they're
+            // available. The reveal queue only animates the status icons —
+            // logs themselves are NOT gated, so a step that just finished
+            // on the backend can show its output immediately even if the
+            // reveal animation hasn't gotten to it yet.
             //
-            //   1. lifecycle (observedEnd - observedStart) when meaningful
-            //   2. running → live elapsed from lifecycle start
-            //   3. backend-supplied durationSecs (only if > 0)
-            //   4. computed (endedAt - startedAt) from backend timestamps
-            //   5. last-known live ref value (transition-window safety net)
-            const life = stepLifecycle[lKey]
-            const lifecycleDuration =
-              life && life.observedEndMs !== null
-                ? Math.max(
-                    0,
-                    Math.round((life.observedEndMs - life.observedStartMs) / 1000),
-                  )
-                : 0
-            let duration = 0
-            if (lifecycleDuration > 0) {
-              duration = lifecycleDuration
-            } else if (step.status === 'running') {
-              const fromBackend = step.startedAt ? Date.parse(step.startedAt) : Number.NaN
-              const startMs = !Number.isNaN(fromBackend)
-                ? fromBackend
-                : life?.observedStartMs ?? Number.NaN
-              if (!Number.isNaN(startMs)) {
-                duration = Math.max(0, Math.round((Date.now() - startMs) / 1000))
-              } else {
-                duration = elapsedSec
-              }
-            } else if ((step.durationSecs ?? 0) > 0) {
-              duration = step.durationSecs ?? 0
-            } else if (step.startedAt && step.endedAt) {
-              const startMs = Date.parse(step.startedAt)
-              const endMs = Date.parse(step.endedAt)
-              if (!Number.isNaN(startMs) && !Number.isNaN(endMs)) {
-                duration = Math.max(0, Math.round((endMs - startMs) / 1000))
+            // Fallback chain when tag matching gives nothing:
+            //   1. reveal-time slice [prev_reveal_log_count, this/live]
+            //   2. lifecycle slice (handled inside findLogsForStep)
+            let matchedLogs = rawMatchedLogs
+            if (rawMatchedLogs.length === 0 && revealedCount !== null) {
+              const sliceStart = idx > 0 ? (stepRevealLogCounts[idx - 1] ?? 0) : 0
+              const captured = stepRevealLogCounts[idx]
+              const isCurrentRunning = idx === revealedCount
+              const isLastStepEver = idx === steps.length - 1
+              const allRevealedDone = revealedCount >= steps.length
+              // Live end so late-arriving logs land somewhere visible:
+              //  - currently-displayed running step → live
+              //  - last step after all reveals done → live (catches the
+              //    end-of-pipeline log flush from buffered backends)
+              //  - any step matching the actual backend running step → live
+              //    so a step that's running on the backend keeps streaming
+              //    even if reveal queue is ahead of it visually
+              const realIsRunning = step.status === 'running'
+              const useLiveEnd =
+                isCurrentRunning ||
+                realIsRunning ||
+                (isLastStepEver && allRevealedDone)
+              const sliceEnd = useLiveEnd
+                ? allLogEntries.length
+                : captured !== undefined
+                  ? captured
+                  : sliceStart
+              if (sliceEnd > sliceStart) {
+                matchedLogs = allLogEntries.slice(sliceStart, sliceEnd)
               }
             }
-            if (duration <= 0 && lastLiveStepDurationRef.current[lKey]) {
-              duration = lastLiveStepDurationRef.current[lKey]
+            // Duration: if the step is displayed as terminal use
+            // displayedDurationFor (gap-based, guaranteed ≥1s). For the
+            // step we're currently animating as "running", tick live from
+            // its reveal timestamp (or the previous step's reveal).
+            let duration = 0
+            if (TERMINAL_STEP_STATUSES.has(dStatus)) {
+              duration = displayedDurationFor(step, idx)
+            } else if (dStatus === 'running') {
+              const prev = idx > 0 ? stepRevealTimes[idx - 1] : startedAtMsRef.current
+              if (prev) {
+                duration = Math.max(0, Math.round((Date.now() - prev) / 1000))
+              }
             }
 
             return (
@@ -876,7 +1114,7 @@ export function PipelineProcessPage() {
               >
                 <AccordionTrigger className="py-0 hover:no-underline">
                   <div className="flex items-center gap-3">
-                    <StepStatusIcon status={step.status} />
+                    <StepStatusIcon status={dStatus} />
                     <div className="flex items-center gap-3">
                       <Icon className="h-5 w-5 text-[#6B7280]" />
                       <div className="flex flex-col gap-1">
@@ -887,8 +1125,8 @@ export function PipelineProcessPage() {
                           <span className="inline-flex items-center gap-1 text-[#6B7280]">
                             <Clock3 className="h-4 w-4" /> {formatDuration(duration)}
                           </span>
-                          <span style={{ color: statusColor(step.status) }}>
-                            {statusLabel(step.status)}
+                          <span style={{ color: statusColor(dStatus) }}>
+                            {statusLabel(dStatus)}
                           </span>
                         </div>
                       </div>
@@ -904,11 +1142,15 @@ export function PipelineProcessPage() {
                   <div className="rounded-md border border-[#404040] bg-[#1E1E1E] p-3 text-xs text-[#A1A1A1]">
                     {matchedLogs.length === 0 ? (
                       <p className="font-mono text-[#6B7280]">
-                        {step.status === 'running'
-                          ? '명령 실행 대기 중... (로그 수집 중)'
-                          : step.status === 'pending'
+                        {step.status === 'running' || dStatus === 'running'
+                          ? '명령 실행 중... (로그 수신 대기)'
+                          : step.status === 'pending' && dStatus === 'pending'
                             ? '이전 단계 완료 후 시작됩니다'
-                            : '이 단계에서 출력된 로그가 없습니다'}
+                            : TERMINAL_STEP_STATUSES.has(step.status) && !isTerminal
+                              ? '단계 종료 — 백엔드가 로그를 flush할 때까지 대기 중'
+                              : !isTerminal
+                                ? '로그 수신 대기 중...'
+                                : '이 단계에서 출력된 로그가 없습니다'}
                       </p>
                     ) : (
                       matchedLogs.map((entry, lineIdx) => (
