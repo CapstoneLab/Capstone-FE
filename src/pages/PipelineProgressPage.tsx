@@ -19,6 +19,7 @@ import { MainLayout } from '@/components/layout/MainLayout'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { useAuth } from '@/contexts/AuthContext'
+import { useTheme } from '@/contexts/ThemeContext'
 import {
   fetchJobDetail,
   fetchJobResult,
@@ -113,6 +114,29 @@ const toneMsgClass: Record<'pass' | 'warn' | 'approve' | 'block', string> = {
   block: 'text-[#FECACA]',
 }
 
+// Light-mode counterparts. The dark tone classes use a translucent dark tint
+// (`bg-...#.../30`) + pale text — over a light card that tint reads as a faint
+// pastel and the pale text washes out (unreadable). In light mode we instead
+// use solid pastel-100 backgrounds with saturated 700/800 text for contrast.
+const toneBannerClassLight: Record<'pass' | 'warn' | 'approve' | 'block', string> = {
+  pass: 'border-[#86EFAC] bg-[#DCFCE7]',
+  warn: 'border-[#FCD34D] bg-[#FEF9C3]',
+  approve: 'border-[#FDBA74] bg-[#FFEDD5]',
+  block: 'border-[#FCA5A5] bg-[#FEE2E2]',
+}
+const toneTitleClassLight: Record<'pass' | 'warn' | 'approve' | 'block', string> = {
+  pass: 'text-[#166534]',
+  warn: 'text-[#854D0E]',
+  approve: 'text-[#9A3412]',
+  block: 'text-[#991B1B]',
+}
+const toneMsgClassLight: Record<'pass' | 'warn' | 'approve' | 'block', string> = {
+  pass: 'text-[#15803D]',
+  warn: 'text-[#A16207]',
+  approve: 'text-[#C2410C]',
+  block: 'text-[#B91C1C]',
+}
+
 const scoreChartOptions: ChartOptions<'doughnut'> = {
   responsive: true,
   maintainAspectRatio: false,
@@ -157,6 +181,7 @@ function legacyToVerdictKind(v: JobVerdict | null, jobStatus: JobDetail['status'
 export function PipelineProgressPage() {
   const navigate = useNavigate()
   const { token } = useAuth()
+  const { resolvedTheme } = useTheme()
   const { state } = useLocation()
   const locationState = (state ?? {}) as LocationState
   const jobId = locationState.jobId ?? ''
@@ -216,14 +241,33 @@ export function PipelineProgressPage() {
   const gaugeColor = vd?.gaugeColor || '#F97316'
   const scoreLabel = vd?.scoreLabel || (score != null ? `${score}/100` : null)
 
-  // B-0 counts (in-scope). Fall back to the aggregate severity summary.
-  const counts: Record<SecuritySeverity, number> = useMemo(
-    () =>
+  // B-0 counts (in-scope). The backend's verdict counts are authoritative, but
+  // `vd.counts` is sometimes present-yet-all-zero (field-name mismatch or not
+  // populated) even when findings exist — a plain `??` would keep those zeros
+  // and the chart would read 0 despite detected vulnerabilities. So: trust
+  // vd.counts only when it has a non-zero total, else derive from the in-scope
+  // findings themselves ("검사 범위 기준" ground truth), then fall back to the
+  // aggregate summaries.
+  const counts: Record<SecuritySeverity, number> = useMemo(() => {
+    const sumOf = (c: Record<SecuritySeverity, number>) =>
+      c.critical + c.high + c.medium + c.low
+    if (vd?.counts && sumOf(vd.counts) > 0) return vd.counts
+    const inScope = (result?.findings ?? []).filter((f) => f.inScope)
+    if (inScope.length > 0) {
+      return inScope.reduce<Record<SecuritySeverity, number>>(
+        (acc, f) => {
+          acc[f.severity] += 1
+          return acc
+        },
+        { critical: 0, high: 0, medium: 0, low: 0 },
+      )
+    }
+    return (
       vd?.counts ??
       result?.severitySummary ??
-      detail?.severityCounts ?? { critical: 0, high: 0, medium: 0, low: 0 },
-    [vd, result, detail],
-  )
+      detail?.severityCounts ?? { critical: 0, high: 0, medium: 0, low: 0 }
+    )
+  }, [vd, result, detail])
   const totalCount = useMemo(
     () => severityOrder.reduce((sum, { key }) => sum + (counts[key] ?? 0), 0),
     [counts],
@@ -233,6 +277,18 @@ export function PipelineProgressPage() {
   const effectiveVerdict: VerdictKind | null =
     vd?.verdict ?? legacyToVerdictKind(result?.verdict ?? detail?.verdict ?? null, jobStatus)
   const verdictCfg = effectiveVerdict ? VERDICT_CONFIG[effectiveVerdict] : null
+  // Theme-aware gate-banner classes: the dark tints/pale text wash out on the
+  // light card, so swap to the light palette when the resolved theme is light.
+  const isLight = resolvedTheme === 'light'
+  const bannerBgClass = verdictCfg
+    ? (isLight ? toneBannerClassLight : toneBannerClass)[verdictCfg.tone]
+    : ''
+  const bannerTitleClass = verdictCfg
+    ? (isLight ? toneTitleClassLight : toneTitleClass)[verdictCfg.tone]
+    : ''
+  const bannerMsgClass = verdictCfg
+    ? (isLight ? toneMsgClassLight : toneMsgClass)[verdictCfg.tone]
+    : ''
   // Banner accent: use gauge_color directly when present (B-0).
   const accent = vd?.gaugeColor || verdictCfg?.color || '#F97316'
 
@@ -501,22 +557,22 @@ export function PipelineProgressPage() {
 
           {/* B-1: verdict main message + reasons + approval CTA */}
           {verdictCfg ? (
-            <div className={`mt-3 rounded-xl border p-3 ${toneBannerClass[verdictCfg.tone]}`}>
+            <div className={`mt-3 rounded-xl border p-3 ${bannerBgClass}`}>
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <p className={`flex items-center gap-2 text-[15px] font-semibold ${toneTitleClass[verdictCfg.tone]}`}>
+                  <p className={`flex items-center gap-2 text-[15px] font-semibold ${bannerTitleClass}`}>
                     <verdictCfg.icon className="h-4.5 w-4.5" />
                     {verdictCfg.message}
                   </p>
                   {reasons.length > 0 ? (
-                    <ul className={`mt-2 list-disc space-y-1 pl-5 text-[12px] ${toneMsgClass[verdictCfg.tone]}`}>
+                    <ul className={`mt-2 list-disc space-y-1 pl-5 text-[12px] ${bannerMsgClass}`}>
                       {reasons.map((r, i) => (
                         <li key={i}>{r}</li>
                       ))}
                     </ul>
                   ) : null}
                   {effectiveVerdict === 'block' ? (
-                    <p className={`mt-2 text-[12px] ${toneMsgClass[verdictCfg.tone]}`}>
+                    <p className={`mt-2 text-[12px] ${bannerMsgClass}`}>
                       하드 차단입니다. 승인으로 통과할 수 없으니 코드를 수정한 뒤 다시 실행하세요.
                     </p>
                   ) : null}
