@@ -927,7 +927,7 @@ export function PipelineProcessPage() {
   }
 
   return (
-    <MainLayout>
+    <MainLayout pipelineElapsed={formatDuration(elapsedSec)}>
       <section className="w-full space-y-4">
         <div className="space-y-2">
           <div className="flex items-center justify-between gap-3">
@@ -1021,14 +1021,22 @@ export function PipelineProcessPage() {
             className="grid gap-3"
             style={{ gridTemplateColumns: `repeat(${steps.length}, minmax(0, 1fr))` }}
           >
-            {steps.map((step, idx) => (
-              <div key={step.stepId || step.stepName} className="h-2 rounded-full bg-[#404040]">
-                <div
-                  className="h-full w-full rounded-full"
-                  style={{ backgroundColor: statusColor(displayedStatusFor(idx, step.status)) }}
-                />
-              </div>
-            ))}
+            {steps.map((step, idx) => {
+              const barStatus = displayedStatusFor(idx, step.status)
+              return (
+                <div key={step.stepId || step.stepName} className="h-2 rounded-full bg-[#404040]">
+                  {/* Pending → transparent so the track (gray in dark, light
+                      gray in light mode) shows instead of a dark #404040 fill. */}
+                  <div
+                    className="h-full w-full rounded-full"
+                    style={{
+                      backgroundColor:
+                        barStatus === 'pending' ? 'transparent' : statusColor(barStatus),
+                    }}
+                  />
+                </div>
+              )
+            })}
           </div>
         </Card>
 
@@ -1139,7 +1147,7 @@ export function PipelineProcessPage() {
                       {step.errorMessage}
                     </p>
                   ) : null}
-                  <div className="rounded-md border border-[#404040] bg-[#1E1E1E] p-3 text-xs text-[#A1A1A1]">
+                  <div className="max-h-72 overflow-y-auto rounded-md border border-[#404040] bg-[#1E1E1E] p-3 text-xs text-[#A1A1A1]">
                     {matchedLogs.length === 0 ? (
                       <p className="font-mono text-[#6B7280]">
                         {step.status === 'running' || dStatus === 'running'

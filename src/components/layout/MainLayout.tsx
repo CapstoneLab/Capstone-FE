@@ -6,7 +6,13 @@ import { Button } from '@/components/ui/button'
 import { Footer } from './Footer'
 import { NativeFrameBar } from './NativeFrameBar'
 
-export function MainLayout({ children }: PropsWithChildren) {
+type MainLayoutProps = PropsWithChildren<{
+  /** Live elapsed-time label for the pipeline progress sticky-header chip
+   *  (e.g. "3m 40s"). Passed by PipelineProcessPage so it isn't hardcoded. */
+  pipelineElapsed?: string
+}>
+
+export function MainLayout({ children, pipelineElapsed }: MainLayoutProps) {
   const { pathname } = useLocation()
   const navigate = useNavigate()
   const [showPageHeader, setShowPageHeader] = useState(false)
@@ -113,7 +119,7 @@ export function MainLayout({ children }: PropsWithChildren) {
     if (pathname.startsWith('/pipeline/progress')) {
       return (
         <div className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-gray-600/75 bg-[#242424] px-3 text-xs text-gray-200">
-          <Clock3 className="h-3.5 w-3.5 text-emerald-300" />실행 시간 3m 40s
+          <Clock3 className="h-3.5 w-3.5 text-emerald-300" />실행 시간 {pipelineElapsed || '—'}
         </div>
       )
     }
@@ -122,8 +128,7 @@ export function MainLayout({ children }: PropsWithChildren) {
       return (
         <Button
           type="button"
-          variant="ghost"
-          className="h-9 border border-[#3ECF8E] bg-[#065F46]/30 px-3 text-xs text-[#A7F3D0] hover:bg-[#065F46]/50"
+          className="h-9 border border-[#34D399] bg-[#34D399] px-3 text-xs font-semibold text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
         >
           <Download className="mr-1.5 h-3.5 w-3.5" />결과 다운로드
         </Button>
@@ -131,7 +136,7 @@ export function MainLayout({ children }: PropsWithChildren) {
     }
 
     return null
-  }, [navigate, pathname])
+  }, [navigate, pathname, pipelineElapsed])
 
   return (
     <div className="relative h-screen overflow-hidden bg-[#1E1E1E] text-gray-50">

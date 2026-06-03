@@ -1,4 +1,4 @@
-import { GitBranch, Layers, Loader2, Lock, Play, Search, SquareMousePointer, Star } from 'lucide-react'
+import { GitBranch, Loader2, Lock, Play, Search, SquareMousePointer, Star } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
@@ -24,7 +24,6 @@ import {
   getTrackedJobIds,
   hasLaunchedRepo,
   PipelineConflictError,
-  type PipelineEnvironment,
   setCachedRepos,
   startPipeline,
 } from '@/lib/api'
@@ -48,16 +47,6 @@ import {
   type SecurityCheckItem,
 } from '@/data/securityCatalog'
 
-const environmentOptions: { value: PipelineEnvironment; label: string }[] = [
-  { value: 'development', label: 'development' },
-  { value: 'feature', label: 'feature' },
-  { value: 'staging', label: 'staging' },
-  { value: 'production', label: 'production' },
-]
-
-// production/staging은 더 엄격한 게이트가 적용됨 (Medium도 승인 필요로 승격).
-const STRICT_ENVIRONMENTS: PipelineEnvironment[] = ['production', 'staging']
-
 export function NewPipelinePage() {
   const navigate = useNavigate()
   const { token, logout } = useAuth()
@@ -72,7 +61,6 @@ export function NewPipelinePage() {
   const [reposError, setReposError] = useState<string | null>(null)
   const [selectedRepoId, setSelectedRepoId] = useState('')
   const [selectedBranch, setSelectedBranch] = useState('')
-  const [environment, setEnvironment] = useState<PipelineEnvironment>('development')
   // Latest commit for the current repo+branch, tagged with the selection key
   // it was fetched for so a stale SHA is never sent after switching repos.
   const [commitInfo, setCommitInfo] = useState<{ key: string; sha: string } | null>(null)
@@ -287,7 +275,6 @@ export function NewPipelinePage() {
       const { jobId } = await startPipeline(token, {
         repoUrl: repoUrlToSend,
         branch: selectedBranch || undefined,
-        environment,
         triggerSource: 'windows-api',
         selectedItems: checksToSend,
         commitSha: currentCommitSha || undefined,
@@ -302,7 +289,6 @@ export function NewPipelinePage() {
           jobId,
           repoName: selectedRepo.name,
           branch: selectedBranch,
-          environment,
           selectedChecks: selectedVulnerabilityTitles,
         },
       })
@@ -451,57 +437,23 @@ export function NewPipelinePage() {
                 <p className="mt-2 text-[12px] text-[#6B7280]">{selectedRepo.description}</p>
               </div>
 
-              <div className="w-full space-y-3 md:w-56">
-                <div>
-                  <p className="inline-flex items-center gap-1 text-[12px] text-[#6B7280]">
-                    <GitBranch className="h-4 w-4" /> 실행 브랜치
-                  </p>
-                  <div className="mt-2">
-                    <Select value={selectedBranch} onValueChange={setSelectedBranch}>
-                      <SelectTrigger>
-                        <SelectValue placeholder="브랜치 선택" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {selectedRepo.branches.map((branch) => (
-                          <SelectItem key={branch} value={branch}>
-                            {branch}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-
-                <div>
-                  <p className="inline-flex items-center gap-1 text-[12px] text-[#6B7280]">
-                    <Layers className="h-4 w-4" /> 환경 (environment)
-                  </p>
-                  <div className="mt-2">
-                    <Select
-                      value={environment}
-                      onValueChange={(value) => setEnvironment(value as PipelineEnvironment)}
-                    >
-                      <SelectTrigger>
-                        <SelectValue placeholder="환경 선택" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {environmentOptions.map((option) => (
-                          <SelectItem key={option.value} value={option.value}>
-                            {option.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <p
-                    className={`mt-2 text-[11px] leading-4 ${
-                      STRICT_ENVIRONMENTS.includes(environment)
-                        ? 'text-[#FCD34D]'
-                        : 'text-[#6B7280]'
-                    }`}
-                  >
-                    production/staging은 더 엄격 — Medium도 승인 필요로 승격됩니다.
-                  </p>
+              <div className="w-full md:w-56">
+                <p className="inline-flex items-center gap-1 text-[12px] text-[#6B7280]">
+                  <GitBranch className="h-4 w-4" /> 실행 브랜치
+                </p>
+                <div className="mt-2">
+                  <Select value={selectedBranch} onValueChange={setSelectedBranch}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="브랜치 선택" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {selectedRepo.branches.map((branch) => (
+                        <SelectItem key={branch} value={branch}>
+                          {branch}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
               </div>
             </div>

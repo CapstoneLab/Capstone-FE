@@ -724,8 +724,7 @@ export function PipelineProgressPage() {
             </Button>
             <Button
               type="button"
-              variant="ghost"
-              className="h-9 border border-[#3ECF8E] bg-[#065F46]/30 px-3 text-xs text-[#A7F3D0] hover:bg-[#065F46]/50"
+              className="h-9 border border-[#34D399] bg-[#34D399] px-3 text-xs font-semibold text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
             >
               <Download className="mr-1.5 h-3.5 w-3.5" />
               결과 다운로드

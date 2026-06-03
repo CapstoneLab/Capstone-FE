@@ -187,6 +187,29 @@ body {
   color: var(--app-text-secondary) !important;
 }
 
+/* Semantic banner text (red/amber/orange light tints) → darker shade in light
+   mode so it reads on the now-light tinted backgrounds. Greens excluded (some
+   sit on solid dark-green boxes). */
+:root[data-theme='light'] .text-\[\#FCA5A5\],
+:root[data-theme='light'] .text-\[\#FECACA\] {
+  color: #b91c1c !important;
+}
+:root[data-theme='light'] .text-\[\#FCD34D\],
+:root[data-theme='light'] .text-\[\#FDE68A\] {
+  color: #92400e !important;
+}
+:root[data-theme='light'] .text-\[\#FDBA74\],
+:root[data-theme='light'] .text-\[\#FED7AA\] {
+  color: #9a3412 !important;
+}
+
+/* Red semantic banner backgrounds → clean light red in light mode (the dark
+   tint turns muddy over white); pairs with the dark-red text above. */
+:root[data-theme='light'] .bg-\[\#450A0A\]\/40,
+:root[data-theme='light'] .bg-\[\#7F1D1D\]\/30 {
+  background-color: #fee2e2 !important;
+}
+
 a {
   color: inherit;
   text-decoration: none;
