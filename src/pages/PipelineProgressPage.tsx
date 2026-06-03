@@ -296,7 +296,6 @@ export function PipelineProgressPage() {
   const repoName = result?.repoName || detail?.repoName || locationState.repoName || ''
   const branch = result?.branch || detail?.branch || locationState.branch || ''
   const repoUrl = result?.repoUrl || detail?.repoUrl || ''
-  const codeQualityScore = result?.codeQualityScore ?? null
   const jobStatus = detail?.status ?? null
 
   // The rich gate verdict (new model). null => legacy/summary-only payload.
@@ -826,11 +825,11 @@ export function PipelineProgressPage() {
         {outOfScopeCount > 0 ? (
           <div className="rounded-xl border border-[#404040] bg-[#1E1E1E] p-4">
             <p className="text-[13px] font-semibold text-[#D1D5DB]">
-              선택 범위 밖에서 {outOfScopeCount}건이 추가로 탐지되었습니다 (미검사 항목).
+              검사 범위 밖에서 취약점 {outOfScopeCount}건이 추가로 발견되었습니다.
             </p>
             <p className="mt-1 text-[12px] text-[#9CA3AF]">
-              이번 판정은 선택한 {vd?.selectedCount ?? selectedCatalogCount}개 항목 기준입니다. 미선택 항목은
-              "안전"이 아니라 "검사 안 함"입니다.
+              배포 판정은 선택한 {vd?.selectedCount ?? selectedCatalogCount}개 항목만 기준입니다. 이{' '}
+              {outOfScopeCount}건은 판정에 포함되지 않았을 뿐, "안전"을 뜻하지는 않습니다.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
               <Button
@@ -839,7 +838,7 @@ export function PipelineProgressPage() {
                 onClick={scrollToOutOfScope}
                 className="h-8 border-[#404040] bg-transparent px-3 text-xs text-[#D1D5DB] hover:bg-[#262626]"
               >
-                미검사 항목 보기
+                추가 발견 항목 보기
               </Button>
               <Button
                 type="button"
@@ -884,7 +883,7 @@ export function PipelineProgressPage() {
             <div className="mt-3 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
               <p className="text-[12px] text-[#6B7280]">코드 품질 점수</p>
               <p className="text-[24px] font-bold leading-none text-white">
-                {codeQualityScore ?? '-'}
+                {score ?? '-'}
                 <span className="text-[24px]">/100</span>
               </p>
             </div>
