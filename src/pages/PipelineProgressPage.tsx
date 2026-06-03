@@ -1,8 +1,10 @@
 import {
   AlertTriangle,
   Ban,
+  Check,
   CheckCircle2,
   CodeXml,
+  Copy,
   Download,
   FileClock,
   FileText,
@@ -21,6 +23,7 @@ import { Card } from '@/components/ui/card'
 import { useAuth } from '@/contexts/AuthContext'
 import { useTheme } from '@/contexts/ThemeContext'
 import {
+  computeSecurityScore,
   fetchJobDetail,
   fetchJobResult,
   type JobDetail,
@@ -178,6 +181,47 @@ function legacyToVerdictKind(v: JobVerdict | null, jobStatus: JobDetail['status'
   return null
 }
 
+// Copy helper that works both on the web (secure context → navigator.clipboard)
+// and in the packaged Electron app, which serves over `file:` where
+// navigator.clipboard is unavailable — there we fall back to the legacy
+// execCommand('copy') via a throwaway textarea.
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // fall through to the legacy path
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.focus()
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch {
+    return false
+  }
+}
+
+// Title = a short one-line summary; the full text lives in the 설명 block. Many
+// scanner messages pack the summary into the first sentence, so take that and
+// cap the length.
+function shortSummary(text: string): string {
+  const trimmed = (text ?? '').trim()
+  if (!trimmed) return ''
+  const firstSentence = trimmed.match(/^.*?[.!?](?:\s|$)/)
+  let s = (firstSentence ? firstSentence[0] : trimmed).trim()
+  if (s.length > 80) s = `${s.slice(0, 77).trimEnd()}…`
+  return s
+}
+
 export function PipelineProgressPage() {
   const navigate = useNavigate()
   const { token } = useAuth()
@@ -192,6 +236,16 @@ export function PipelineProgressPage() {
   // there's nothing to fetch (jobId/token are stable for this page's life).
   const [isLoading, setIsLoading] = useState(() => !!(jobId && token))
   const [error, setError] = useState<string | null>(null)
+  // Which copy affordance most recently succeeded — keyed by `${id}:code|ai`,
+  // shown as "복사됨" briefly.
+  const [copiedKey, setCopiedKey] = useState<string | null>(null)
+
+  async function handleCopy(key: string, text: string) {
+    const ok = await copyToClipboard(text)
+    if (!ok) return
+    setCopiedKey(key)
+    window.setTimeout(() => setCopiedKey((cur) => (cur === key ? null : cur)), 1500)
+  }
 
   useEffect(() => {
     if (!jobId || !token) return
@@ -236,10 +290,12 @@ export function PipelineProgressPage() {
   // The rich gate verdict (new model). null => legacy/summary-only payload.
   const vd: JobVerdictDetail | null = result?.verdictDetail ?? null
 
-  // The score is consumed as-is (B-0: no recompute). gauge_color too.
-  const score = vd?.score ?? result?.securityScore ?? detail?.securityScore ?? null
+  // Backend score (B-0: prefer as-is). gauge_color too. The final `score` is
+  // reconciled against the in-scope findings just below — a perfect 100 while
+  // findings exist means the backend score is empty-derived (same root cause as
+  // the all-zero counts), so we recompute the deduction there.
+  const rawScore = vd?.score ?? result?.securityScore ?? detail?.securityScore ?? null
   const gaugeColor = vd?.gaugeColor || '#F97316'
-  const scoreLabel = vd?.scoreLabel || (score != null ? `${score}/100` : null)
 
   // B-0 counts (in-scope). The backend's verdict counts are authoritative, but
   // `vd.counts` is sometimes present-yet-all-zero (field-name mismatch or not
@@ -272,6 +328,16 @@ export function PipelineProgressPage() {
     () => severityOrder.reduce((sum, { key }) => sum + (counts[key] ?? 0), 0),
     [counts],
   )
+
+  // Reconcile the score with the in-scope findings. A backend score that is
+  // null, or a suspiciously perfect 100 while in-scope findings exist (empty-
+  // derived — the same defect that zeroed the counts), is recomputed from the
+  // same counts the chart shows so the gauge actually reflects the deduction.
+  const score =
+    (rawScore == null || rawScore === 100) && totalCount > 0
+      ? computeSecurityScore(counts)
+      : rawScore
+  const scoreLabel = vd?.scoreLabel || (score != null ? `${score}/100` : null)
 
   // Effective verdict — prefer the rich model, else map the legacy verdict.
   const effectiveVerdict: VerdictKind | null =
@@ -328,8 +394,47 @@ export function PipelineProgressPage() {
     [counts],
   )
 
+  // 검사 범위 밖(정책 미선택) findings를 등급별로 집계 — 두 번째 도넛용.
+  const outScopeCounts = useMemo(
+    () =>
+      outOfScopeFindings.reduce<Record<SecuritySeverity, number>>(
+        (acc, f) => {
+          acc[f.severity] += 1
+          return acc
+        },
+        { critical: 0, high: 0, medium: 0, low: 0 },
+      ),
+    [outOfScopeFindings],
+  )
+  const outScopeTotal = useMemo(
+    () => severityOrder.reduce((sum, { key }) => sum + (outScopeCounts[key] ?? 0), 0),
+    [outScopeCounts],
+  )
+  const outScopeChartData = useMemo(
+    () => ({
+      labels: severityOrder.map((s) => s.label),
+      datasets: [
+        {
+          data: severityOrder.map((s) => outScopeCounts[s.key] ?? 0),
+          backgroundColor: severityOrder.map((s) => severityColors[s.label]),
+          borderColor: '#1E1E1E',
+          borderWidth: 2,
+        },
+      ],
+    }),
+    [outScopeCounts],
+  )
+
   // selected_items → mark each of the 16 catalog items as 검사/미검사.
-  const selectedSet = useMemo(() => new Set(vd?.selectedItems ?? []), [vd])
+  // selected_items가 catalog key("sql-injection")로 올 수도, 백엔드가 변환한
+  // CWE id("CWE-89")로 올 수도 있어 둘 다 소문자로 정규화해 담는다.
+  const selectedSet = useMemo(
+    () => new Set((vd?.selectedItems ?? []).map((s) => String(s).toLowerCase())),
+    [vd],
+  )
+  const isItemSelected = (item: { id: string; cwe: string }) =>
+    selectedSet.has(item.id.toLowerCase()) || selectedSet.has(item.cwe.toLowerCase())
+  const selectedCatalogCount = securityCheckCatalog.filter(isItemSelected).length
 
   function scrollToOutOfScope() {
     document.getElementById('out-of-scope-section')?.scrollIntoView({ behavior: 'smooth' })
@@ -340,6 +445,41 @@ export function PipelineProgressPage() {
     const ref = vd?.scannedCommitSha || branch || 'HEAD'
     const base = repoUrl.replace(/\.git$/, '').replace(/\/$/, '')
     return `${base}/blob/${ref}/${f.filePath}${f.lineNumber ? `#L${f.lineNumber}` : ''}`
+  }
+
+  // One severity breakdown row (도넛 + 범례 + total). Reused by the in-scope and
+  // out-of-scope halves of the 등급별 취약점 card.
+  function renderSeverityBreakdown(
+    chartData: typeof severityChartData,
+    breakdownCounts: Record<SecuritySeverity, number>,
+    total: number,
+    emptyText: string,
+  ) {
+    return (
+      <div className="flex min-h-40 items-center justify-center gap-6">
+        {total > 0 ? (
+          <div className="flex h-36 w-36 items-center justify-center">
+            <Doughnut data={chartData} options={severityChartOptions} />
+          </div>
+        ) : (
+          <div className="flex h-36 w-36 items-center justify-center text-center text-[12px] text-[#6B7280]">
+            {emptyText}
+          </div>
+        )}
+        <div className="flex-1 self-center space-y-2">
+          {severityOrder.map(({ key, label }) => (
+            <div key={key} className="flex items-center justify-between text-[12px] text-[#D1D5DB]">
+              <p className="inline-flex items-center gap-2">
+                <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: severityColors[label] }} />
+                {label}
+              </p>
+              <span>{breakdownCounts[key] ?? 0}</span>
+            </div>
+          ))}
+          <div className="pt-1 text-[12px] text-[#A3A3A3]">total {total.toLocaleString()}</div>
+        </div>
+      </div>
+    )
   }
 
   if (!jobId) {
@@ -407,6 +547,14 @@ export function PipelineProgressPage() {
     const url = githubLineUrl(item)
     const cvssText =
       item.cvssScore != null ? `CVSS ${item.cvssScore}` : item.cvss ? `CVSS ${item.cvss}` : null
+    // 제목/설명 분리: 설명(긴 본문)은 description, 없으면 title을 사용하고,
+    // 제목은 그 본문을 한 줄로 요약. 백엔드가 별도의 짧은 title을 주면 그대로.
+    const fullText = item.description || item.title || ''
+    const hasDistinctTitle =
+      !!item.title && item.title !== item.description && item.title.length <= 80
+    const titleText = hasDistinctTitle ? item.title : shortSummary(fullText)
+    const codeCopyKey = `${item.id}:code`
+    const aiCopyKey = `${item.id}:ai`
     return (
       <div
         key={item.id}
@@ -432,14 +580,9 @@ export function PipelineProgressPage() {
               미검사
             </span>
           ) : null}
-          {item.scanner ? (
-            <span className="ml-auto rounded-full border border-[#404040] px-2 py-0.5 text-[11px] text-[#9CA3AF]">
-              {item.scanner}
-            </span>
-          ) : null}
         </div>
 
-        <p className="text-[20px] font-bold text-white">{item.title}</p>
+        <p className="text-[20px] font-bold text-white">{titleText}</p>
         <div className="mt-1 flex flex-wrap items-center gap-3">
           {location ? (
             url ? (
@@ -459,22 +602,68 @@ export function PipelineProgressPage() {
         </div>
 
         {item.codeSnippet ? (
-          <pre className="mt-3 overflow-x-auto rounded-md border border-[#404040] bg-[#0F0F0F] p-3 text-[12px] text-[#D1D5DB]">
-            <code className="font-mono">{item.codeSnippet}</code>
-          </pre>
+          <div className="relative mt-3">
+            <button
+              type="button"
+              onClick={() => handleCopy(codeCopyKey, item.codeSnippet ?? '')}
+              title="코드 복사"
+              className="absolute right-2 top-2 z-10 inline-flex items-center gap-1 rounded-md border border-[#404040] bg-[#1E1E1E] px-2 py-0.5 text-[11px] text-[#9CA3AF] transition-colors hover:text-white"
+            >
+              {copiedKey === codeCopyKey ? (
+                <>
+                  <Check className="h-3 w-3" /> 복사됨
+                </>
+              ) : (
+                <>
+                  <Copy className="h-3 w-3" /> 복사
+                </>
+              )}
+            </button>
+            <pre className="overflow-x-auto rounded-md border border-[#404040] bg-[#0F0F0F] p-3 pr-20 text-[12px] text-[#D1D5DB]">
+              <code className="font-mono">{item.codeSnippet}</code>
+            </pre>
+          </div>
         ) : null}
 
-        {item.description ? (
+        {fullText ? (
           <div className="mt-3">
             <p className="text-[12px] font-semibold text-[#D1D5DB]">설명</p>
-            <p className="mt-1 text-[12px] text-[#A3A3A3]">{item.description}</p>
+            <p className="mt-1 text-[12px] text-[#A3A3A3]">{fullText}</p>
           </div>
         ) : null}
 
         {item.aiSuggestion ? (
           <details className="mt-3 rounded-lg border border-[#3ECF8E] bg-[#065F46] p-3">
-            <summary className="inline-flex cursor-pointer items-center gap-1 text-[14px] font-semibold text-[#D1FAE5]">
-              <FileText className="h-3.5 w-3.5" /> AI 수정 제안
+            <summary className="flex cursor-pointer items-center justify-between gap-2 text-[14px] font-semibold text-[#D1FAE5]">
+              <span className="inline-flex items-center gap-1">
+                <FileText className="h-3.5 w-3.5" /> AI 수정 제안
+              </span>
+              <span
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  e.preventDefault()
+                  handleCopy(aiCopyKey, item.aiSuggestion)
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    handleCopy(aiCopyKey, item.aiSuggestion)
+                  }
+                }}
+                title="제안 복사"
+                className="inline-flex items-center gap-1 rounded-md border border-[#3ECF8E]/60 px-2 py-0.5 text-[11px] font-normal text-[#A7F3D0] transition-colors hover:bg-[#047857] hover:text-white"
+              >
+                {copiedKey === aiCopyKey ? (
+                  <>
+                    <Check className="h-3 w-3" /> 복사됨
+                  </>
+                ) : (
+                  <>
+                    <Copy className="h-3 w-3" /> 복사
+                  </>
+                )}
+              </span>
             </summary>
             <p className="mt-2 text-[14px] text-[#D1FAE5]">{item.aiSuggestion}</p>
           </details>
@@ -620,7 +809,7 @@ export function PipelineProgressPage() {
               선택 범위 밖에서 {outOfScopeCount}건이 추가로 탐지되었습니다 (미검사 항목).
             </p>
             <p className="mt-1 text-[12px] text-[#9CA3AF]">
-              이번 판정은 선택한 {vd?.selectedCount ?? selectedSet.size}개 항목 기준입니다. 미선택 항목은
+              이번 판정은 선택한 {vd?.selectedCount ?? selectedCatalogCount}개 항목 기준입니다. 미선택 항목은
               "안전"이 아니라 "검사 안 함"입니다.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
@@ -700,30 +889,25 @@ export function PipelineProgressPage() {
           </Card>
 
           <Card className="border-[#404040] bg-[#262626] p-4">
-            <p className="mb-3 text-[16px] font-semibold text-white">등급별 취약점 (검사 범위 기준)</p>
-            <div className="flex min-h-45 items-center justify-center gap-6">
-              {totalCount > 0 ? (
-                <div className="flex h-40 w-40 items-center justify-center">
-                  <Doughnut data={severityChartData} options={severityChartOptions} />
-                </div>
-              ) : (
-                <div className="flex h-40 w-40 items-center justify-center text-[12px] text-[#6B7280]">
-                  탐지된 취약점 없음
-                </div>
-              )}
-              <div className="flex-1 self-center space-y-2">
-                {severityOrder.map(({ key, label }) => (
-                  <div key={key} className="flex items-center justify-between text-[12px] text-[#D1D5DB]">
-                    <p className="inline-flex items-center gap-2">
-                      <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: severityColors[label] }} />
-                      {label}
-                    </p>
-                    <span>{counts[key] ?? 0}</span>
-                  </div>
-                ))}
-                <div className="pt-1 text-[12px] text-[#A3A3A3]">total {totalCount.toLocaleString()}</div>
-              </div>
+            <p className="mb-1 text-[16px] font-semibold text-white">등급별 취약점</p>
+            {/* 위: 검사 범위 기준(in-scope) / 아래: 검사 범위 밖(out-of-scope) */}
+            <div className="mb-2 flex items-center gap-2 text-[13px] font-medium text-[#34D399]">
+              <span className="h-2 w-2 rounded-full bg-[#34D399]" /> 검사 범위 기준
             </div>
+            {renderSeverityBreakdown(severityChartData, counts, totalCount, '탐지된 취약점 없음')}
+
+            <div className="my-3 border-t border-dashed border-[#404040]" />
+
+            <div className="mb-2 flex items-center gap-2 text-[13px] font-medium text-[#9CA3AF]">
+              <span className="h-2 w-2 rounded-full bg-[#9CA3AF]" /> 검사 범위 밖 기준
+              <span className="text-[11px] text-[#6B7280]">(정책 미선택 — 게이트 영향 없음)</span>
+            </div>
+            {renderSeverityBreakdown(
+              outScopeChartData,
+              outScopeCounts,
+              outScopeTotal,
+              '범위 밖 취약점 없음',
+            )}
           </Card>
         </div>
 
@@ -731,11 +915,11 @@ export function PipelineProgressPage() {
         {vd && vd.selectedItems.length >= 0 ? (
           <details className="rounded-xl border border-[#404040] bg-[#262626] p-4">
             <summary className="cursor-pointer text-[14px] font-semibold text-white">
-              검사 항목 ({selectedSet.size}/{securityCheckCatalog.length})
+              검사 항목 ({selectedCatalogCount}/{securityCheckCatalog.length})
             </summary>
             <div className="mt-3 grid gap-2 sm:grid-cols-2">
               {securityCheckCatalog.map((c) => {
-                const checked = selectedSet.has(c.id)
+                const checked = isItemSelected(c)
                 return (
                   <div
                     key={c.id}
