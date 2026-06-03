@@ -1018,7 +1018,7 @@ function mapApprovalEntry(raw: UnknownRecord, idx: number): ApprovalLogEntry {
       (!!requestedCommitSha && !!scannedCommitSha && requestedCommitSha !== scannedCommitSha),
     cwes: Array.isArray(cwesRaw) ? (cwesRaw as string[]) : [],
     reason: pick<string>(raw, 'reason') ?? '',
-    approver: pick<string>(raw, 'approver', 'approved_by', 'approvedBy', 'reviewer') ?? '',
+    approver: pick<string>(raw, 'approver', 'approver_id', 'approverId', 'approved_by', 'approvedBy', 'reviewer') ?? '',
     status,
     createdAt:
       pick<string>(raw, 'created_at', 'createdAt', 'requested_at', 'requestedAt', 'at') ?? null,
@@ -1050,7 +1050,7 @@ export async function fetchApprovals(
   const data = (await res.json()) as unknown
   const list = Array.isArray(data)
     ? (data as UnknownRecord[])
-    : (pick<unknown[]>(data as UnknownRecord, 'approvals', 'items', 'results') ?? [])
+    : (pick<unknown[]>(data as UnknownRecord, 'records', 'approvals', 'items', 'results') ?? [])
   return (list as UnknownRecord[]).map(mapApprovalEntry)
 }
 
@@ -1097,8 +1097,8 @@ export type StartPipelinePayload = {
   environment?: PipelineEnvironment
   triggerSource?: string
   /** Security check identifiers the user selected — only these run. Sent as
-   *  the top-level `selected_items` field; CWE id ("CWE-89") or key
-   *  ("sql-injection") 둘 다 허용되지만 일관되게 CWE id를 보냄. */
+   *  the top-level `selected_items` field using catalog keys ("sql-injection",
+   *  ...) per API spec §6. Empty/omitted → backend runs all 16 checks. */
   selectedItems?: string[]
   /** Latest commit SHA of the selected repo+branch (best-effort). */
   commitSha?: string
@@ -1127,8 +1127,10 @@ export async function startPipeline(
   if (payload.commitSha) body.commit_sha = payload.commitSha
   if (payload.isFirstRun !== undefined) body.is_first_run = payload.isFirstRun
 
-  // Backend pipeline-start endpoint (per backend spec 3-2).
-  const res = await fetch(`${API_BASE}/start-pipeline`, {
+  // Pipeline-start endpoint (API spec §2-1). /api/pipelines is preferred over
+  // /start-pipeline because it adds duplicate-run prevention: a 409 CONFLICT
+  // when the same repo+branch already has a running pipeline (handled below).
+  const res = await fetch(`${API_BASE}/api/pipelines`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -1139,7 +1141,7 @@ export async function startPipeline(
 
   if (!res.ok) {
     const text = await res.text().catch(() => '')
-    console.error('[api] /start-pipeline failed:', res.status, text)
+    console.error('[api] /api/pipelines failed:', res.status, text)
     let detail = ''
     let parsed: UnknownRecord | null = null
     try {

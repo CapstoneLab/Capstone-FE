@@ -118,7 +118,7 @@
 ---
 
 ### 3.3 POST `/api/pipelines` — 파이프라인 시작 ★
-사용처: [src/lib/api.ts:273](../src/lib/api.ts#L273) (현재 `/start-pipeline` 직호출 중 → 이 경로로 변경 필요)
+사용처: [src/lib/api.ts](../src/lib/api.ts) `startPipeline` (v0.10.4부터 `/api/pipelines` 호출 — 409 중복 실행 방지 적용)
 
 **요청 바디**
 ```json
