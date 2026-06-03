@@ -210,6 +210,18 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
+// selected_items 매칭용 정규화. 백엔드가 catalog key("sql-injection"),
+// 표시명("SQL Injection"), CWE id("CWE-89"), 숫자("89") 등 어떤 형식으로 echo해도
+// 매칭되도록 영숫자만 남겨 비교한다.
+function normToken(s: string): string {
+  return String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+}
+// CWE 통일 키: 어떤 형식이든 숫자만 뽑아 "cwe89" 형태로.
+function cweKey(s: string): string {
+  const m = String(s ?? '').match(/(\d{1,6})/)
+  return m ? `cwe${m[1]}` : ''
+}
+
 // Title = a short one-line summary; the full text lives in the 설명 block. Many
 // scanner messages pack the summary into the first sentence, so take that and
 // cap the length.
@@ -428,12 +440,20 @@ export function PipelineProgressPage() {
   // selected_items → mark each of the 16 catalog items as 검사/미검사.
   // selected_items가 catalog key("sql-injection")로 올 수도, 백엔드가 변환한
   // CWE id("CWE-89")로 올 수도 있어 둘 다 소문자로 정규화해 담는다.
-  const selectedSet = useMemo(
-    () => new Set((vd?.selectedItems ?? []).map((s) => String(s).toLowerCase())),
-    [vd],
-  )
-  const isItemSelected = (item: { id: string; cwe: string }) =>
-    selectedSet.has(item.id.toLowerCase()) || selectedSet.has(item.cwe.toLowerCase())
+  const selectedTokens = useMemo(() => {
+    const set = new Set<string>()
+    for (const raw of vd?.selectedItems ?? []) {
+      const n = normToken(raw)
+      if (n) set.add(n)
+      const c = cweKey(raw)
+      if (c) set.add(c)
+    }
+    return set
+  }, [vd])
+  const isItemSelected = (item: { id: string; cwe: string; title: string }) =>
+    [normToken(item.id), normToken(item.cwe), cweKey(item.cwe), normToken(item.title)].some(
+      (t) => t && selectedTokens.has(t),
+    )
   const selectedCatalogCount = securityCheckCatalog.filter(isItemSelected).length
 
   function scrollToOutOfScope() {
@@ -868,24 +888,6 @@ export function PipelineProgressPage() {
                 <span className="text-[24px]">/100</span>
               </p>
             </div>
-            {/* score_breakdown (감점 내역 — 접기) */}
-            {vd?.scoreBreakdown &&
-            severityOrder.some(({ key }) => (vd.scoreBreakdown[key] ?? 0) > 0) ? (
-              <details className="mt-2 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
-                <summary className="cursor-pointer text-[12px] text-[#9CA3AF]">감점 내역</summary>
-                <div className="mt-2 space-y-1">
-                  {severityOrder.map(({ key, label }) => (
-                    <div key={key} className="flex items-center justify-between text-[12px] text-[#D1D5DB]">
-                      <span className="inline-flex items-center gap-2">
-                        <span className="h-2 w-2 rounded-full" style={{ backgroundColor: severityColors[label] }} />
-                        {label}
-                      </span>
-                      <span className="text-[#FCA5A5]">-{vd.scoreBreakdown[key] ?? 0}</span>
-                    </div>
-                  ))}
-                </div>
-              </details>
-            ) : null}
           </Card>
 
           <Card className="border-[#404040] bg-[#262626] p-4">
