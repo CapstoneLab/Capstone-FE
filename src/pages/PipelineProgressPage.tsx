@@ -888,6 +888,24 @@ export function PipelineProgressPage() {
                 <span className="text-[24px]">/100</span>
               </p>
             </div>
+            {/* score_breakdown (감점 내역 — 항상 펼침) */}
+            {vd?.scoreBreakdown &&
+            severityOrder.some(({ key }) => (vd.scoreBreakdown[key] ?? 0) > 0) ? (
+              <div className="mt-2 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
+                <p className="text-[12px] text-[#9CA3AF]">감점 내역</p>
+                <div className="mt-2 space-y-1">
+                  {severityOrder.map(({ key, label }) => (
+                    <div key={key} className="flex items-center justify-between text-[12px] text-[#D1D5DB]">
+                      <span className="inline-flex items-center gap-2">
+                        <span className="h-2 w-2 rounded-full" style={{ backgroundColor: severityColors[label] }} />
+                        {label}
+                      </span>
+                      <span className="text-[#FCA5A5]">-{vd.scoreBreakdown[key] ?? 0}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
           </Card>
 
           <Card className="border-[#404040] bg-[#262626] p-4">
