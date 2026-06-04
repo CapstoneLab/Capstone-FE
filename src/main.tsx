@@ -5,23 +5,28 @@ import './index.css'
 import App from './App.tsx'
 import { AuthProvider } from '@/contexts/AuthContext'
 import { ThemeProvider } from '@/contexts/ThemeContext'
+import { ZoomProvider } from '@/contexts/ZoomContext'
+import { ZoomControl } from '@/components/layout/ZoomControl'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <ThemeProvider>
-      {window.location.protocol === 'file:' ? (
-        <HashRouter>
-          <AuthProvider>
-            <App />
-          </AuthProvider>
-        </HashRouter>
-      ) : (
-        <BrowserRouter>
-          <AuthProvider>
-            <App />
-          </AuthProvider>
-        </BrowserRouter>
-      )}
+      <ZoomProvider>
+        {window.location.protocol === 'file:' ? (
+          <HashRouter>
+            <AuthProvider>
+              <App />
+            </AuthProvider>
+          </HashRouter>
+        ) : (
+          <BrowserRouter>
+            <AuthProvider>
+              <App />
+            </AuthProvider>
+          </BrowserRouter>
+        )}
+        <ZoomControl />
+      </ZoomProvider>
     </ThemeProvider>
   </StrictMode>,
 )

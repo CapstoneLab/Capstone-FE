@@ -64,10 +64,10 @@ const severityColors: Record<SeverityLabel, string> = {
 // Critical 🔴 / High 🟠 / Medium 🟡 / Low 🟢. Kept in lockstep with
 // severityColors so the dot, doughnut and pill never disagree.
 const severityBadgeClassMap: Record<SecuritySeverity, string> = {
-  critical: 'border-[#EF4444] bg-[#450A0A] text-[#F87171]',
-  high: 'border-[#F97316] bg-[#3A1A05] text-[#FDBA74]',
-  medium: 'border-[#EAB308] bg-[#3A2E05] text-[#FDE68A]',
-  low: 'border-[#22C55E] bg-[#052E1B] text-[#86EFAC]',
+  critical: 'border-[#EF4444] bg-[#EF4444] text-white',
+  high: 'border-[#F97316] bg-[#F97316] text-white',
+  medium: 'border-[#CA8A04] bg-[#CA8A04] text-white',
+  low: 'border-[#16A34A] bg-[#16A34A] text-white',
 }
 
 // B-1: the 4-state verdict presentation. icon/label/message are fixed per
