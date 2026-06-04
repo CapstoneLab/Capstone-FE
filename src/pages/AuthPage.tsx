@@ -84,9 +84,9 @@ export function AuthPage() {
   }
 
   return (
-    <section className="min-h-screen bg-[#1E1E1E] text-white">
+    <section className="min-h-full bg-[#1E1E1E] text-white">
       <NativeFrameBar />
-      <main className="mx-auto flex min-h-screen w-full max-w-6xl items-center justify-center px-6 pb-10 pt-14">
+      <main className="mx-auto flex min-h-full w-full max-w-6xl items-center justify-center px-6 pb-10 pt-14">
         <div className="w-full max-w-md">
           <Card className="border-gray-500/80 bg-[#242424] p-4 text-center">
             <img

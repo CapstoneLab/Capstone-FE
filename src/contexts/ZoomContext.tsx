@@ -46,11 +46,20 @@ export function ZoomProvider({ children }: { children: ReactNode }) {
   const [zoom, setZoomState] = useState<number>(() => readStoredZoom())
 
   // CSS `zoom` scales the whole layout like the browser's native zoom. We apply
-  // it to <body> (not <html>) so the fixed ZoomControl can cancel it back to
-  // 100% with an inverse `zoom`, keeping the control itself a constant size.
+  // it to #root (the app wrapper) rather than <body>: the layout uses
+  // `html, body, #root { height: 100% }`, so zooming <body> would paint it at
+  // only `zoom × 100vh` and leave a dead band below. Counter-sizing #root to
+  // `100 / zoom` % means after the zoom multiply it lands back at exactly the
+  // full viewport (e.g. at 60% → 166.7% × 0.6 = 100%), so content always fills
+  // the screen. The fixed ZoomControl lives inside #root and cancels this with
+  // an inverse `zoom`, keeping itself a constant size.
   useEffect(() => {
     if (typeof document === 'undefined') return
-    document.body.style.zoom = String(zoom)
+    const root = document.getElementById('root')
+    if (!root) return
+    root.style.zoom = String(zoom)
+    root.style.width = `${100 / zoom}%`
+    root.style.height = `${100 / zoom}%`
   }, [zoom])
 
   const setZoom = useCallback((next: number) => {

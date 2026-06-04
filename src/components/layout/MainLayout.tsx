@@ -139,7 +139,7 @@ export function MainLayout({ children, pipelineElapsed }: MainLayoutProps) {
   }, [navigate, pathname, pipelineElapsed])
 
   return (
-    <div className="relative h-screen overflow-hidden bg-[#1E1E1E] text-gray-50">
+    <div className="relative h-full overflow-hidden bg-[#1E1E1E] text-gray-50">
       <NativeFrameBar />
 
       <div
@@ -163,7 +163,7 @@ export function MainLayout({ children, pipelineElapsed }: MainLayoutProps) {
 
       <div
         ref={scrollContainerRef}
-        className="mt-9 flex h-[calc(100vh-36px)] flex-col overflow-y-auto overflow-x-hidden"
+        className="mt-9 flex h-[calc(100%-36px)] flex-col overflow-y-auto overflow-x-hidden"
       >
         <main className="relative mx-auto w-full max-w-6xl flex-1 px-6 pb-10 pt-6">{children}</main>
         <Footer />

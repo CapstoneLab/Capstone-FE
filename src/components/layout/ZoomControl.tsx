@@ -4,8 +4,8 @@ import { useZoom } from '@/contexts/ZoomContext'
 /**
  * Fixed bottom-right "− 100% +" control that scales the whole app via CSS zoom.
  *
- * The page zoom is applied to <body>; this control lives inside <body> too, so
- * it carries an inverse `zoom` (1 / current) that cancels the body zoom and
+ * The page zoom is applied to #root; this control lives inside #root too, so
+ * it carries an inverse `zoom` (1 / current) that cancels the root zoom and
  * keeps the control itself a constant size — it never shrinks out of reach.
  */
 export function ZoomControl() {
