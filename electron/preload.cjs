@@ -32,6 +32,10 @@ contextBridge.exposeInMainWorld('desktop', {
       return () => ipcRenderer.removeListener('auth:token-received', listener)
     },
   },
+  report: {
+    savePdf: (html, fileName) =>
+      ipcRenderer.invoke('report:save-pdf', { html, fileName }),
+  },
   updater: {
     checkForUpdates: () => ipcRenderer.invoke('updater:check-release'),
     downloadAndInstall: (installerUrl, version) =>

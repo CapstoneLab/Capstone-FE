@@ -41,6 +41,12 @@ declare global {
         startGithubLogin?: (url?: string) => Promise<{ opened: boolean; url: string; token?: string | null }>
         onAuthToken?: (callback: (token: string) => void) => () => void
       }
+      report?: {
+        savePdf?: (
+          html: string,
+          fileName: string,
+        ) => Promise<{ ok: boolean; filePath?: string; canceled?: boolean; error?: string }>
+      }
       updater?: {
         checkForUpdates?: () => Promise<DesktopReleaseInfo>
         downloadAndInstall?: (installerUrl: string, version: string) => Promise<{ started: boolean }>

@@ -35,6 +35,8 @@ import {
   type VerdictKind,
 } from '@/lib/api'
 import { securityCheckCatalog } from '@/data/securityCatalog'
+import { ResultDownloadDialog } from '@/components/ResultDownloadDialog'
+import type { ReportData } from '@/lib/reportExport'
 
 ChartJS.register(ArcElement, Tooltip, Legend)
 
@@ -251,6 +253,7 @@ export function PipelineProgressPage() {
   // Which copy affordance most recently succeeded — keyed by `${id}:code|ai`,
   // shown as "복사됨" briefly.
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
+  const [downloadOpen, setDownloadOpen] = useState(false)
 
   async function handleCopy(key: string, text: string) {
     const ok = await copyToClipboard(text)
@@ -374,6 +377,30 @@ export function PipelineProgressPage() {
   const outOfScopeFindings = useMemo(() => allFindings.filter((f) => !f.inScope), [allFindings])
   // out_of_scope_count: prefer the backend value, else count locally.
   const outOfScopeCount = vd?.outOfScopeCount ?? outOfScopeFindings.length
+
+  // Snapshot fed to the 결과 다운로드 modal (CSV/XLSX/JSON/보고서).
+  const reportData: ReportData = useMemo(
+    () => ({
+      jobId,
+      repoName,
+      repoUrl,
+      branch,
+      completedAt: result?.completedAt ?? null,
+      verdict: effectiveVerdict,
+      verdictLabel: verdictCfg?.label ?? '',
+      score,
+      scoreLabel,
+      counts,
+      inScopeFindings,
+      outOfScopeFindings,
+      selectedItems: vd?.selectedItems ?? [],
+    }),
+    [
+      jobId, repoName, repoUrl, branch, result?.completedAt, effectiveVerdict,
+      verdictCfg?.label, score, scoreLabel, counts, inScopeFindings,
+      outOfScopeFindings, vd?.selectedItems,
+    ],
+  )
 
   const scoreChartData = useMemo(
     () => ({
@@ -585,9 +612,9 @@ export function PipelineProgressPage() {
           >
             {item.severity}
           </span>
-          {/* 항목명 + CWE 태그. policy_item == null 이면 "16항목 외" */}
+          {/* 항목명 + CWE 태그. policy_item == null 이면 "정책 항목 외" */}
           <span className="text-[14px] font-semibold text-white">
-            {item.policyItem || '16항목 외'}
+            {item.policyItem || '정책 항목 외'}
           </span>
           {cwe ? (
             <span className="rounded-full border border-[#404040] px-2 py-0.5 text-[11px] text-[#9CA3AF]">
@@ -724,6 +751,7 @@ export function PipelineProgressPage() {
             </Button>
             <Button
               type="button"
+              onClick={() => setDownloadOpen(true)}
               className="h-9 border border-[#34D399] bg-[#34D399] px-3 text-xs font-semibold text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
             >
               <Download className="mr-1.5 h-3.5 w-3.5" />
@@ -844,7 +872,7 @@ export function PipelineProgressPage() {
                 onClick={() => navigate('/pipeline/new')}
                 className="h-8 bg-[#34D399] px-3 text-xs text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
               >
-                전체 16개로 다시 검사
+                전체 {securityCheckCatalog.length}개로 다시 검사
               </Button>
             </div>
           </div>
@@ -991,6 +1019,12 @@ export function PipelineProgressPage() {
           </Card>
         ) : null}
       </section>
+
+      <ResultDownloadDialog
+        open={downloadOpen}
+        onOpenChange={setDownloadOpen}
+        data={reportData}
+      />
     </MainLayout>
   )
 }

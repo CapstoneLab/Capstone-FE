@@ -59,13 +59,18 @@ body,
   --app-bg-elevated: #ffffff;
   --app-bg-sunken: #ececec;
   --app-surface-strong: #e5e7eb;
-  /* Light mode: neutral divider/border lines are rendered black for
-     visibility. In dark mode these same lines are a distinguishable gray
-     (rgba(75,85,99,.75)); on a light surface a subtle border washes out, so
-     we make them solid black instead. */
-  --app-border: #000000;
+  /* Neutral divider/border lines. Kept as a soft light-gray hairline — solid
+     black read as heavy outlines around every card/input on a light surface
+     (the cards already separate via the bg/elevated contrast and shadow, so a
+     subtle line is enough). */
+  --app-border: #e5e7eb;
   --app-text-primary: #1f2937;
   --app-text-secondary: #4b5563;
+  /* Hover/active fills for neutral surfaces. The components bake dark hover
+     hexes (hover:bg-[#262626], …) that have no light equivalent — these give
+     them a visible light-gray hover instead of flipping to dark. */
+  --app-hover: #ebebeb;
+  --app-hover-strong: #dcdcdc;
   --app-titlebar-bg: #f0f0f0;
   --app-titlebar-text: #111827;
   --app-titlebar-icon: #374151;
@@ -92,6 +97,7 @@ body {
    below use uppercase hex; we also list common lowercase variants. */
 :root[data-theme='light'] .bg-\[\#1E1E1E\],
 :root[data-theme='light'] .bg-\[\#1e1e1e\],
+:root[data-theme='light'] .bg-\[\#1E1E1E\]\/80,
 :root[data-theme='light'] .bg-\[\#0F0F0F\],
 :root[data-theme='light'] .bg-\[\#101010\],
 :root[data-theme='light'] .bg-\[\#171717\] {
@@ -131,7 +137,8 @@ body {
 }
 :root[data-theme='light'] .bg-gray-600\/75,
 :root[data-theme='light'] .bg-gray-600\/70,
-:root[data-theme='light'] .bg-gray-600\/65 {
+:root[data-theme='light'] .bg-gray-600\/65,
+:root[data-theme='light'] .bg-gray-500 {
   background-color: var(--app-surface-strong) !important;
 }
 
@@ -146,6 +153,10 @@ body {
 :root[data-theme='light'] .border-gray-600\/75,
 :root[data-theme='light'] .border-gray-600\/70,
 :root[data-theme='light'] .border-gray-600\/65,
+:root[data-theme='light'] .border-gray-500,
+:root[data-theme='light'] .border-gray-500\/80,
+:root[data-theme='light'] .border-gray-500\/70,
+:root[data-theme='light'] .border-gray-500\/60,
 :root[data-theme='light'] .border-gray-400\/80,
 :root[data-theme='light'] .border-gray-50 {
   border-color: var(--app-border) !important;
@@ -180,10 +191,15 @@ body {
   color: var(--app-text-secondary) !important;
 }
 :root[data-theme='light'] .text-\[\#6B7280\],
+:root[data-theme='light'] .text-gray-400,
 :root[data-theme='light'] .text-gray-300,
 :root[data-theme='light'] .text-gray-200,
 :root[data-theme='light'] .text-gray-100,
 :root[data-theme='light'] .text-gray-50 {
+  color: var(--app-text-secondary) !important;
+}
+/* gray-500 is a dimmer label/placeholder; keep it secondary too. */
+:root[data-theme='light'] .text-gray-500 {
   color: var(--app-text-secondary) !important;
 }
 
@@ -206,8 +222,125 @@ body {
 /* Red semantic banner backgrounds → clean light red in light mode (the dark
    tint turns muddy over white); pairs with the dark-red text above. */
 :root[data-theme='light'] .bg-\[\#450A0A\]\/40,
-:root[data-theme='light'] .bg-\[\#7F1D1D\]\/30 {
+:root[data-theme='light'] .bg-\[\#7F1D1D\]\/30,
+:root[data-theme='light'] .bg-\[\#7F1D1D\] {
   background-color: #fee2e2 !important;
+}
+
+/* Amber/orange/blue dark banner fills → light tints (same rationale as the
+   red banner above). The paired banner text is already darkened in light
+   mode by the rules above, so these read with good contrast. */
+:root[data-theme='light'] .bg-\[\#78350F\],
+:root[data-theme='light'] .bg-\[\#78350F\]\/30 {
+  background-color: #fef3c7 !important;
+}
+:root[data-theme='light'] .bg-\[\#7C2D12\],
+:root[data-theme='light'] .bg-\[\#7C2D12\]\/30,
+:root[data-theme='light'] .bg-\[\#7C2D12\]\/20 {
+  background-color: #ffedd5 !important;
+}
+:root[data-theme='light'] .bg-\[\#1E3A8A\] {
+  background-color: #dbeafe !important;
+}
+/* Light-blue banner text → darker blue so it reads on the light-blue fill. */
+:root[data-theme='light'] .text-\[\#93C5FD\] {
+  color: #1e40af !important;
+}
+
+/* ===== Light-mode interactive states =====================================
+   The components bake dark hover/active hexes (hover:bg-[#262626], …). With no
+   light equivalent, every button/list-row flips to a DARK fill on hover in
+   light mode (the reported "버튼 호버 미대응"). Map neutral hover/active fills
+   to light gray; semantic hovers (greens, reds, brand) are intentionally left
+   untouched so they keep their meaning. */
+:root[data-theme='light'] .hover\:bg-\[\#1E1E1E\]:hover,
+:root[data-theme='light'] .hover\:bg-\[\#1F1F1F\]:hover,
+:root[data-theme='light'] .hover\:bg-\[\#262626\]:hover,
+:root[data-theme='light'] .hover\:bg-gray-700\/70:hover {
+  background-color: var(--app-hover) !important;
+}
+:root[data-theme='light'] .hover\:bg-\[\#2A2A2A\]:hover,
+:root[data-theme='light'] .hover\:bg-\[\#2E2E2E\]:hover,
+:root[data-theme='light'] .hover\:bg-\[\#2F2F2F\]:hover,
+:root[data-theme='light'] .hover\:bg-\[\#333333\]:hover,
+:root[data-theme='light'] .hover\:bg-\[\#3A3A3A\]:hover,
+:root[data-theme='light'] .active\:bg-\[\#3A3A3A\]:active,
+:root[data-theme='light'] .hover\:bg-gray-600\/75:hover,
+:root[data-theme='light'] .hover\:bg-gray-600\/65:hover,
+:root[data-theme='light'] .active\:bg-gray-600\/70:active {
+  background-color: var(--app-hover-strong) !important;
+}
+/* Subtle white-overlay hovers → subtle black overlay on a light surface
+   (white/5 over white is invisible). */
+:root[data-theme='light'] .hover\:bg-white\/3:hover,
+:root[data-theme='light'] .hover\:bg-white\/5:hover {
+  background-color: rgba(0, 0, 0, 0.05) !important;
+}
+
+/* White hairline borders wash out completely on light surfaces → soft black.
+   Kept subtle (not solid #000) since these are intentionally thin dividers. */
+:root[data-theme='light'] .border-white\/10,
+:root[data-theme='light'] .border-white\/15,
+:root[data-theme='light'] .border-white\/20 {
+  border-color: rgba(0, 0, 0, 0.14) !important;
+}
+/* Neutral hover border → black, matching the resting neutral borders. */
+:root[data-theme='light'] .hover\:border-\[\#6B7280\]:hover {
+  border-color: var(--app-border) !important;
+}
+
+/* Hover text that brightens toward white/near-white becomes invisible on a
+   light surface — pin it to the primary text color instead. */
+:root[data-theme='light'] .hover\:text-white:hover,
+:root[data-theme='light'] .hover\:text-gray-100:hover,
+:root[data-theme='light'] .hover\:text-\[\#D1D5DB\]:hover {
+  color: var(--app-text-primary) !important;
+}
+
+/* ===== Light-mode icon & accent colors ===================================
+   Brand/semantic icons use bright or pale colors tuned for dark surfaces; on
+   light cards they wash out. Darken the green accent + the cyan/indigo action-
+   icon colors, and lighten the dark-green badge/chip FILLS so the now-darker
+   green text still reads on them. Solid CTAs (bg-[#059669]) and the terminal
+   mock (text-green-100 on a dark gradient) are intentionally left untouched. */
+
+/* Dark-green badge/chip fills → light green tint. */
+:root[data-theme='light'] .bg-\[\#065F46\],
+:root[data-theme='light'] .bg-\[\#065F46\]\/50,
+:root[data-theme='light'] .bg-\[\#065F46\]\/45,
+:root[data-theme='light'] .bg-\[\#065F46\]\/30,
+:root[data-theme='light'] .bg-\[\#065F46\]\/20,
+:root[data-theme='light'] .bg-green-900\/70,
+:root[data-theme='light'] .bg-green-900\/45 {
+  background-color: #d1fae5 !important;
+}
+
+/* Green accent text/icons → readable dark green. green-100 is excluded: it
+   only appears on the dark terminal mock, where it must stay light. */
+:root[data-theme='light'] .text-green-400,
+:root[data-theme='light'] .text-green-300,
+:root[data-theme='light'] .text-green-200,
+:root[data-theme='light'] .text-\[\#34D399\],
+:root[data-theme='light'] .text-\[\#34D399\]\!,
+:root[data-theme='light'] .text-\[\#3ECF8E\],
+:root[data-theme='light'] .text-\[\#6EE7B7\],
+:root[data-theme='light'] .text-\[\#A7F3D0\],
+:root[data-theme='light'] .text-\[\#D1FAE5\] {
+  color: #047857 !important;
+}
+/* Brand-green hover text → slightly darker green (stays on-brand, readable). */
+:root[data-theme='light'] .hover\:text-\[\#6EE7B7\]:hover,
+:root[data-theme='light'] .hover\:text-\[\#D1FAE5\]:hover {
+  color: #065f46 !important;
+}
+
+/* Cyan / indigo action-icon colors → darker shades for the light chip they
+   sit on (bg-[#2E2E2E] → light surface in light mode). */
+:root[data-theme='light'] .text-\[\#22D3EE\] {
+  color: #0e7490 !important;
+}
+:root[data-theme='light'] .text-\[\#6366F1\] {
+  color: #4f46e5 !important;
 }
 
 a {

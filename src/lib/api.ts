@@ -552,7 +552,7 @@ export type SecurityFinding = {
   scanner: string
   ruleId: string
   /** Matched policy item name (CWE selection). null => detected outside the
-   *  16-item policy set ("16항목 외"). */
+   *  selected policy set ("정책 항목 외"). */
   policyItem: string | null
   /** CWE id, e.g. "CWE-89". Classification is by CWE, not CVE. */
   cwe: string | null
@@ -1056,7 +1056,7 @@ export async function fetchApprovals(
 
 export type PipelineEnvironment = 'development' | 'feature' | 'staging' | 'production'
 
-// GET /api/security/catalog — the 16-item security policy catalog. Returns
+// GET /api/security/catalog — the security policy catalog. Returns
 // [] on failure so callers fall back to the bundled local catalog. Maps the
 // backend's {key,name,cwe,grade} to our SecurityCheckItem, reusing local
 // descriptions (the API carries none).
@@ -1263,10 +1263,22 @@ export async function fetchPipelineLogs(
   return Array.isArray(lines) ? (lines as string[]) : []
 }
 
+export type PipelineStepsResponse = {
+  steps: JobStep[]
+  job: {
+    status: string
+    repoUrl: string
+    branch: string
+    startedAt: string | null
+    completedAt: string | null
+    durationSecs: number | null
+  } | null
+}
+
 export async function fetchPipelineSteps(
   token: string,
   jobId: string,
-): Promise<JobStep[]> {
+): Promise<PipelineStepsResponse> {
   const res = await fetch(
     `${API_BASE}/api/pipelines/${encodeURIComponent(jobId)}/steps`,
     { headers: { Authorization: `Bearer ${token}` } },
@@ -1274,12 +1286,26 @@ export async function fetchPipelineSteps(
 
   if (!res.ok) {
     console.error('[api] /api/pipelines/{id}/steps failed:', res.status)
-    return []
+    return { steps: [], job: null }
   }
 
   const data = (await res.json()) as UnknownRecord
-  const steps = pick<unknown[]>(data, 'steps')
-  return Array.isArray(steps) ? (steps as UnknownRecord[]).map(mapStep) : []
+  const stepsRaw = pick<unknown[]>(data, 'steps')
+  const jobRaw = pick<UnknownRecord>(data, 'job')
+
+  return {
+    steps: Array.isArray(stepsRaw) ? (stepsRaw as UnknownRecord[]).map(mapStep) : [],
+    job: jobRaw
+      ? {
+          status: pick<string>(jobRaw, 'status') ?? '',
+          repoUrl: pick<string>(jobRaw, 'repo_url', 'repoUrl') ?? '',
+          branch: pick<string>(jobRaw, 'branch') ?? '',
+          startedAt: pick<string>(jobRaw, 'started_at', 'startedAt') ?? null,
+          completedAt: pick<string>(jobRaw, 'completed_at', 'completedAt') ?? null,
+          durationSecs: pick<number>(jobRaw, 'duration_secs', 'durationSecs') ?? null,
+        }
+      : null,
+  }
 }
 
 export async function fetchJobsByIds(

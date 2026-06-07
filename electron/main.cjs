@@ -1,5 +1,6 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron')
+const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 const { pipeline } = require('node:stream/promises')
 const { Readable } = require('node:stream')
@@ -587,6 +588,54 @@ ipcMain.handle('app:get-info', () => {
   return {
     appName: 'SecuPipeline',
     version: normalizeVersion(app.getVersion()),
+  }
+})
+
+// Render the security report HTML to a real PDF. Electron's window.print()
+// has no preview in the desktop print dialog, so the renderer hands the report
+// HTML here: we load it into an offscreen window, printToPDF, then prompt for a
+// save location and open the result.
+ipcMain.handle('report:save-pdf', async (event, payload) => {
+  const html = typeof payload?.html === 'string' ? payload.html : ''
+  const fileName =
+    typeof payload?.fileName === 'string' && payload.fileName.trim()
+      ? payload.fileName.replace(/[^\w.-]+/g, '_')
+      : 'security-report.pdf'
+  if (!html) return { ok: false, error: 'empty-html' }
+
+  const tmpHtml = path.join(os.tmpdir(), `secupipeline-report-${Date.now()}.html`)
+  const pdfWindow = new BrowserWindow({
+    show: false,
+    webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
+  })
+
+  try {
+    await fs.promises.writeFile(tmpHtml, html, 'utf8')
+    await pdfWindow.loadFile(tmpHtml)
+    // Give web fonts a beat to settle so the PDF matches the on-screen design.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+
+    const data = await pdfWindow.webContents.printToPDF({
+      printBackground: true,
+      margins: { marginType: 'custom', top: 0.55, bottom: 0.55, left: 0.55, right: 0.55 },
+    })
+
+    const parentWindow = BrowserWindow.fromWebContents(event.sender)
+    const { canceled, filePath } = await dialog.showSaveDialog(parentWindow || undefined, {
+      title: '보고서 PDF 저장',
+      defaultPath: fileName,
+      filters: [{ name: 'PDF', extensions: ['pdf'] }],
+    })
+    if (canceled || !filePath) return { ok: false, canceled: true }
+
+    await fs.promises.writeFile(filePath, data)
+    shell.openPath(filePath)
+    return { ok: true, filePath }
+  } catch (err) {
+    return { ok: false, error: String(err && err.message ? err.message : err) }
+  } finally {
+    pdfWindow.destroy()
+    fs.promises.unlink(tmpHtml).catch(() => {})
   }
 })
 

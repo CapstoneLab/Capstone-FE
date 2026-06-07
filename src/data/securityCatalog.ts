@@ -1,7 +1,10 @@
-// The fixed 16-item security check catalog, grouped by severity (4 per
-// grade). Mirrors "보안 정책 16개 카탈로그" / GET /api/security/catalog.
-// Used as the source of truth for the selection UI and as a local FALLBACK
-// when the catalog API is unavailable. `id` is the backend `key`
+// The 14-item security check catalog, grouped by severity. Mirrors
+// "보안 정책 카탈로그" / GET /api/security/catalog. Scoped to vulnerability
+// classes that Semgrep can statically detect via pattern matching — purely
+// logic/authorization-driven flaws (IDOR / CWE-639, weak password policy /
+// CWE-521) are intentionally excluded because they aren't reliably pattern-
+// detectable. Used as the source of truth for the selection UI and as a local
+// FALLBACK when the catalog API is unavailable. `id` is the backend `key`
 // (e.g. "sql-injection") sent in `selected_items`.
 
 export type CheckSeverity = 'critical' | 'high' | 'medium' | 'low'
@@ -67,13 +70,6 @@ export const securityCheckCatalog: SecurityCheckItem[] = [
     description: '신뢰할 수 없는 직렬화 데이터 역직렬화 과정에서 원격 코드 실행 위험을 분석합니다.',
   },
   {
-    id: 'idor',
-    title: 'IDOR',
-    cwe: 'CWE-639',
-    severity: 'high',
-    description: '접근 제어 없이 식별자 조작만으로 타인의 객체·데이터에 접근 가능한지 점검합니다.',
-  },
-  {
     id: 'improper-jwt',
     title: 'Improper JWT Verification',
     cwe: 'CWE-347',
@@ -137,13 +133,6 @@ export const securityCheckCatalog: SecurityCheckItem[] = [
     cwe: 'CWE-614',
     severity: 'low',
     description: '쿠키에 Secure 플래그가 없어 평문 채널로 전송되는지 확인합니다.',
-  },
-  {
-    id: 'weak-password-policy',
-    title: 'Weak Password Requirements',
-    cwe: 'CWE-521',
-    severity: 'low',
-    description: '비밀번호 정책이 약해 무차별 대입 공격에 취약한지 검사합니다.',
   },
 ]
 
