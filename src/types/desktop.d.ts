@@ -39,6 +39,9 @@ declare global {
       }
       auth?: {
         startGithubLogin?: (url?: string) => Promise<{ opened: boolean; url: string; token?: string | null }>
+        getSavedToken?: () => Promise<string | null>
+        setSavedToken?: (token: string) => Promise<boolean>
+        clearSavedToken?: () => Promise<boolean>
         onAuthToken?: (callback: (token: string) => void) => () => void
       }
       report?: {

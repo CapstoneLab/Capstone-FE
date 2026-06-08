@@ -2,7 +2,7 @@
   "name": "secupipeline",
   "productName": "Secupipeline",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "main": "electron/main.cjs",
   "releaseRepository": "CapstoneLab/Capstone-FE",
@@ -68,7 +68,7 @@
   },
   "build": {
     "appId": "com.secupipeline.desktop",
-    "icon": "public/logo.png",
+    "icon": "public/icon.ico",
     "directories": {
       "output": "release"
     },
@@ -78,7 +78,7 @@
       "package.json"
     ],
     "win": {
-      "icon": "public/logo.png",
+      "icon": "public/icon.ico",
       "target": "nsis"
     }
   }

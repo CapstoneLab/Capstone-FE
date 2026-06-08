@@ -1360,6 +1360,16 @@ export function removeTrackedJobId(key: string, jobId: string): string[] {
   return next
 }
 
+export function mergeTrackedJobIds(targetKey: string, sourceKey: string): string[] {
+  if (!targetKey || !sourceKey || targetKey === sourceKey) {
+    return getTrackedJobIds(targetKey)
+  }
+
+  const merged = Array.from(new Set([...getTrackedJobIds(targetKey), ...getTrackedJobIds(sourceKey)]))
+  writeTrackedJobIds(targetKey, merged)
+  return merged
+}
+
 const LAUNCHED_REPOS_PREFIX = 'secupipeline:launched-repos:'
 
 function normalizeRepoKey(raw: string): string {

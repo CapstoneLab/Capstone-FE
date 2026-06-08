@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useAuth } from '@/contexts/AuthContext'
+import { getAuthCacheKey } from '@/contexts/AuthContext'
 import {
   addLaunchedRepo,
   addTrackedJobId,
@@ -49,8 +50,8 @@ import {
 
 export function NewPipelinePage() {
   const navigate = useNavigate()
-  const { token, logout } = useAuth()
-  const cacheKey = token ? token.slice(0, 16) : 'anonymous'
+  const { token, user, logout } = useAuth()
+  const cacheKey = getAuthCacheKey(token, user)
   const [search, setSearch] = useState('')
   const [repos, setRepos] = useState<RepositoryItem[]>(
     () => (token ? (getCachedRepos(cacheKey) ?? []) : []),

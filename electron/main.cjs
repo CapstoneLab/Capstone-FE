@@ -81,7 +81,9 @@ app.setName('Secupipeline')
 
 function getAppIconPath() {
   const candidates = [
+    path.join(appRootDir, 'renderer-dist', 'icon.ico'),
     path.join(appRootDir, 'renderer-dist', 'logo.png'),
+    path.join(appRootDir, 'public', 'icon.ico'),
     path.join(appRootDir, 'public', 'logo.png'),
   ]
 
@@ -517,6 +519,50 @@ ipcMain.handle('window:is-maximized', (event) => {
 
 const apiBaseUrl = process.env.VITE_API_BASE_URL || 'https://api.pwd.kr/capstonelab/capstone-back'
 const DEFAULT_AUTH_LOGIN_URL = `${apiBaseUrl}/auth/github/login`
+const AUTH_STORE_FILE = 'auth-session.json'
+
+function authStorePath() {
+  return path.join(app.getPath('userData'), AUTH_STORE_FILE)
+}
+
+function readSavedAuthToken() {
+  try {
+    const raw = fs.readFileSync(authStorePath(), 'utf-8')
+    const parsed = JSON.parse(raw)
+    return typeof parsed?.token === 'string' ? parsed.token : null
+  } catch {
+    return null
+  }
+}
+
+function writeSavedAuthToken(token) {
+  if (typeof token !== 'string' || !token.trim()) {
+    return false
+  }
+
+  try {
+    fs.mkdirSync(app.getPath('userData'), { recursive: true })
+    fs.writeFileSync(
+      authStorePath(),
+      JSON.stringify({ token, savedAt: new Date().toISOString() }),
+      'utf-8',
+    )
+    return true
+  } catch (error) {
+    console.error('[auth] failed to persist token:', error)
+    return false
+  }
+}
+
+function clearSavedAuthToken() {
+  try {
+    fs.rmSync(authStorePath(), { force: true })
+    return true
+  } catch (error) {
+    console.error('[auth] failed to clear token:', error)
+    return false
+  }
+}
 
 const ALLOWED_AUTH_HOSTS = new Set([
   '127.0.0.1',
@@ -595,6 +641,10 @@ ipcMain.handle('auth:open-github-login', async (event, payload) => {
     authWindow.loadURL(target)
   })
 })
+
+ipcMain.handle('auth:get-token', () => readSavedAuthToken())
+ipcMain.handle('auth:set-token', (_event, token) => writeSavedAuthToken(token))
+ipcMain.handle('auth:clear-token', () => clearSavedAuthToken())
 
 ipcMain.handle('app:get-info', () => {
   return {

@@ -6,7 +6,7 @@ const API_BASE =
     ? import.meta.env.VITE_API_BASE_URL
     : '/api-proxy'
 
-type User = {
+export type User = {
   login: string
   name: string | null
   avatarUrl: string | null
@@ -24,6 +24,12 @@ type AuthState = {
 const AuthContext = createContext<AuthState | null>(null)
 
 const TOKEN_KEY = 'secupipeline:token'
+
+export function getAuthCacheKey(token: string | null, user: User | null): string {
+  const login = user?.login?.trim().toLowerCase()
+  if (login) return `user:${login}`
+  return token ? token.slice(0, 16) : 'anonymous'
+}
 
 async function fetchMe(token: string): Promise<User> {
   const res = await fetch(`${API_BASE}/auth/me`, {
@@ -62,9 +68,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   })
   const [isLoading, setIsLoading] = useState(() => {
     try {
-      return !!localStorage.getItem(TOKEN_KEY)
+      return !!localStorage.getItem(TOKEN_KEY) || !!window.desktop?.auth?.getSavedToken
     } catch {
-      return false
+      return !!window.desktop?.auth?.getSavedToken
     }
   })
 
@@ -73,6 +79,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const userInfo = await fetchMe(newToken)
       localStorage.setItem(TOKEN_KEY, newToken)
+      await window.desktop?.auth?.setSavedToken?.(newToken)
       setToken(newToken)
       setUser(userInfo)
     } finally {
@@ -82,9 +89,38 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback(() => {
     localStorage.removeItem(TOKEN_KEY)
+    void window.desktop?.auth?.clearSavedToken?.()
     setToken(null)
     setUser(null)
   }, [])
+
+  useEffect(() => {
+    if (token || !window.desktop?.auth?.getSavedToken) {
+      if (!token) setIsLoading(false)
+      return
+    }
+
+    let mounted = true
+
+    window.desktop.auth
+      .getSavedToken()
+      .then((savedToken) => {
+        if (!mounted) return
+        if (savedToken) {
+          localStorage.setItem(TOKEN_KEY, savedToken)
+          setToken(savedToken)
+        } else {
+          setIsLoading(false)
+        }
+      })
+      .catch(() => {
+        if (mounted) setIsLoading(false)
+      })
+
+    return () => {
+      mounted = false
+    }
+  }, [token])
 
   useEffect(() => {
     if (!token || user) {
@@ -102,6 +138,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .catch(() => {
         if (mounted) {
           localStorage.removeItem(TOKEN_KEY)
+          void window.desktop?.auth?.clearSavedToken?.()
           setToken(null)
         }
       })

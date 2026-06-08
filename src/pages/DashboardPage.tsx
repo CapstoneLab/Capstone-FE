@@ -42,6 +42,7 @@ import {
   getCachedRepos,
   getRepoDetectEnabled,
   getTrackedJobIds,
+  mergeTrackedJobIds,
   removeTrackedJobId,
   setCachedRepos,
   setRepoDetectEnabled,
@@ -50,6 +51,7 @@ import {
 } from '@/lib/api'
 import { getLanguageColor } from '@/lib/languageColors'
 import { useAuth } from '@/contexts/AuthContext'
+import { getAuthCacheKey } from '@/contexts/AuthContext'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -163,13 +165,13 @@ const TERMINAL_PIPELINE_STATUS = new Set(['success', 'failed', 'cancelled'])
 function getCachedPipelines(key: string): PipelineItem[] {
   try {
     const raw = localStorage.getItem(PIPELINE_CACHE_PREFIX + key)
-    if (!raw) return getLatestPipelineCache()
+    if (!raw) return []
     const parsed = JSON.parse(raw) as { pipelines?: PipelineItem[] }
     return Array.isArray(parsed.pipelines) && parsed.pipelines.length > 0
       ? parsed.pipelines
-      : getLatestPipelineCache()
+      : []
   } catch {
-    return getLatestPipelineCache()
+    return []
   }
 }
 
@@ -184,45 +186,26 @@ function setCachedPipelines(key: string, pipelines: PipelineItem[]): void {
   }
 }
 
-function getLatestPipelineCache(): PipelineItem[] {
-  try {
-    let latest: { timestamp: number; pipelines: PipelineItem[] } | null = null
-    for (let i = 0; i < localStorage.length; i += 1) {
-      const key = localStorage.key(i)
-      if (!key?.startsWith(PIPELINE_CACHE_PREFIX)) continue
-      const raw = localStorage.getItem(key)
-      if (!raw) continue
-      const parsed = JSON.parse(raw) as { timestamp?: number; pipelines?: PipelineItem[] }
-      if (!Array.isArray(parsed.pipelines) || parsed.pipelines.length === 0) continue
-      const timestamp = typeof parsed.timestamp === 'number' ? parsed.timestamp : 0
-      if (!latest || timestamp >= latest.timestamp) {
-        latest = { timestamp, pipelines: parsed.pipelines }
-      }
-    }
-    return latest?.pipelines ?? []
-  } catch {
-    return []
-  }
+function mergeCachedPipelines(targetKey: string, sourceKey: string | null): PipelineItem[] {
+  const target = getCachedPipelines(targetKey)
+  if (!sourceKey || sourceKey === targetKey) return target
+
+  const source = getCachedPipelines(sourceKey)
+  if (source.length === 0) return target
+
+  const mergedById = new Map<string, PipelineItem>()
+  ;[...source, ...target].forEach((item) => {
+    if (item.jobId) mergedById.set(item.jobId, item)
+  })
+
+  const merged = Array.from(mergedById.values())
+  setCachedPipelines(targetKey, merged)
+  return merged
 }
 
 function getAllKnownTrackedJobIds(key: string, cached: PipelineItem[]): string[] {
   const ids = new Set<string>(getTrackedJobIds(key))
   cached.forEach((item) => ids.add(item.jobId))
-
-  try {
-    for (let i = 0; i < localStorage.length; i += 1) {
-      const storageKey = localStorage.key(i)
-      if (!storageKey?.startsWith('secupipeline:jobs:')) continue
-      const raw = localStorage.getItem(storageKey)
-      if (!raw) continue
-      const parsed = JSON.parse(raw) as { ids?: string[] }
-      if (Array.isArray(parsed.ids)) {
-        parsed.ids.forEach((id) => ids.add(id))
-      }
-    }
-  } catch {
-    // Keep the current-key/cache ids if storage scanning fails.
-  }
 
   return Array.from(ids).filter(Boolean)
 }
@@ -235,8 +218,9 @@ function scoreTone(score: number): { color: string } {
 
 export function DashboardPage() {
   const navigate = useNavigate()
-  const { token, logout } = useAuth()
-  const cacheKey = token ? token.slice(0, 16) : 'anonymous'
+  const { token, user, logout } = useAuth()
+  const cacheKey = getAuthCacheKey(token, user)
+  const legacyTokenCacheKey = token && user ? token.slice(0, 16) : null
   const [activeTab, setActiveTab] = useState<DashboardTab>('repo')
   const [tabDirection, setTabDirection] = useState(1)
   const [searchInput, setSearchInput] = useState('')
@@ -315,7 +299,10 @@ export function DashboardPage() {
       return
     }
 
-    const cached = getCachedPipelines(cacheKey)
+    const cached = mergeCachedPipelines(cacheKey, legacyTokenCacheKey)
+    if (legacyTokenCacheKey) {
+      mergeTrackedJobIds(cacheKey, legacyTokenCacheKey)
+    }
     const ids = getAllKnownTrackedJobIds(cacheKey, cached)
 
     if (ids.length === 0) {
@@ -394,7 +381,7 @@ export function DashboardPage() {
       cancelled = true
       if (timer !== null) window.clearTimeout(timer)
     }
-  }, [token, cacheKey])
+  }, [token, cacheKey, legacyTokenCacheKey])
 
   const triggerLoading = () => {
     if (loadingTimerRef.current) {

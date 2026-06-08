@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { GitHubIcon } from '@/components/ui/github-icon'
 import { useAuth } from '@/contexts/AuthContext'
+import { getAuthCacheKey } from '@/contexts/AuthContext'
 import {
   AuthExpiredError,
   deriveJobStatus,
@@ -76,9 +77,9 @@ function parseOwnerRepo(fullName: string): { owner: string; repo: string } | nul
 export function RepositoryDetailPage() {
   const { state } = useLocation()
   const { repoId: paramRepoId = '' } = useParams()
-  const { token, logout } = useAuth()
+  const { token, user, logout } = useAuth()
   const navigate = useNavigate()
-  const cacheKey = token ? token.slice(0, 16) : 'anonymous'
+  const cacheKey = getAuthCacheKey(token, user)
 
   const locationState = (state ?? {}) as { repoId?: string }
   const resolvedRepoId = locationState.repoId ?? paramRepoId ?? ''

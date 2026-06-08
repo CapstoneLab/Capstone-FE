@@ -30,6 +30,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { useAuth } from '@/contexts/AuthContext'
+import { getAuthCacheKey } from '@/contexts/AuthContext'
 import {
   cancelPipeline,
   fetchJobDetail,
@@ -220,10 +221,7 @@ export function PipelineProcessPage() {
   const { state } = useLocation()
   const locationState = (state ?? {}) as LocationState
   const jobId = locationState.jobId ?? ''
-  // Same scheme as DashboardPage/RepositoryDetailPage: 16-char prefix
-  // of the auth token. Used to scope per-user localStorage entries (e.g.
-  // the auto-extracted deploy domain).
-  const cacheKey = token ? token.slice(0, 16) : 'anonymous'
+  const cacheKey = getAuthCacheKey(token, user)
 
   const [job, setJob] = useState<JobDetail | null>(null)
   const [logs, setLogs] = useState<string[]>([])
