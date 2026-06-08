@@ -85,6 +85,200 @@ body {
   overflow: hidden;
 }
 
+.dialog-overlay[data-state='open'] {
+  animation: dialog-overlay-in 160ms ease-out both;
+}
+
+.dialog-overlay[data-state='closed'] {
+  animation: dialog-overlay-out 130ms ease-in both;
+}
+
+.dialog-content[data-state='open'] {
+  animation: dialog-content-in 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.dialog-content[data-state='closed'] {
+  animation: dialog-content-out 130ms ease-in both;
+}
+
+.titlebar-popover {
+  position: fixed !important;
+  transform-origin: top right;
+  background-color: var(--app-bg-elevated) !important;
+  border-color: var(--app-border) !important;
+  color: var(--app-text-primary);
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.24);
+}
+
+.titlebar-popover[data-state='open'] {
+  animation: titlebar-popover-in 170ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.titlebar-popover[data-state='closed'] {
+  animation: titlebar-popover-out 120ms ease-in both;
+}
+
+.titlebar-popover__header {
+  border-color: var(--app-border) !important;
+}
+
+.profile-card {
+  background-color: var(--app-bg-sunken) !important;
+  border-color: var(--app-border) !important;
+  color: var(--app-text-primary);
+}
+
+.profile-muted {
+  color: var(--app-text-secondary) !important;
+}
+
+.profile-primary-button {
+  background-color: #10b981 !important;
+  color: #061b13 !important;
+}
+
+.profile-primary-button:hover {
+  background-color: #34d399 !important;
+}
+
+.profile-danger-button {
+  background-color: #ef4444 !important;
+  color: #ffffff !important;
+}
+
+.profile-danger-button:hover {
+  background-color: #dc2626 !important;
+}
+
+.profile-secondary-button {
+  background-color: var(--app-surface-strong) !important;
+  border-color: var(--app-border) !important;
+  color: var(--app-text-primary) !important;
+}
+
+.profile-secondary-button:hover {
+  background-color: var(--app-hover-strong, #333333) !important;
+}
+
+.theme-option {
+  color: var(--app-text-primary);
+}
+
+.theme-option:hover {
+  background-color: var(--app-hover, rgba(255, 255, 255, 0.05)) !important;
+}
+
+.theme-option--active {
+  background-color: rgba(16, 185, 129, 0.14) !important;
+  color: #34d399 !important;
+}
+
+:root[data-theme='light'] .theme-option--active {
+  color: #047857 !important;
+}
+
+.update-dialog-panel {
+  background-color: var(--app-bg-elevated) !important;
+  border-color: var(--app-border) !important;
+  color: var(--app-text-primary);
+}
+
+.update-dialog-box {
+  background-color: var(--app-bg-sunken) !important;
+  border-color: var(--app-border) !important;
+}
+
+.update-dialog-label,
+.update-dialog-version {
+  color: var(--app-text-secondary) !important;
+}
+
+.update-dialog-success {
+  color: #34d399 !important;
+}
+
+:root[data-theme='light'] .update-dialog-success {
+  color: #059669 !important;
+}
+
+.update-dialog-error {
+  color: #f87171 !important;
+}
+
+:root[data-theme='light'] .update-dialog-error {
+  color: #b91c1c !important;
+}
+
+.update-dialog-warning {
+  color: #fbbf24 !important;
+}
+
+:root[data-theme='light'] .update-dialog-warning {
+  color: #92400e !important;
+}
+
+@keyframes dialog-overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes dialog-overlay-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes dialog-content-in {
+  from {
+    opacity: 0;
+    transform: translateY(-10px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes dialog-content-out {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+}
+
+@keyframes titlebar-popover-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes titlebar-popover-out {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+}
+
 /* Light-mode overrides for hardcoded Tailwind arbitrary-value classes.
    The codebase has many `bg-[#1E1E1E]`, `bg-[#262626]`, etc. baked into
    components. Rather than refactor every file to use tokens, we override
@@ -119,6 +313,21 @@ body {
 :root[data-theme='light'] .bg-\[\#404040\],
 :root[data-theme='light'] .bg-\[\#6B7280\] {
   background-color: var(--app-surface-strong) !important;
+}
+
+/* Segmented tab toggle (대시보드 탭). The sliding pill is #3A3A3A on a #2A2A2A
+   track — a subtle lift in dark mode. Both hexes collapse to the same
+   --app-surface-strong in light mode, so the pill would vanish. Lift it to the
+   white elevated surface with a soft shadow so the active tab reads clearly. */
+:root[data-theme='light'] .tab-toggle__pill {
+  background-color: var(--app-bg-elevated) !important;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.14) !important;
+}
+
+:root[data-theme='light'] .result-code-block,
+:root[data-theme='light'] .result-code-block code {
+  background-color: #0d1117 !important;
+  color: #d1d5db !important;
 }
 
 /* Named gray-scale surfaces. The @theme gray scale is DARK (gray-700 =

@@ -1,4 +1,4 @@
-# SecuPipeline Desktop
+# Secupipeline Desktop
 
 Electron 기반 자체 보안 CI/CD 데스크탑 앱입니다.
 

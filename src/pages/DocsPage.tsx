@@ -196,7 +196,7 @@ const pipelineSteps = [
 const faqs = [
   {
     q: 'GitHub 토큰이 만료됐다는 메시지가 떠요',
-    a: '백엔드 캐시에서 GitHub 액세스 토큰을 찾지 못한 경우입니다. SecuPipeline은 자동으로 로그인 페이지로 이동시키며, "GitHub로 계속하기" 버튼을 다시 누르면 즉시 복구됩니다.',
+    a: '백엔드 캐시에서 GitHub 액세스 토큰을 찾지 못한 경우입니다. Secupipeline은 자동으로 로그인 페이지로 이동시키며, "GitHub로 계속하기" 버튼을 다시 누르면 즉시 복구됩니다.',
   },
   {
     q: '"이미 실행 중인 파이프라인이 있어요" 다이얼로그가 떴어요',
@@ -307,7 +307,7 @@ export function DocsPage() {
         <div>
           <h1 className="text-4xl font-bold text-white">문서</h1>
           <p className="mt-2 text-sm text-[#9CA3AF]">
-            SecuPipeline 사용 방법, 보안 검사 항목, 파이프라인 구조까지 한 페이지에서 확인하세요.
+            Secupipeline 사용 방법, 보안 검사 항목, 파이프라인 구조까지 한 페이지에서 확인하세요.
           </p>
         </div>
 
@@ -338,7 +338,7 @@ export function DocsPage() {
           <div className="space-y-12">
             <DocSection id="intro" title="소개" icon={FileText}>
               <p>
-                <strong className="text-white">SecuPipeline</strong> 은 GitHub 레포지토리를 대상으로
+                <strong className="text-white">Secupipeline</strong> 은 GitHub 레포지토리를 대상으로
                 <span className="text-[#34D399]"> 보안 중심 CI/CD 파이프라인</span>을 실행하고 결과를
                 한눈에 시각화하는 데스크톱 도구입니다. 한 번의 클릭으로 의존성 검사부터 SAST, 빌드,
                 배포까지 7단계를 자동 수행하며, 발견된 취약점은 위험도별로 점수화되어 보고됩니다.
@@ -579,7 +579,7 @@ export function DocsPage() {
 
             <DocSection id="architecture" title="아키텍처" icon={Network}>
               <p>
-                SecuPipeline은 <strong>3티어 구조</strong>로 동작합니다. 프론트엔드는 백엔드 API만
+                Secupipeline은 <strong>3티어 구조</strong>로 동작합니다. 프론트엔드는 백엔드 API만
                 호출하며, 실제 검사 실행은 우분투 러너가 담당합니다.
               </p>
               <pre className="mt-3 overflow-x-auto rounded-lg border border-[#2F2F2F] bg-[#0F0F0F] p-4 text-xs leading-6 text-[#D1D5DB]">

@@ -12,6 +12,7 @@ import {
   Eye,
   Globe,
   GitBranch,
+  Loader2,
   Play,
   Search,
   Shield,
@@ -22,7 +23,6 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   CategoryScale,
   Chart as ChartJS,
-  Filler,
   Legend,
   LineElement,
   LinearScale,
@@ -30,6 +30,7 @@ import {
   Tooltip,
 } from 'chart.js'
 import { Line } from 'react-chartjs-2'
+import { AnimatePresence, motion } from 'framer-motion'
 import { Link, useNavigate } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
 import { type RepositoryItem } from '@/data/repositories'
@@ -64,7 +65,7 @@ import {
 dayjs.extend(relativeTime)
 dayjs.locale('ko')
 
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend, Filler)
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend)
 
 type PipelineItem = {
   id: string
@@ -83,6 +84,25 @@ type PipelineItem = {
   totalSteps: number
   completedSteps: number
   currentStepName: string | null
+}
+
+type DashboardTab = 'repo' | 'pipeline'
+
+const dashboardTabOrder: DashboardTab[] = ['repo', 'pipeline']
+
+const dashboardTabPanelVariants = {
+  initial: (direction: number) => ({
+    opacity: 0,
+    x: direction > 0 ? -28 : 28,
+  }),
+  animate: {
+    opacity: 1,
+    x: 0,
+  },
+  exit: (direction: number) => ({
+    opacity: 0,
+    x: direction > 0 ? 28 : -28,
+  }),
 }
 
 function formatDuration(durationSec: number) {
@@ -137,11 +157,88 @@ const verdictMeta: Record<JobVerdict, { label: string; className: string }> = {
   },
 }
 
+const PIPELINE_CACHE_PREFIX = 'secupipeline:pipeline-items:'
+const TERMINAL_PIPELINE_STATUS = new Set(['success', 'failed', 'cancelled'])
+
+function getCachedPipelines(key: string): PipelineItem[] {
+  try {
+    const raw = localStorage.getItem(PIPELINE_CACHE_PREFIX + key)
+    if (!raw) return getLatestPipelineCache()
+    const parsed = JSON.parse(raw) as { pipelines?: PipelineItem[] }
+    return Array.isArray(parsed.pipelines) && parsed.pipelines.length > 0
+      ? parsed.pipelines
+      : getLatestPipelineCache()
+  } catch {
+    return getLatestPipelineCache()
+  }
+}
+
+function setCachedPipelines(key: string, pipelines: PipelineItem[]): void {
+  try {
+    localStorage.setItem(
+      PIPELINE_CACHE_PREFIX + key,
+      JSON.stringify({ timestamp: Date.now(), pipelines }),
+    )
+  } catch {
+    // Ignore storage quota/unavailable errors.
+  }
+}
+
+function getLatestPipelineCache(): PipelineItem[] {
+  try {
+    let latest: { timestamp: number; pipelines: PipelineItem[] } | null = null
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i)
+      if (!key?.startsWith(PIPELINE_CACHE_PREFIX)) continue
+      const raw = localStorage.getItem(key)
+      if (!raw) continue
+      const parsed = JSON.parse(raw) as { timestamp?: number; pipelines?: PipelineItem[] }
+      if (!Array.isArray(parsed.pipelines) || parsed.pipelines.length === 0) continue
+      const timestamp = typeof parsed.timestamp === 'number' ? parsed.timestamp : 0
+      if (!latest || timestamp >= latest.timestamp) {
+        latest = { timestamp, pipelines: parsed.pipelines }
+      }
+    }
+    return latest?.pipelines ?? []
+  } catch {
+    return []
+  }
+}
+
+function getAllKnownTrackedJobIds(key: string, cached: PipelineItem[]): string[] {
+  const ids = new Set<string>(getTrackedJobIds(key))
+  cached.forEach((item) => ids.add(item.jobId))
+
+  try {
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const storageKey = localStorage.key(i)
+      if (!storageKey?.startsWith('secupipeline:jobs:')) continue
+      const raw = localStorage.getItem(storageKey)
+      if (!raw) continue
+      const parsed = JSON.parse(raw) as { ids?: string[] }
+      if (Array.isArray(parsed.ids)) {
+        parsed.ids.forEach((id) => ids.add(id))
+      }
+    }
+  } catch {
+    // Keep the current-key/cache ids if storage scanning fails.
+  }
+
+  return Array.from(ids).filter(Boolean)
+}
+
+function scoreTone(score: number): { color: string } {
+  if (score >= 80) return { color: '#22C55E' }
+  if (score >= 50) return { color: '#F97316' }
+  return { color: '#EF4444' }
+}
+
 export function DashboardPage() {
   const navigate = useNavigate()
   const { token, logout } = useAuth()
   const cacheKey = token ? token.slice(0, 16) : 'anonymous'
-  const [activeTab, setActiveTab] = useState<'repo' | 'pipeline'>('repo')
+  const [activeTab, setActiveTab] = useState<DashboardTab>('repo')
+  const [tabDirection, setTabDirection] = useState(1)
   const [searchInput, setSearchInput] = useState('')
   const [searchKeyword, setSearchKeyword] = useState('')
   const [repos, setRepos] = useState<RepositoryItem[]>(() => {
@@ -156,13 +253,13 @@ export function DashboardPage() {
       detectEnabled: getRepoDetectEnabled(cacheKey, repo.id),
     }))
   })
-  const [pipelines, setPipelines] = useState<PipelineItem[]>([])
+  const [pipelines, setPipelines] = useState<PipelineItem[]>(() => getCachedPipelines(cacheKey))
   const [isLoading, setIsLoading] = useState(false)
   const [isReposLoading, setIsReposLoading] = useState(
     () => !!token && !getCachedRepos(cacheKey),
   )
   const [isJobsLoading, setIsJobsLoading] = useState(
-    () => !!token && getTrackedJobIds(cacheKey).length > 0,
+    () => !!token && getTrackedJobIds(cacheKey).length > 0 && getCachedPipelines(cacheKey).length === 0,
   )
   const [reposError, setReposError] = useState<string | null>(null)
   const [jobsError, setJobsError] = useState<string | null>(null)
@@ -218,30 +315,66 @@ export function DashboardPage() {
       return
     }
 
-    const ids = getTrackedJobIds(cacheKey)
+    const cached = getCachedPipelines(cacheKey)
+    const ids = getAllKnownTrackedJobIds(cacheKey, cached)
 
     if (ids.length === 0) {
-      setPipelines([])
+      if (cached.length > 0) {
+        setPipelines(cached)
+      } else {
+        setPipelines([])
+      }
       setIsJobsLoading(false)
+      return
+    }
+
+    const visibleCached = cached.filter((item) => ids.includes(item.jobId))
+    if (visibleCached.length > 0) {
+      setPipelines(visibleCached)
+    }
+
+    const cachedById = new Map(visibleCached.map((item) => [item.jobId, item]))
+    const idsToFetch =
+      visibleCached.length > 0
+        ? ids.filter((id) => {
+            const cachedItem = cachedById.get(id)
+            return !cachedItem || !TERMINAL_PIPELINE_STATUS.has(cachedItem.status)
+          })
+        : ids
+
+    if (idsToFetch.length === 0) {
+      setIsJobsLoading(false)
+      setJobsError(null)
       return
     }
 
     let cancelled = false
     let timer: number | null = null
-    setIsJobsLoading(true)
+    setIsJobsLoading(visibleCached.length === 0)
     setJobsError(null)
-
-    const TERMINAL = new Set(['success', 'failed', 'cancelled'])
 
     async function tick(initial: boolean) {
       try {
-        const jobs = await fetchJobsByIds(token!, ids)
+        const jobs = await fetchJobsByIds(token!, idsToFetch)
         if (cancelled) return
-        const mapped = jobs.map(mapJobToPipelineItem)
-        setPipelines(mapped)
+        const fetchedItems = jobs.map(mapJobToPipelineItem)
+        const fetchedById = new Map(fetchedItems.map((item) => [item.jobId, item]))
+        const merged =
+          visibleCached.length > 0
+            ? ids
+                .map((id) => fetchedById.get(id) ?? cachedById.get(id))
+                .filter((item): item is PipelineItem => !!item)
+            : fetchedItems
+
+        if (merged.length > 0 || visibleCached.length === 0) {
+          setPipelines(merged)
+        }
+        if (merged.length > 0) {
+          setCachedPipelines(cacheKey, merged)
+        }
         setJobsError(null)
 
-        const hasActive = mapped.some((p) => !TERMINAL.has(p.status))
+        const hasActive = fetchedItems.some((p) => !TERMINAL_PIPELINE_STATUS.has(p.status))
         if (!cancelled && hasActive) {
           timer = window.setTimeout(() => tick(false), 3000)
         }
@@ -270,6 +403,17 @@ export function DashboardPage() {
 
     setIsLoading(true)
     loadingTimerRef.current = window.setTimeout(() => setIsLoading(false), 280)
+  }
+
+  const switchTab = (nextTab: DashboardTab) => {
+    if (nextTab === activeTab) {
+      return
+    }
+
+    const currentIndex = dashboardTabOrder.indexOf(activeTab)
+    const nextIndex = dashboardTabOrder.indexOf(nextTab)
+    setTabDirection(nextIndex > currentIndex ? 1 : -1)
+    setActiveTab(nextTab)
   }
 
   useEffect(() => {
@@ -334,9 +478,15 @@ export function DashboardPage() {
           label: '보안 점수 추이',
           data: chartPipelines.map((item) => item.score),
           borderColor: '#45bd87',
-          backgroundColor: 'rgba(69, 189, 135, 0.2)',
-          fill: true,
-          tension: 0.35,
+          backgroundColor: '#45bd87',
+          pointBackgroundColor: '#ffffff',
+          pointBorderColor: '#45bd87',
+          pointBorderWidth: 2,
+          pointRadius: 3,
+          pointHoverRadius: 5,
+          fill: false,
+          tension: 0.18,
+          borderWidth: 2,
         },
       ],
     }),
@@ -361,40 +511,50 @@ export function DashboardPage() {
         </div>
 
         <div className="inline-flex w-fit items-center rounded-xl border border-white/10 bg-[#2A2A2A] p-1">
-          <button
-            type="button"
-            onClick={() => {
-              triggerLoading()
-              setActiveTab('repo')
-            }}
-            className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-[14px] font-semibold transition ${
-              activeTab === 'repo'
-                ? 'bg-[#3A3A3A] text-[#34D399]'
-                : 'bg-transparent text-[#9CA3AF] hover:text-gray-100'
-            }`}
-          >
-            <BookOpen className="h-5 w-5" /> 내 레포지토리
-            <span className="rounded-full bg-[#6B7280] px-2 py-0.5 text-xs text-white">{repos.length}</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              triggerLoading()
-              setActiveTab('pipeline')
-            }}
-            className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-[14px] font-semibold transition ${
-              activeTab === 'pipeline'
-                ? 'bg-[#3A3A3A] text-[#34D399]'
-                : 'bg-transparent text-[#9CA3AF] hover:text-gray-100'
-            }`}
-          >
-            <Activity className="h-5 w-5" /> 파이프라인 결과
-            <span className="rounded-full bg-[#6B7280] px-2 py-0.5 text-xs text-white">{pipelines.length}</span>
-          </button>
+          {([
+            { key: 'repo', label: '내 레포지토리', icon: BookOpen, count: repos.length },
+            { key: 'pipeline', label: '파이프라인 결과', icon: Activity, count: pipelines.length },
+          ] as const).map(({ key, label, icon: Icon, count }) => {
+            const active = activeTab === key
+            return (
+              <button
+                key={key}
+                type="button"
+                onClick={() => switchTab(key)}
+                className={`relative inline-flex items-center gap-2 rounded-xl px-4 py-2 text-[14px] font-semibold transition-colors ${
+                  active ? 'text-[#34D399]' : 'text-[#9CA3AF] hover:text-gray-100'
+                }`}
+              >
+                {/* Single shared pill that slides between tabs (magic-move). */}
+                {active ? (
+                  <motion.span
+                    layoutId="dashboardTabPill"
+                    className="tab-toggle__pill absolute inset-0 rounded-xl bg-[#3A3A3A] shadow-sm"
+                    transition={{ type: 'spring', stiffness: 480, damping: 36 }}
+                  />
+                ) : null}
+                <span className="relative z-10 inline-flex items-center gap-2">
+                  <Icon className="h-5 w-5" /> {label}
+                  <span className="rounded-full bg-[#6B7280] px-2 py-0.5 text-xs text-white">{count}</span>
+                </span>
+              </button>
+            )
+          })}
         </div>
 
-        {activeTab === 'repo' ? (
-          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <AnimatePresence mode="wait" initial={false} custom={tabDirection}>
+          {activeTab === 'repo' ? (
+            <motion.div
+              key="repo"
+              className="space-y-4"
+              custom={tabDirection}
+              variants={dashboardTabPanelVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+              transition={{ duration: 0.22, ease: [0.4, 0, 0.2, 1] }}
+            >
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
             <p className="inline-flex items-center gap-2 text-[14px] text-[#A1A1A1]">
               <Eye className="h-4 w-4 text-[#6EE7B7]" /> 탐지 활성: {detectionOnCount}/{repos.length}
             </p>
@@ -411,11 +571,7 @@ export function DashboardPage() {
                 className="h-11 w-full rounded-xl border border-white/10 bg-[#262626] pl-10 pr-3 text-sm text-gray-50 outline-none ring-green-500/45 placeholder:text-gray-300 focus:ring"
               />
             </label>
-          </div>
-        ) : null}
-
-        {activeTab === 'repo' ? (
-          <div className="space-y-4">
+              </div>
             {isLoading || isReposLoading ? (
               Array.from({ length: 3 }).map((_, idx) => (
                 <Card key={idx} className="h-36 animate-pulse border-gray-500/60 bg-gray-700/30" />
@@ -531,9 +687,18 @@ export function DashboardPage() {
                 </Card>
               ))
             )}
-          </div>
-        ) : (
-          <div className="space-y-4">
+            </motion.div>
+          ) : (
+            <motion.div
+              key="pipeline"
+              className="space-y-4"
+              custom={tabDirection}
+              variants={dashboardTabPanelVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+              transition={{ duration: 0.22, ease: [0.4, 0, 0.2, 1] }}
+            >
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <Card className="p-4">
                 <div className="flex items-start justify-between">
@@ -573,8 +738,8 @@ export function DashboardPage() {
               </Card>
             </div>
 
-            <div className="mt-6 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-              <h2 className="text-4xl font-extrabold text-white">파이프라인 실행 기록</h2>
+            <div className="mt-6 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <h2 className="flex h-11 items-center text-[28px] font-extrabold leading-none text-white">파이프라인 실행 기록</h2>
               <label className="relative block w-full md:max-w-md">
                 <Search className="pointer-events-none absolute left-3 top-3.5 h-4 w-4 text-gray-300" />
                 <input
@@ -591,25 +756,29 @@ export function DashboardPage() {
 
             <Card className="p-4">
               <p className="mb-3 text-sm text-gray-200">실행별 보안 점수 추이</p>
-              <Line
-                data={chartData}
-                options={{
-                  responsive: true,
-                  plugins: { legend: { display: false } },
-                  scales: {
-                    y: {
-                      min: 0,
-                      max: 100,
-                      ticks: { color: '#d1d5db' },
-                      grid: { color: 'rgba(255,255,255,0.08)' },
+              <div className="h-52">
+                <Line
+                  data={chartData}
+                  options={{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: { legend: { display: false } },
+                    scales: {
+                      y: {
+                        min: 0,
+                        max: 100,
+                        ticks: { color: '#d1d5db', stepSize: 25 },
+                        grid: { color: 'rgba(255,255,255,0.08)' },
+                      },
+                      x: {
+                        ticks: { color: '#d1d5db', maxRotation: 0, autoSkip: true, maxTicksLimit: 8 },
+                        grid: { display: false },
+                      },
                     },
-                    x: {
-                      ticks: { color: '#d1d5db' },
-                      grid: { color: 'rgba(255,255,255,0.05)' },
-                    },
-                  },
-                }}
-              />
+                  }}
+                />
+              </div>
             </Card>
 
             {isLoading || isJobsLoading ? (
@@ -635,6 +804,8 @@ export function DashboardPage() {
                           <CircleCheckBig className="h-6 w-6 text-[#34D399]" />
                         ) : run.status === 'failed' ? (
                           <CircleX className="h-6 w-6 text-[#FF3B30]" />
+                        ) : run.status === 'running' || run.status === 'queued' ? (
+                          <Loader2 className="h-6 w-6 animate-spin text-[#FCD34D]" />
                         ) : (
                           <Activity className="h-6 w-6 text-[#FCD34D]" />
                         )}
@@ -721,7 +892,7 @@ export function DashboardPage() {
                                 : '결과 대기'}
                             </span>
                           </div>
-                          <div className="h-2.5 w-full max-w-203.75 overflow-hidden rounded-full bg-[#404040]">
+                          <div className="h-2.5 w-full overflow-hidden rounded-full bg-[#404040]">
                             {run.totalSteps > 0 ? (
                               <div
                                 className="h-full rounded-full bg-[#F59E0B] transition-all duration-500"
@@ -738,12 +909,21 @@ export function DashboardPage() {
                         <div>
                           <div className="mb-2 flex items-center justify-between text-sm">
                             <span className="text-[10px] text-[#E5E7EB]">보안 점수</span>
-                            <span className="text-[14px] font-semibold text-[#FF7206]">
+                            <span
+                              className="text-[14px] font-semibold"
+                              style={{ color: scoreTone(run.score).color }}
+                            >
                               {run.score}/100
                             </span>
                           </div>
-                          <div className="h-2.5 w-full max-w-203.75 overflow-hidden rounded-full bg-[#404040]">
-                            <div className="h-full bg-[#FF7206]" style={{ width: `${run.score}%` }} />
+                          <div className="h-2.5 w-full overflow-hidden rounded-full bg-[#404040]">
+                            <div
+                              className="h-full rounded-full transition-all duration-500"
+                              style={{
+                                width: `${Math.max(0, Math.min(100, run.score))}%`,
+                                backgroundColor: scoreTone(run.score).color,
+                              }}
+                            />
                           </div>
                         </div>
                       )}
@@ -809,8 +989,9 @@ export function DashboardPage() {
                 </Card>
               ))
             )}
-          </div>
-        )}
+            </motion.div>
+          )}
+        </AnimatePresence>
       </section>
 
       <Dialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTargetId(null)}>
@@ -834,7 +1015,11 @@ export function DashboardPage() {
                   return
                 }
                 removeTrackedJobId(cacheKey, deleteTarget.jobId)
-                setPipelines((prev) => prev.filter((item) => item.jobId !== deleteTarget.jobId))
+                setPipelines((prev) => {
+                  const next = prev.filter((item) => item.jobId !== deleteTarget.jobId)
+                  setCachedPipelines(cacheKey, next)
+                  return next
+                })
                 setDeleteTargetId(null)
               }}
               className="bg-[#EF4444] text-white shadow-none hover:bg-[#DC2626]"

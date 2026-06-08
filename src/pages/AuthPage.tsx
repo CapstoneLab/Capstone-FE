@@ -1,7 +1,6 @@
 import { CheckCircle2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { NativeFrameBar } from '@/components/layout/NativeFrameBar'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { GitHubIcon } from '@/components/ui/github-icon'
@@ -85,13 +84,12 @@ export function AuthPage() {
 
   return (
     <section className="min-h-full bg-[#1E1E1E] text-white">
-      <NativeFrameBar />
       <main className="mx-auto flex min-h-full w-full max-w-6xl items-center justify-center px-6 pb-10 pt-14">
         <div className="w-full max-w-md">
           <Card className="border-gray-500/80 bg-[#242424] p-4 text-center">
             <img
               src={appLogo}
-              alt="SecuPipeline"
+              alt="Secupipeline"
               className="mx-auto aspect-square h-28 w-28 rounded-2xl object-cover"
             />
             <h1 className="mt-4 text-4xl font-extrabold text-white">로그인</h1>

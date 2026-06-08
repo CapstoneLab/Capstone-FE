@@ -132,7 +132,7 @@ export function downloadJSON(data: ReportData): void {
       repoUrl: data.repoUrl,
       branch: data.branch,
       completedAt: data.completedAt,
-      generatedBy: 'SecuPipeline',
+      generatedBy: 'Secupipeline',
     },
     verdict: { kind: data.verdict, label: data.verdictLabel },
     score: { value: data.score, label: data.scoreLabel },
@@ -229,6 +229,32 @@ function findingRowsHtml(findings: SecurityFinding[], inScope: boolean): string 
     .join('')
 }
 
+function findingRowsHtmlCompact(findings: SecurityFinding[], inScope: boolean): string {
+  if (findings.length === 0) {
+    return `<tr><td colspan="6" class="empty">${inScope ? '범위 내' : '범위 밖'} 탐지 항목이 없습니다.</td></tr>`
+  }
+  return findings
+    .map((f) => {
+      const color = SEVERITY_COLOR[f.severity] ?? '#6B7280'
+      const loc = [escapeHtml(f.filePath || ''), f.lineNumber != null ? `:${f.lineNumber}` : ''].join('')
+      const policy = escapeHtml(f.policyItem || '정책 항목 외')
+      const cwe = escapeHtml(f.cwe || '-')
+      return `<tr>
+        <td><span class="sev" style="background:${color}">${escapeHtml(severityLabel(f.severity))}</span></td>
+        <td colspan="3">
+          <strong>${escapeHtml(f.title || '-')}</strong>
+          <div class="chips"><span>${policy}</span><span>${cwe}</span></div>
+          <div class="desc">${escapeHtml((f.description || '').slice(0, 260))}</div>
+        </td>
+        <td class="mono">${loc || '-'}</td>
+        <td class="mono">${escapeHtml(f.scanner || '-')}</td>
+      </tr>`
+    })
+    .join('')
+}
+
+void findingRowsHtml
+
 function buildReportHtml(data: ReportData): string {
   const generatedAt = data.completedAt || ''
   const verdictColor =
@@ -265,19 +291,29 @@ function buildReportHtml(data: ReportData): string {
   .card-n { font-size: 26px; font-weight: 800; }
   .card-l { font-size: 12px; color: #6B7280; margin-top: 2px; }
   h2 { font-size: 14px; margin: 22px 0 8px; padding-left: 8px; border-left: 3px solid #149362; }
-  table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 11px; }
+  col.severity { width: 88px; }
+  col.title { width: auto; }
+  col.location { width: 28%; }
+  col.scanner { width: 76px; }
+  th:nth-child(1), td:nth-child(1) { width: 88px; }
+  th:nth-child(5), td:nth-child(5) { width: 28%; }
+  th:nth-child(6), td:nth-child(6) { width: 76px; }
   th { text-align: left; background: #F3F4F6; color: #374151; padding: 7px 8px; border-bottom: 1px solid #D1D5DB; font-weight: 700; }
-  td { padding: 7px 8px; border-bottom: 1px solid #EEF0F2; vertical-align: top; }
+  tr { break-inside: avoid; page-break-inside: avoid; }
+  td { padding: 8px 8px; border-bottom: 1px solid #EEF0F2; vertical-align: top; overflow-wrap: anywhere; }
   .sev { display: inline-block; padding: 1px 8px; border-radius: 999px; color: #fff; font-size: 10.5px; font-weight: 700; }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .chips span { display: inline-block; border: 1px solid #E5E7EB; border-radius: 999px; padding: 1px 6px; color: #4B5563; font-size: 9.8px; }
   .desc { color: #6B7280; font-size: 10.5px; margin-top: 3px; line-height: 1.4; }
-  .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10.5px; color: #374151; word-break: break-all; }
+  .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 9.5px; color: #374151; line-height: 1.35; overflow-wrap: anywhere; word-break: normal; }
   .empty { text-align: center; color: #9CA3AF; padding: 16px; }
   .foot { margin-top: 28px; color: #9CA3AF; font-size: 10.5px; text-align: center; }
   @media print { body { padding: 0; } @page { margin: 16mm; } }
 </style>
 </head>
 <body>
-  <div class="brand">🛡 SecuPipeline 보안 분석 보고서</div>
+  <div class="brand">🛡 Secupipeline 보안 분석 보고서</div>
   <h1 style="margin-top:6px">${escapeHtml(data.repoName || data.jobId)}</h1>
   <div class="sub">브랜치 ${escapeHtml(data.branch || '-')} · Job ID ${escapeHtml(data.jobId)}${generatedAt ? ` · ${escapeHtml(generatedAt)}` : ''}</div>
   <div><span class="verdict">${escapeHtml(data.verdictLabel || '판정 없음')}</span></div>
@@ -293,16 +329,16 @@ function buildReportHtml(data: ReportData): string {
   <h2>검사 범위 내 탐지 항목 (${data.inScopeFindings.length})</h2>
   <table>
     <thead><tr><th>심각도</th><th>항목</th><th>CWE</th><th>제목 / 설명</th><th>위치</th><th>스캐너</th></tr></thead>
-    <tbody>${findingRowsHtml(data.inScopeFindings, true)}</tbody>
+    <tbody>${findingRowsHtmlCompact(data.inScopeFindings, true)}</tbody>
   </table>
 
   <h2>검사 범위 밖 탐지 항목 (${data.outOfScopeFindings.length})</h2>
   <table>
     <thead><tr><th>심각도</th><th>항목</th><th>CWE</th><th>제목 / 설명</th><th>위치</th><th>스캐너</th></tr></thead>
-    <tbody>${findingRowsHtml(data.outOfScopeFindings, false)}</tbody>
+    <tbody>${findingRowsHtmlCompact(data.outOfScopeFindings, false)}</tbody>
   </table>
 
-  <div class="foot">본 보고서는 SecuPipeline에서 자동 생성되었습니다.</div>
+  <div class="foot">본 보고서는 Secupipeline에서 자동 생성되었습니다.</div>
 </body>
 </html>`
 }

@@ -13,7 +13,7 @@ const DialogOverlay = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Overlay
     ref={ref}
-    className={cn('fixed bottom-0 left-0 right-0 top-9 z-40 bg-black/70 backdrop-blur-[1px]', className)}
+    className={cn('dialog-overlay fixed bottom-0 left-0 right-0 top-9 z-40 bg-black/70 backdrop-blur-[1px]', className)}
     {...props}
   />
 ))
@@ -25,16 +25,18 @@ const DialogContent = React.forwardRef<
 >(({ className, children, ...props }, ref) => (
   <DialogPortal>
     <DialogOverlay />
-    <DialogPrimitive.Content
-      ref={ref}
-      className={cn(
-        'fixed left-1/2 top-[calc(50%+18px)] z-40 w-[min(92vw,420px)] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-white/10 bg-[#242424] p-5 text-gray-50 shadow-2xl',
-        className,
-      )}
-      {...props}
-    >
-      {children}
-    </DialogPrimitive.Content>
+    <div className="dialog-positioner fixed bottom-0 left-0 right-0 top-9 z-40 grid place-items-center p-4 pointer-events-none">
+      <DialogPrimitive.Content
+        ref={ref}
+        className={cn(
+          'dialog-content pointer-events-auto w-[min(92vw,420px)] rounded-xl border border-white/10 bg-[#242424] p-5 text-gray-50 shadow-2xl',
+          className,
+        )}
+        {...props}
+      >
+        {children}
+      </DialogPrimitive.Content>
+    </div>
   </DialogPortal>
 ))
 DialogContent.displayName = DialogPrimitive.Content.displayName
@@ -51,7 +53,7 @@ const DialogTitle = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Title>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Title>
 >(({ className, ...props }, ref) => (
-  <DialogPrimitive.Title ref={ref} className={cn('text-lg font-bold text-white', className)} {...props} />
+  <DialogPrimitive.Title ref={ref} className={cn('text-lg font-bold text-[var(--app-text-primary)]', className)} {...props} />
 ))
 DialogTitle.displayName = DialogPrimitive.Title.displayName
 
@@ -61,7 +63,7 @@ const DialogDescription = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Description
     ref={ref}
-    className={cn('text-sm leading-6 text-gray-300', className)}
+    className={cn('text-sm leading-6 text-[var(--app-text-secondary)]', className)}
     {...props}
   />
 ))

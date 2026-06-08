@@ -21,6 +21,14 @@ import { MainLayout } from '@/components/layout/MainLayout'
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { useAuth } from '@/contexts/AuthContext'
 import {
   cancelPipeline,
@@ -91,6 +99,65 @@ function formatDuration(totalSeconds: number) {
   const seconds = Math.round(totalSeconds % 60)
   if (minutes === 0) return `${seconds}s`
   return `${minutes}m ${String(seconds).padStart(2, '0')}s`
+}
+
+function buildStableLogTimestamps(count: number, totalSeconds: number) {
+  if (count <= 0) return []
+  const total = Math.max(0, Math.round(totalSeconds || 0))
+  if (count === 1) return [total]
+  return Array.from({ length: count }, (_, idx) =>
+    Math.min(total, Math.round((total * idx) / (count - 1))),
+  )
+}
+
+function boundedDurationSecs(value: number, capSecs: number): number | null {
+  if (!Number.isFinite(value) || value <= 0) return null
+  const rounded = Math.max(1, Math.round(value))
+  const cap = Math.max(0, Math.round(capSecs || 0))
+  if (cap > 0 && rounded > Math.max(1, Math.ceil(cap * 1.2))) return null
+  return rounded
+}
+
+function backendStepDurationSecs(step: JobStep, capSecs: number): number | null {
+  const explicitDuration = boundedDurationSecs(step.durationSecs ?? 0, capSecs)
+  if (explicitDuration !== null) return explicitDuration
+
+  if (step.startedAt && step.endedAt) {
+    const startMs = Date.parse(step.startedAt)
+    const endMs = Date.parse(step.endedAt)
+    if (!Number.isNaN(startMs) && !Number.isNaN(endMs) && endMs > startMs) {
+      return boundedDurationSecs((endMs - startMs) / 1000, capSecs)
+    }
+  }
+
+  return null
+}
+
+function stepDurationStorageKey(jobId: string) {
+  return `secupipeline:step-durations:${jobId}`
+}
+
+function readStepDurationCache(jobId: string): Record<string, number> {
+  if (!jobId) return {}
+  try {
+    const raw = window.localStorage.getItem(stepDurationStorageKey(jobId))
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([, value]) => typeof value === 'number' && value >= 0),
+    ) as Record<string, number>
+  } catch {
+    return {}
+  }
+}
+
+function writeStepDurationCache(jobId: string, durations: Record<string, number>) {
+  if (!jobId) return
+  try {
+    window.localStorage.setItem(stepDurationStorageKey(jobId), JSON.stringify(durations))
+  } catch {
+    // localStorage can be unavailable in hardened desktop/webview contexts.
+  }
 }
 
 function statusColor(status: JobStep['status']): string {
@@ -168,6 +235,10 @@ export function PipelineProcessPage() {
   const [, setIsInitialLoading] = useState(true)
   const [elapsedSec, setElapsedSec] = useState(0)
   const [isCancelling, setIsCancelling] = useState(false)
+  const [isCancelDialogOpen, setIsCancelDialogOpen] = useState(false)
+  const [storedStepDurations, setStoredStepDurations] = useState<Record<string, number>>(() =>
+    readStepDurationCache(jobId),
+  )
   // Steps the user has expanded. We auto-add the running step's key so its
   // logs are visible without a manual click, but never auto-close items.
   const [openSteps, setOpenSteps] = useState<string[]>([])
@@ -193,11 +264,16 @@ export function PipelineProcessPage() {
   const lastLogCount = useRef(0)
   const startedAtMsRef = useRef<number | null>(null)
   const terminalPollCountRef = useRef(0)
+  const hasObservedLiveRunRef = useRef(false)
   // Last live-computed duration per step. Lets a step keep showing its real
   // elapsed (e.g. 12s) right when status flips running→success, before the
   // backend has filled durationSecs/endedAt. Without this the cell snaps to
   // "0s" for a poll cycle or two and looks wrong.
   const lastLiveStepDurationRef = useRef<Record<string, number>>({})
+
+  useEffect(() => {
+    setStoredStepDurations(readStepDurationCache(jobId))
+  }, [jobId])
 
   useEffect(() => {
     if (!jobId || !token) {
@@ -210,6 +286,7 @@ export function PipelineProcessPage() {
 
     async function tick() {
       let isTerminal = false
+      let nextJobForTick: JobDetail | null = null
       // Fetch independently so a transient failure in one endpoint does not
       // discard the other's payload (e.g. logs must keep streaming even if
       // job detail blips, and vice versa).
@@ -223,8 +300,12 @@ export function PipelineProcessPage() {
       if (jobResult.status === 'fulfilled') {
         const nextJob = jobResult.value
         if (nextJob) {
+          nextJobForTick = nextJob
           setJob(nextJob)
           isTerminal = TERMINAL_JOB_STATUSES.has(nextJob.status)
+          if (!isTerminal) {
+            hasObservedLiveRunRef.current = true
+          }
         }
       } else {
         detailError = jobResult.reason
@@ -243,14 +324,23 @@ export function PipelineProcessPage() {
         // sees real-time "+5s [build.log] ..." in the log panel. We only
         // append for lines we haven't seen before; existing line indexes
         // keep their original timestamp.
-        const jobStartMs = startedAtMsRef.current
-        if (jobStartMs !== null) {
-          const elapsed = Math.max(0, Math.round((Date.now() - jobStartMs) / 1000))
-          setLogTimestamps((prev) => {
-            if (nextLogs.length <= prev.length) return prev.slice(0, nextLogs.length)
-            const additions = nextLogs.length - prev.length
-            return [...prev, ...new Array<number>(additions).fill(elapsed)]
-          })
+        if (nextJobForTick && TERMINAL_JOB_STATUSES.has(nextJobForTick.status)) {
+          setLogTimestamps((prev) =>
+            nextLogs.length === 0
+              ? prev
+              : buildStableLogTimestamps(nextLogs.length, nextJobForTick.durationSecs),
+          )
+        } else {
+          const jobStartMs = startedAtMsRef.current
+          if (jobStartMs !== null) {
+            const elapsed = Math.max(0, Math.round((Date.now() - jobStartMs) / 1000))
+            setLogTimestamps((prev) => {
+              if (nextLogs.length === 0) return prev
+              if (nextLogs.length <= prev.length) return prev.slice(0, nextLogs.length)
+              const additions = nextLogs.length - prev.length
+              return [...prev, ...new Array<number>(additions).fill(elapsed)]
+            })
+          }
         }
       } else {
         console.error('[pipeline-poll] logs fetch failed:', logsResult.reason)
@@ -419,6 +509,19 @@ export function PipelineProcessPage() {
   // empty. Declared above any useMemo/effect that references it to avoid
   // TDZ when those callbacks run during the first render.
   const lifecycleKeyFor = (idx: number): string => `step-${idx}`
+  const stepDurationKeyFor = (step: JobStep, idx: number): string =>
+    `${idx}:${(step.stepType || step.stepName || step.stepId || 'step').toLowerCase()}`
+
+  const lifecycleDurationFor = (idx: number, capSecs: number): number | null => {
+    const lifecycle = stepLifecycle[lifecycleKeyFor(idx)]
+    if (!lifecycle?.observedEndMs || lifecycle.observedEndMs <= lifecycle.observedStartMs) {
+      return null
+    }
+    return boundedDurationSecs(
+      (lifecycle.observedEndMs - lifecycle.observedStartMs) / 1000,
+      capSecs,
+    )
+  }
 
   const findLogsForStep = (step: JobStep, key: string): LogEntry[] => {
     // 1. Exact / case-insensitive name match against the bracketed prefix
@@ -480,16 +583,24 @@ export function PipelineProcessPage() {
     return []
   }
 
+  const logDurationFor = (step: JobStep, idx: number, capSecs: number): number | null => {
+    const lines = findLogsForStep(step, lifecycleKeyFor(idx))
+    if (lines.length < 2) return null
+    const first = lines[0]?.elapsedSec
+    const last = lines[lines.length - 1]?.elapsedSec
+    if (typeof first !== 'number' || typeof last !== 'number' || last <= first) return null
+    return boundedDurationSecs(last - first, capSecs)
+  }
+
   async function handleCancel() {
     if (!token || !jobId || isCancelling) return
-    const ok = window.confirm('실행 중인 파이프라인을 취소할까요? 진행 중인 작업은 즉시 종료됩니다.')
-    if (!ok) return
     setIsCancelling(true)
     try {
       await cancelPipeline(token, jobId)
       const refreshed = await fetchJobDetail(token, jobId)
       if (refreshed) setJob(refreshed)
       setError(null)
+      setIsCancelDialogOpen(false)
     } catch (err) {
       setError(err instanceof Error ? err.message : '파이프라인 취소에 실패했습니다.')
     } finally {
@@ -544,12 +655,14 @@ export function PipelineProcessPage() {
   // Shorter than the original 900ms so the visual reveal keeps up with
   // fast pipelines — otherwise reveal lags behind the backend and the user
   // sees logs only after the queue finishes animating.
+  const isHistorySnapshot = isTerminal && !hasObservedLiveRunRef.current && apiSteps.length > 0
+
   const REVEAL_INTERVAL_MS = 450
   const [revealedCount, setRevealedCount] = useState<number | null>(null)
   // Wall-clock time each step transitioned to "displayed complete" — used
   // to derive a believable displayed duration when the backend's data is
   // unreliable.
-  const [stepRevealTimes, setStepRevealTimes] = useState<Record<number, number>>({})
+  const [, setStepRevealTimes] = useState<Record<number, number>>({})
   // logs.length captured at the moment each step revealed as complete.
   // Lets the accordion of step N show logs that arrived between step (N-1)
   // reveal and step N reveal as belonging to step N. Tag matching still
@@ -560,6 +673,11 @@ export function PipelineProcessPage() {
   useEffect(() => {
     if (revealedCount !== null) return
     if (steps.length === 0) return
+    if (isHistorySnapshot) {
+      setRevealedCount(steps.length)
+      setStepRevealTimes({})
+      return
+    }
     const completed = steps.filter((s) => TERMINAL_STEP_STATUSES.has(s.status)).length
     setRevealedCount(completed)
     // Backfill reveal times for already-completed steps using backend
@@ -576,11 +694,12 @@ export function PipelineProcessPage() {
     }
     // Intentionally only runs once we know steps — depend on steps but
     // re-check with the guard above.
-  }, [steps, revealedCount])
+  }, [steps, revealedCount, isHistorySnapshot])
 
   // Advance reveal toward the actual completion count, one step per tick.
   useEffect(() => {
     if (revealedCount === null) return
+    if (isHistorySnapshot) return
     const actualCompleted = steps.filter((s) =>
       TERMINAL_STEP_STATUSES.has(s.status),
     ).length
@@ -594,7 +713,7 @@ export function PipelineProcessPage() {
       })
     }, REVEAL_INTERVAL_MS)
     return () => window.clearTimeout(id)
-  }, [revealedCount, steps])
+  }, [revealedCount, steps, isHistorySnapshot])
 
   // Capture logs.length at the moment of each reveal so the per-step
   // accordion can show the logs that arrived between the previous reveal
@@ -620,29 +739,36 @@ export function PipelineProcessPage() {
   //   2. backend (endedAt - startedAt)
   //   3. backend durationSecs (only if > 0)
   //   4. 1s default — guarantees no "0초" displayed.
-  const displayedDurationFor = (step: JobStep, idx: number): number => {
-    const t = stepRevealTimes[idx]
-    const tPrev = idx > 0 ? stepRevealTimes[idx - 1] : startedAtMsRef.current ?? undefined
-    if (t && tPrev && t > tPrev) {
-      return Math.max(1, Math.round((t - tPrev) / 1000))
-    }
-    if (step.startedAt && step.endedAt) {
-      const s = Date.parse(step.startedAt)
-      const e = Date.parse(step.endedAt)
-      if (!Number.isNaN(s) && !Number.isNaN(e) && e > s) {
-        return Math.max(1, Math.round((e - s) / 1000))
-      }
-    }
-    if ((step.durationSecs ?? 0) > 0) {
-      return Math.max(1, step.durationSecs ?? 0)
-    }
-    return 1
+  const rawDisplayedDurationFor = (step: JobStep, idx: number): number => {
+    if (step.status === 'skipped') return 0
+
+    const capSecs = job?.durationSecs && job.durationSecs > 0 ? job.durationSecs : elapsedSec
+    const storedDuration = boundedDurationSecs(
+      storedStepDurations[stepDurationKeyFor(step, idx)] ?? -1,
+      capSecs,
+    )
+    const backendDuration = backendStepDurationSecs(step, capSecs)
+    const lifecycleDuration = lifecycleDurationFor(idx, capSecs)
+    const liveDuration = boundedDurationSecs(
+      lastLiveStepDurationRef.current[lifecycleKeyFor(idx)] ?? -1,
+      capSecs,
+    )
+    const logDuration = logDurationFor(step, idx, capSecs)
+
+    if (storedDuration !== null) return storedDuration
+    if (backendDuration !== null) return backendDuration
+    if (lifecycleDuration !== null) return lifecycleDuration
+    if (liveDuration !== null) return liveDuration
+    if (logDuration !== null) return logDuration
+
+    return isHistorySnapshot ? 0 : 1
   }
 
   // Effective display status: respect the reveal queue. A step that the
   // backend has marked complete but the reveal queue hasn't reached yet
   // is shown as running (the next one up) or pending (further out).
   const displayedStatusFor = (idx: number, real: JobStep['status']): JobStep['status'] => {
+    if (isHistorySnapshot) return real
     if (revealedCount === null) return real
     if (idx < revealedCount) return real
     if (!TERMINAL_STEP_STATUSES.has(real)) return real
@@ -655,9 +781,10 @@ export function PipelineProcessPage() {
   // and to the auto-open accordion logic so the user always sees what's
   // happening RIGHT NOW without having to click into a step. Picks the
   // first step whose DISPLAYED status is running.
-  const currentStepIdx = steps.findIndex(
-    (s, idx) => displayedStatusFor(idx, s.status) === 'running',
-  )
+  const currentStepIdx =
+    isTerminal || isHistorySnapshot
+      ? -1
+      : steps.findIndex((s, idx) => displayedStatusFor(idx, s.status) === 'running')
   const currentStep = currentStepIdx >= 0 ? steps[currentStepIdx] : null
 
   // Count how many steps the user currently SEES as success — driven by
@@ -666,6 +793,37 @@ export function PipelineProcessPage() {
   const successCount = steps.filter(
     (s, idx) => displayedStatusFor(idx, s.status) === 'success',
   ).length
+
+  const displayedStepDurations = (() => {
+    const raw = steps.map((step, idx) => rawDisplayedDurationFor(step, idx))
+    const totalCap = job?.durationSecs && job.durationSecs > 0 ? job.durationSecs : elapsedSec
+    if (totalCap <= 0) return raw
+
+    const cappedIndexes = steps
+      .map((step, idx) => ({ idx, status: displayedStatusFor(idx, step.status), duration: raw[idx] ?? 0 }))
+      .filter(({ status, duration }) => TERMINAL_STEP_STATUSES.has(status) && duration > 0)
+
+    const sum = cappedIndexes.reduce((acc, item) => acc + item.duration, 0)
+    if (sum <= totalCap) return raw
+
+    const next = [...raw]
+    const scale = totalCap / sum
+    cappedIndexes.forEach(({ idx, duration }) => {
+      next[idx] = Math.max(1, Math.floor(duration * scale))
+    })
+
+    let scaledSum = cappedIndexes.reduce((acc, { idx }) => acc + (next[idx] ?? 0), 0)
+    while (scaledSum > totalCap) {
+      const target = cappedIndexes
+        .filter(({ idx }) => (next[idx] ?? 0) > 1)
+        .sort((a, b) => (next[b.idx] ?? 0) - (next[a.idx] ?? 0))[0]
+      if (!target) break
+      next[target.idx] = (next[target.idx] ?? 1) - 1
+      scaledSum -= 1
+    }
+
+    return next
+  })()
 
   // When the deploy step finishes successfully, scan its logs for an
   // http(s) URL and persist it as this repo's deployment domain. The
@@ -789,11 +947,23 @@ export function PipelineProcessPage() {
   // streaming logs are visible without a manual click. We append-only — once
   // the user opens or auto-opens a step it stays open.
   useEffect(() => {
+    if (isHistorySnapshot) {
+      const historyKeys = steps
+        .map((step, idx) => ({
+          key: step.stepId || `${step.stepName}-${idx}`,
+          status: step.status,
+        }))
+        .filter(({ status }) => TERMINAL_STEP_STATUSES.has(status))
+        .map(({ key }) => key)
+      if (historyKeys.length === 0) return
+      setOpenSteps((prev) => (prev.length > 0 ? prev : historyKeys))
+      return
+    }
     if (!currentStep) return
     const idx = steps.indexOf(currentStep)
     const key = currentStep.stepId || `${currentStep.stepName}-${idx}`
     setOpenSteps((prev) => (prev.includes(key) ? prev : [...prev, key]))
-  }, [currentStep, steps])
+  }, [currentStep, steps, isHistorySnapshot])
 
   // Track each running step's live elapsed in a ref so the render can fall
   // back to this value during the brief running→complete transition window
@@ -814,6 +984,53 @@ export function PipelineProcessPage() {
       )
     })
   }, [steps, elapsedSec, stepLifecycle])
+
+  useEffect(() => {
+    if (!jobId || steps.length === 0) return
+    const capSecs = job?.durationSecs && job.durationSecs > 0 ? job.durationSecs : elapsedSec
+
+    setStoredStepDurations((prev) => {
+      let next = prev
+      let changed = false
+
+      const writeDuration = (key: string, duration: number) => {
+        if (prev[key] === duration) return
+        if (!changed) {
+          next = { ...prev }
+          changed = true
+        }
+        next[key] = duration
+      }
+
+      steps.forEach((step, idx) => {
+        if (!TERMINAL_STEP_STATUSES.has(step.status)) return
+        const key = stepDurationKeyFor(step, idx)
+        if (step.status === 'skipped') {
+          writeDuration(key, 0)
+          return
+        }
+
+        const duration =
+          backendStepDurationSecs(step, capSecs) ??
+          lifecycleDurationFor(idx, capSecs) ??
+          boundedDurationSecs(lastLiveStepDurationRef.current[lifecycleKeyFor(idx)] ?? -1, capSecs) ??
+          logDurationFor(step, idx, capSecs)
+
+        if (duration !== null) {
+          writeDuration(key, duration)
+        }
+      })
+
+      if (changed) {
+        writeStepDurationCache(jobId, next)
+      }
+
+      return changed ? next : prev
+    })
+    // findLogsForStep/logDurationFor are intentionally not listed; their
+    // backing data is covered by steps, lifecycle, logs, and timestamps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobId, steps, stepLifecycle, logs, logTimestamps, job?.durationSecs, elapsedSec])
 
   // Record step lifecycle transitions. For each poll we:
   //   - Notice a step that just transitioned to running → stamp its
@@ -1073,7 +1290,7 @@ export function PipelineProcessPage() {
             //   1. reveal-time slice [prev_reveal_log_count, this/live]
             //   2. lifecycle slice (handled inside findLogsForStep)
             let matchedLogs = rawMatchedLogs
-            if (rawMatchedLogs.length === 0 && revealedCount !== null) {
+            if (rawMatchedLogs.length === 0 && revealedCount !== null && step.status !== 'skipped') {
               const sliceStart = idx > 0 ? (stepRevealLogCounts[idx - 1] ?? 0) : 0
               const captured = stepRevealLogCounts[idx]
               const isCurrentRunning = idx === revealedCount
@@ -1106,12 +1323,9 @@ export function PipelineProcessPage() {
             // its reveal timestamp (or the previous step's reveal).
             let duration = 0
             if (TERMINAL_STEP_STATUSES.has(dStatus)) {
-              duration = displayedDurationFor(step, idx)
+              duration = displayedStepDurations[idx] ?? 0
             } else if (dStatus === 'running') {
-              const prev = idx > 0 ? stepRevealTimes[idx - 1] : startedAtMsRef.current
-              if (prev) {
-                duration = Math.max(0, Math.round((Date.now() - prev) / 1000))
-              }
+              duration = rawDisplayedDurationFor(step, idx)
             }
 
             return (
@@ -1202,7 +1416,7 @@ export function PipelineProcessPage() {
         <div className="flex justify-end gap-2 pt-1">
           {!isTerminal ? (
             <Button
-              onClick={handleCancel}
+              onClick={() => setIsCancelDialogOpen(true)}
               disabled={isCancelling}
               className="border border-[#7F1D1D] bg-transparent text-[#FCA5A5] shadow-none hover:bg-[#450A0A]/40"
             >
@@ -1222,6 +1436,41 @@ export function PipelineProcessPage() {
           </Button>
         </div>
       </section>
+
+      <Dialog open={isCancelDialogOpen} onOpenChange={(open) => !isCancelling && setIsCancelDialogOpen(open)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>파이프라인을 취소할까요?</DialogTitle>
+            <DialogDescription>
+              진행 중인 작업이 즉시 종료됩니다. 이미 생성된 로그와 기록은 유지됩니다.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setIsCancelDialogOpen(false)}
+              disabled={isCancelling}
+            >
+              계속 실행
+            </Button>
+            <Button
+              type="button"
+              onClick={handleCancel}
+              disabled={isCancelling}
+              className="bg-[#EF4444] text-white shadow-none hover:bg-[#DC2626]"
+            >
+              {isCancelling ? (
+                <>
+                  <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />취소 중...
+                </>
+              ) : (
+                '파이프라인 취소'
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </MainLayout>
   )
 }

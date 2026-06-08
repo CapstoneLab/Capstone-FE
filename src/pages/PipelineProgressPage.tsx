@@ -157,7 +157,7 @@ const scoreChartOptions: ChartOptions<'doughnut'> = {
 const severityChartOptions: ChartOptions<'doughnut'> = {
   responsive: true,
   maintainAspectRatio: false,
-  cutout: '0%',
+  cutout: '64%',
   plugins: {
     legend: { display: false },
     tooltip: {
@@ -236,6 +236,40 @@ function shortSummary(text: string): string {
   return s
 }
 
+function escapeCodeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function highlightCodeSnippet(code: string): string {
+  const highlighter = (window as unknown as {
+    hljs?: {
+      highlight?: (code: string, options: { language: string; ignoreIllegals: boolean }) => { value: string }
+      highlightAuto?: (code: string, languageSubset?: string[]) => { value: string }
+    }
+  }).hljs
+
+  try {
+    return (
+      highlighter?.highlight?.(code, { language: 'javascript', ignoreIllegals: true }).value ??
+      highlighter?.highlightAuto?.(code, ['javascript', 'typescript', 'json']).value ??
+      escapeCodeHtml(code)
+    )
+  } catch {
+    return escapeCodeHtml(code)
+  }
+}
+
+function scoreBandColor(score: number | null): string {
+  if (score == null) return '#9CA3AF'
+  if (score >= 80) return '#22C55E'
+  if (score >= 50) return '#F97316'
+  return '#EF4444'
+}
+
 export function PipelineProgressPage() {
   const navigate = useNavigate()
   const { token } = useAuth()
@@ -254,6 +288,9 @@ export function PipelineProgressPage() {
   // shown as "복사됨" briefly.
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const [downloadOpen, setDownloadOpen] = useState(false)
+  const [highlightReady, setHighlightReady] = useState(
+    () => !!(window as unknown as { hljs?: unknown }).hljs,
+  )
 
   async function handleCopy(key: string, text: string) {
     const ok = await copyToClipboard(text)
@@ -296,6 +333,36 @@ export function PipelineProgressPage() {
     }
   }, [jobId, token])
 
+  useEffect(() => {
+    if ((window as unknown as { hljs?: unknown }).hljs) {
+      setHighlightReady(true)
+      return
+    }
+
+    const cssId = 'highlightjs-github-dark-css'
+    if (!document.getElementById(cssId)) {
+      const link = document.createElement('link')
+      link.id = cssId
+      link.rel = 'stylesheet'
+      link.href = 'https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github-dark.min.css'
+      document.head.appendChild(link)
+    }
+
+    const scriptId = 'highlightjs-cdn-script'
+    const existing = document.getElementById(scriptId) as HTMLScriptElement | null
+    if (existing) {
+      existing.addEventListener('load', () => setHighlightReady(true), { once: true })
+      return
+    }
+
+    const script = document.createElement('script')
+    script.id = scriptId
+    script.src = 'https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/lib/common.min.js'
+    script.async = true
+    script.onload = () => setHighlightReady(true)
+    document.body.appendChild(script)
+  }, [])
+
   const repoName = result?.repoName || detail?.repoName || locationState.repoName || ''
   const branch = result?.branch || detail?.branch || locationState.branch || ''
   const repoUrl = result?.repoUrl || detail?.repoUrl || ''
@@ -309,8 +376,6 @@ export function PipelineProgressPage() {
   // findings exist means the backend score is empty-derived (same root cause as
   // the all-zero counts), so we recompute the deduction there.
   const rawScore = vd?.score ?? result?.securityScore ?? detail?.securityScore ?? null
-  const gaugeColor = vd?.gaugeColor || '#F97316'
-
   // B-0 counts (in-scope). The backend's verdict counts are authoritative, but
   // `vd.counts` is sometimes present-yet-all-zero (field-name mismatch or not
   // populated) even when findings exist — a plain `??` would keep those zeros
@@ -352,6 +417,7 @@ export function PipelineProgressPage() {
       ? computeSecurityScore(counts)
       : rawScore
   const scoreLabel = vd?.scoreLabel || (score != null ? `${score}/100` : null)
+  const displayScoreColor = scoreBandColor(score)
 
   // Effective verdict — prefer the rich model, else map the legacy verdict.
   const effectiveVerdict: VerdictKind | null =
@@ -407,14 +473,16 @@ export function PipelineProgressPage() {
       labels: ['보안 점수', '남은 점수'],
       datasets: [
         {
+          // Track color follows the theme — #404040 reads as a heavy dark arc on
+          // the light card, so use a soft gray there.
           data: [score ?? 0, 100 - (score ?? 0)],
-          backgroundColor: [gaugeColor, '#404040'],
+          backgroundColor: [displayScoreColor, isLight ? '#E5E7EB' : '#3A3A3A'],
           borderWidth: 0,
           hoverOffset: 0,
         },
       ],
     }),
-    [score, gaugeColor],
+    [score, displayScoreColor, isLight],
   )
 
   const severityChartData = useMemo(
@@ -424,12 +492,13 @@ export function PipelineProgressPage() {
         {
           data: severityOrder.map((s) => counts[s.key] ?? 0),
           backgroundColor: severityOrder.map((s) => severityColors[s.label]),
-          borderColor: '#1E1E1E',
+          // Match the card surface so the donut segments read as separated.
+          borderColor: isLight ? '#FFFFFF' : '#262626',
           borderWidth: 2,
         },
       ],
     }),
-    [counts],
+    [counts, isLight],
   )
 
   // 검사 범위 밖(정책 미선택) findings를 등급별로 집계 — 두 번째 도넛용.
@@ -455,12 +524,12 @@ export function PipelineProgressPage() {
         {
           data: severityOrder.map((s) => outScopeCounts[s.key] ?? 0),
           backgroundColor: severityOrder.map((s) => severityColors[s.label]),
-          borderColor: '#1E1E1E',
+          borderColor: isLight ? '#FFFFFF' : '#262626',
           borderWidth: 2,
         },
       ],
     }),
-    [outScopeCounts],
+    [outScopeCounts, isLight],
   )
 
   // selected_items → mark each of the 16 catalog items as 검사/미검사.
@@ -504,8 +573,12 @@ export function PipelineProgressPage() {
     return (
       <div className="flex min-h-40 items-center justify-center gap-6">
         {total > 0 ? (
-          <div className="flex h-36 w-36 items-center justify-center">
+          <div className="relative flex h-36 w-36 items-center justify-center">
             <Doughnut data={chartData} options={severityChartOptions} />
+            <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
+              <span className="text-[26px] font-bold leading-none text-white">{total}</span>
+              <span className="mt-0.5 text-[11px] text-[#9CA3AF]">건</span>
+            </div>
           </div>
         ) : (
           <div className="flex h-36 w-36 items-center justify-center text-center text-[12px] text-[#6B7280]">
@@ -648,25 +721,45 @@ export function PipelineProgressPage() {
         </div>
 
         {item.codeSnippet ? (
-          <div className="relative mt-3">
-            <button
-              type="button"
-              onClick={() => handleCopy(codeCopyKey, item.codeSnippet ?? '')}
-              title="코드 복사"
-              className="absolute right-2 top-2 z-10 inline-flex items-center gap-1 rounded-md border border-[#404040] bg-[#1E1E1E] px-2 py-0.5 text-[11px] text-[#9CA3AF] transition-colors hover:text-white"
-            >
-              {copiedKey === codeCopyKey ? (
-                <>
-                  <Check className="h-3 w-3" /> 복사됨
-                </>
-              ) : (
-                <>
-                  <Copy className="h-3 w-3" /> 복사
-                </>
-              )}
-            </button>
-            <pre className="overflow-x-auto rounded-md border border-[#404040] bg-[#0F0F0F] p-3 pr-20 text-[12px] text-[#D1D5DB]">
-              <code className="font-mono">{item.codeSnippet}</code>
+          <div className="mt-3 overflow-hidden rounded-lg border border-[#404040]">
+            {/* Editor-style title bar: window dots + file location + copy. */}
+            <div className="flex items-center justify-between gap-2 border-b border-[#404040] bg-[#262626] px-3 py-1.5">
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="flex shrink-0 items-center gap-1.5">
+                  <span className="h-2.5 w-2.5 rounded-full bg-[#EF4444]" />
+                  <span className="h-2.5 w-2.5 rounded-full bg-[#EAB308]" />
+                  <span className="h-2.5 w-2.5 rounded-full bg-[#22C55E]" />
+                </span>
+                <span className="truncate font-mono text-[11px] text-[#9CA3AF]">
+                  {location ?? '취약 코드'}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => handleCopy(codeCopyKey, item.codeSnippet ?? '')}
+                title="코드 복사"
+                className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-0.5 text-[11px] text-[#9CA3AF] transition-colors hover:text-white"
+              >
+                {copiedKey === codeCopyKey ? (
+                  <>
+                    <Check className="h-3 w-3" /> 복사됨
+                  </>
+                ) : (
+                  <>
+                    <Copy className="h-3 w-3" /> 복사
+                  </>
+                )}
+              </button>
+            </div>
+            <pre className="result-code-block overflow-x-auto bg-[#0F0F0F] p-3 text-[12px] leading-relaxed text-[#D1D5DB]">
+              <code
+                className="language-javascript font-mono"
+                dangerouslySetInnerHTML={{
+                  __html: highlightReady
+                    ? highlightCodeSnippet(item.codeSnippet)
+                    : escapeCodeHtml(item.codeSnippet),
+                }}
+              />
             </pre>
           </div>
         ) : null}
@@ -719,7 +812,7 @@ export function PipelineProgressPage() {
   }
 
   return (
-    <MainLayout>
+    <MainLayout onResultDownload={() => setDownloadOpen(true)}>
       <section className="w-full space-y-4">
         {/* Header */}
         <div className="flex items-start justify-between gap-3">
@@ -896,10 +989,17 @@ export function PipelineProgressPage() {
           <Card className="border-[#404040] bg-[#262626] p-4">
             <p className="mb-3 text-[16px] font-semibold text-white">보안 점수</p>
             <div className="relative mx-auto h-30 w-36">
+              {/* Soft colored glow keyed to the gauge color, sitting under the
+                  arc for a bit of depth (theme-independent — it's a tint). */}
+              <div
+                aria-hidden
+                className="pointer-events-none absolute left-1/2 top-[62%] h-24 w-24 -translate-x-1/2 -translate-y-1/2 rounded-full opacity-25 blur-2xl"
+                style={{ backgroundColor: displayScoreColor }}
+              />
               <Doughnut data={scoreChartData} options={scoreChartOptions} />
               <p
                 className="pointer-events-none absolute left-1/2 top-[72%] -translate-x-1/2 -translate-y-1/2 text-[44px] font-bold leading-none"
-                style={{ color: gaugeColor }}
+                style={{ color: displayScoreColor }}
               >
                 {score ?? '-'}
               </p>
@@ -909,10 +1009,19 @@ export function PipelineProgressPage() {
             </div>
             <div className="mt-3 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
               <p className="text-[12px] text-[#6B7280]">코드 품질 점수</p>
-              <p className="text-[24px] font-bold leading-none text-white">
+              <p className="text-[24px] font-bold leading-none" style={{ color: displayScoreColor }}>
                 {score ?? '-'}
                 <span className="text-[24px]">/100</span>
               </p>
+              <div className="mt-3 h-2.5 w-full overflow-hidden rounded-full bg-[#404040]">
+                <div
+                  className="h-full rounded-full transition-all duration-500"
+                  style={{
+                    width: `${Math.max(0, Math.min(100, score ?? 0))}%`,
+                    backgroundColor: displayScoreColor,
+                  }}
+                />
+              </div>
             </div>
             {/* score_breakdown (감점 내역 — 항상 펼침) */}
             {vd?.scoreBreakdown &&

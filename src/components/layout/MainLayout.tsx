@@ -1,18 +1,20 @@
 import type { PropsWithChildren } from 'react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Clock3, Download, Play } from 'lucide-react'
+import { Clock3, Download, FileClock, Play } from 'lucide-react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
 import { Footer } from './Footer'
-import { NativeFrameBar } from './NativeFrameBar'
 
 type MainLayoutProps = PropsWithChildren<{
   /** Live elapsed-time label for the pipeline progress sticky-header chip
    *  (e.g. "3m 40s"). Passed by PipelineProcessPage so it isn't hardcoded. */
   pipelineElapsed?: string
+  /** Opens the 결과 다운로드 modal. Passed by the result page so the sticky-
+   *  header download button triggers the same dialog as the in-page one. */
+  onResultDownload?: () => void
 }>
 
-export function MainLayout({ children, pipelineElapsed }: MainLayoutProps) {
+export function MainLayout({ children, pipelineElapsed, onResultDownload }: MainLayoutProps) {
   const { pathname } = useLocation()
   const navigate = useNavigate()
   const [showPageHeader, setShowPageHeader] = useState(false)
@@ -126,24 +128,33 @@ export function MainLayout({ children, pipelineElapsed }: MainLayoutProps) {
 
     if (pathname.startsWith('/pipeline/result')) {
       return (
-        <Button
-          type="button"
-          className="h-9 border border-[#34D399] bg-[#34D399] px-3 text-xs font-semibold text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
-        >
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => navigate('/approvals')}
+            className="h-9 border-[#404040] bg-transparent px-3 text-xs text-[#D1D5DB] hover:bg-[#262626]"
+          >
+            <FileClock className="mr-1.5 h-3.5 w-3.5" />감사 로그
+          </Button>
+          <Button
+            type="button"
+            onClick={onResultDownload}
+            className="h-9 border border-[#34D399] bg-[#34D399] px-3 text-xs font-semibold text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
+          >
           <Download className="mr-1.5 h-3.5 w-3.5" />결과 다운로드
-        </Button>
+          </Button>
+        </div>
       )
     }
 
     return null
-  }, [navigate, pathname, pipelineElapsed])
+  }, [navigate, pathname, pipelineElapsed, onResultDownload])
 
   return (
     <div className="relative h-full overflow-hidden bg-[#1E1E1E] text-gray-50">
-      <NativeFrameBar />
-
       <div
-        className={`fixed left-0 right-0 top-9 z-40 transition-all duration-200 ${
+        className={`absolute left-0 right-0 top-0 z-40 transition-all duration-200 ${
           shouldShowScrollHeader
             ? 'translate-y-0 opacity-100'
             : 'pointer-events-none -translate-y-2 opacity-0'
@@ -163,7 +174,7 @@ export function MainLayout({ children, pipelineElapsed }: MainLayoutProps) {
 
       <div
         ref={scrollContainerRef}
-        className="mt-9 flex h-[calc(100%-36px)] flex-col overflow-y-auto overflow-x-hidden"
+        className="flex h-full flex-col overflow-y-auto overflow-x-hidden"
       >
         <main className="relative mx-auto w-full max-w-6xl flex-1 px-6 pb-10 pt-6">{children}</main>
         <Footer />

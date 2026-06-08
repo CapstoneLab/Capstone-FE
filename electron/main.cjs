@@ -77,6 +77,17 @@ function getRepositoryFromPackageJson() {
 
 const fallbackGithubRepo = getRepositoryFromPackageJson() || defaultGithubRepo
 
+app.setName('Secupipeline')
+
+function getAppIconPath() {
+  const candidates = [
+    path.join(appRootDir, 'renderer-dist', 'logo.png'),
+    path.join(appRootDir, 'public', 'logo.png'),
+  ]
+
+  return candidates.find((candidate) => fs.existsSync(candidate))
+}
+
 function loadDotEnvFile(filePath) {
   if (!fs.existsSync(filePath)) {
     return
@@ -190,7 +201,7 @@ async function requestGithubJson(url) {
   const response = await fetch(url, {
     headers: {
       Accept: 'application/vnd.github+json',
-      'User-Agent': 'SecuPipeline-Desktop-Updater',
+      'User-Agent': 'Secupipeline-Desktop-Updater',
       ...getGithubAuthHeader(),
     },
   })
@@ -282,7 +293,7 @@ async function fetchLatestRelease() {
 
   if (!release) {
     return {
-      appName: 'SecuPipeline',
+      appName: 'Secupipeline',
       repository,
       currentVersion,
       latestVersion: currentVersion,
@@ -299,7 +310,7 @@ async function fetchLatestRelease() {
   const latestVersion = normalizeVersion(release.tag_name || release.name || currentVersion)
 
   return {
-    appName: 'SecuPipeline',
+    appName: 'Secupipeline',
     repository,
     currentVersion,
     latestVersion,
@@ -323,7 +334,7 @@ async function downloadInstaller(url, version, onProgress) {
   const response = await fetch(url, {
     redirect: 'follow',
     headers: {
-      'User-Agent': 'SecuPipeline-Desktop-Updater',
+      'User-Agent': 'Secupipeline-Desktop-Updater',
       ...getGithubAuthHeader(),
     },
   })
@@ -416,6 +427,7 @@ function createWindow() {
     height: 900,
     minWidth: 1100,
     minHeight: 720,
+    icon: getAppIconPath(),
     backgroundColor: '#1E1E1E',
     frame: false,
     titleBarStyle: 'hidden',
@@ -586,7 +598,7 @@ ipcMain.handle('auth:open-github-login', async (event, payload) => {
 
 ipcMain.handle('app:get-info', () => {
   return {
-    appName: 'SecuPipeline',
+    appName: 'Secupipeline',
     version: normalizeVersion(app.getVersion()),
   }
 })

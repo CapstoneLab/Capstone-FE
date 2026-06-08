@@ -77,7 +77,7 @@ export function Footer() {
           </div>
         </div>
         <hr className="my-8 border-gray-500/70" />
-        <p className="text-xs text-gray-300">© 2026 SecuPipeline. All rights reserved.</p>
+        <p className="text-xs text-gray-300">© 2026 Secupipeline. All rights reserved.</p>
       </div>
     </footer>
   )

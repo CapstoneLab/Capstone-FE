@@ -66,7 +66,7 @@ export function NativeFrameBar() {
   const [canGoBack, setCanGoBack] = useState(false)
   const [canGoForward, setCanGoForward] = useState(false)
   const [appInfo, setAppInfo] = useState({
-    appName: 'SecuPipeline',
+    appName: 'Secupipeline',
     version: '0.0.0',
   })
   const [releaseInfo, setReleaseInfo] = useState<DesktopReleaseInfo | null>(null)
@@ -156,7 +156,7 @@ export function NativeFrameBar() {
         }
 
         setAppInfo({
-          appName: info.appName || 'SecuPipeline',
+          appName: info.appName || 'Secupipeline',
           version: info.version || '0.0.0',
         })
       })
@@ -166,7 +166,7 @@ export function NativeFrameBar() {
         }
 
         setAppInfo({
-          appName: 'SecuPipeline',
+          appName: 'Secupipeline',
           version: '0.0.0',
         })
       })
@@ -290,7 +290,7 @@ export function NativeFrameBar() {
         <div className="pointer-events-none absolute left-1/2 flex -translate-x-1/2 items-center gap-2">
           <img src={appIconSrc} alt="앱 아이콘" className="h-7 w-7 rounded-xl object-cover" />
           <p className="text-sm font-semibold" style={{ color: 'var(--app-titlebar-text)' }}>
-            SecuPipeline
+            Secupipeline
           </p>
         </div>
 
@@ -311,10 +311,9 @@ export function NativeFrameBar() {
             </DialogTrigger>
 
             <DialogContent
-              className="left-auto right-13 top-13.5 w-[min(92vw,240px)] translate-x-0 translate-y-0 border-gray-600/70 p-0"
-              style={{ backgroundColor: 'var(--app-bg-elevated)' }}
+              className="titlebar-popover left-auto right-13 top-13.5 w-[min(92vw,240px)] translate-x-0 translate-y-0 border-gray-600/70 p-0"
             >
-              <div className="border-b border-gray-700/40 px-4 py-3">
+              <div className="titlebar-popover__header border-b border-gray-700/40 px-4 py-3">
                 <DialogHeader>
                   <DialogTitle className="text-base">테마</DialogTitle>
                 </DialogHeader>
@@ -336,8 +335,8 @@ export function NativeFrameBar() {
                         setTheme(key)
                         setIsThemeDialogOpen(false)
                       }}
-                      className={`flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
-                        active ? 'bg-emerald-500/15 text-emerald-300' : 'hover:bg-white/5'
+                      className={`theme-option flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
+                        active ? 'theme-option--active' : ''
                       }`}
                     >
                       <Icon className="h-4 w-4" />
@@ -368,8 +367,8 @@ export function NativeFrameBar() {
               </button>
             </DialogTrigger>
 
-            <DialogContent className="left-auto right-3 top-13.5 w-[min(92vw,320px)] translate-x-0 translate-y-0 border-gray-600/70 bg-[#222222] p-0">
-              <div className="border-b border-gray-700/80 px-4 py-3">
+            <DialogContent className="titlebar-popover left-auto right-3 top-13.5 w-[min(92vw,320px)] translate-x-0 translate-y-0 border-gray-600/70 bg-[#222222] p-0">
+              <div className="titlebar-popover__header border-b border-gray-700/80 px-4 py-3">
                 <DialogHeader>
                   <DialogTitle className="text-base">프로필</DialogTitle>
                 </DialogHeader>
@@ -377,24 +376,24 @@ export function NativeFrameBar() {
 
               <div className="space-y-3 px-4 py-3">
                 {user ? (
-                  <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-gray-700/70 bg-[#1C1C1C] px-3 py-4">
+                  <div className="profile-card flex flex-col items-center justify-center gap-2 rounded-lg border border-gray-700/70 bg-[#1C1C1C] px-3 py-4">
                     <img
                       src={user.avatarUrl || defaultProfileSvg}
                       alt={user.name || user.login}
                       className="h-16 w-16 rounded-full"
                     />
-                    <p className="text-center text-sm font-semibold text-gray-100">
+                    <p className="text-center text-sm font-semibold text-[var(--app-text-primary)]">
                       {user.name || user.login}
                     </p>
-                    <p className="text-center text-xs text-gray-400">@{user.login}</p>
+                    <p className="profile-muted text-center text-xs text-gray-400">@{user.login}</p>
                     {user.email && (
-                      <p className="text-center text-xs text-gray-500">{user.email}</p>
+                      <p className="profile-muted text-center text-xs text-gray-500">{user.email}</p>
                     )}
                   </div>
                 ) : (
-                  <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-gray-700/70 bg-[#1C1C1C] px-3 py-4">
+                  <div className="profile-card flex flex-col items-center justify-center gap-2 rounded-lg border border-gray-700/70 bg-[#1C1C1C] px-3 py-4">
                     <img src={defaultProfileSvg} alt="기본 프로필" className="h-16 w-16 rounded-full" />
-                    <p className="text-center text-sm font-semibold text-gray-100">
+                    <p className="text-center text-sm font-semibold text-[var(--app-text-primary)]">
                       비로그인 상태입니다. 로그인이 필요합니다.
                     </p>
                   </div>
@@ -404,7 +403,7 @@ export function NativeFrameBar() {
                   <Button
                     type="button"
                     variant="ghost"
-                    className="h-9 w-full justify-center bg-red-500/80 px-3 text-xs font-semibold text-white shadow-none hover:bg-red-500"
+                    className="profile-danger-button h-9 w-full justify-center bg-red-500/80 px-3 text-xs font-semibold text-white shadow-none hover:bg-red-500"
                     onClick={() => {
                       logout()
                       setIsProfileDialogOpen(false)
@@ -417,7 +416,7 @@ export function NativeFrameBar() {
                   <Button
                     type="button"
                     variant="ghost"
-                    className="h-9 w-full justify-center bg-emerald-400 px-3 text-xs font-semibold text-[#111827] shadow-none hover:bg-emerald-300"
+                    className="profile-primary-button h-9 w-full justify-center bg-emerald-400 px-3 text-xs font-semibold text-[#111827] shadow-none hover:bg-emerald-300"
                     onClick={() => {
                       setIsProfileDialogOpen(false)
                       navigate('/auth')
@@ -430,7 +429,7 @@ export function NativeFrameBar() {
                 <Button
                   type="button"
                   variant="outline"
-                  className="h-9 w-full justify-center border-gray-600 bg-[#2A2A2A] text-gray-100 hover:bg-[#333333]"
+                  className="profile-secondary-button h-9 w-full justify-center border-gray-600 bg-[#2A2A2A] text-gray-100 hover:bg-[#333333]"
                   onClick={handleCheckUpdates}
                   disabled={isCheckingUpdate}
                 >
@@ -477,31 +476,31 @@ export function NativeFrameBar() {
       </div>
 
       <Dialog open={isUpdateDialogOpen} onOpenChange={setIsUpdateDialogOpen}>
-        <DialogContent className="w-[min(92vw,460px)] border-gray-600/75 bg-[#202020]">
+        <DialogContent className="update-dialog-panel w-[min(92vw,460px)] border-gray-600/75 bg-[#202020]">
           <DialogHeader className="items-center text-center">
             <DialogTitle>앱 업데이트 확인</DialogTitle>
           </DialogHeader>
 
           <div className="mt-3 flex flex-col items-center text-center">
             <img src={appIconSrc} alt="앱 아이콘" className="h-12 w-12 rounded-xl object-cover" />
-            <p className="mt-3 text-base font-semibold text-white">{releaseInfo?.appName || appInfo.appName}</p>
-            <p className="mt-1 text-xs text-gray-300">
+            <p className="mt-3 text-base font-semibold text-[var(--app-text-primary)]">{releaseInfo?.appName || appInfo.appName}</p>
+            <p className="update-dialog-version mt-1 text-xs text-gray-300">
               현재 앱 버전 {withVersionPrefix(releaseInfo?.currentVersion || appInfo.version)}
             </p>
             {releaseInfo?.latestVersion && (
-              <p className="mt-1 text-xs text-gray-400">
+              <p className="update-dialog-version mt-1 text-xs text-gray-400">
                 최신 릴리즈 버전 {withVersionPrefix(releaseInfo.latestVersion)}
               </p>
             )}
           </div>
 
-          <div className="mt-4 rounded-lg border border-gray-700/80 bg-[#171717] p-4">
-            <p className="mb-3 text-center text-xs font-semibold tracking-wide text-gray-400">업데이트 확인</p>
+          <div className="update-dialog-box mt-4 rounded-lg border border-gray-700/80 bg-[#171717] p-4">
+            <p className="update-dialog-label mb-3 text-center text-xs font-semibold tracking-wide text-gray-400">업데이트 확인</p>
             {updateError ? (
-              <p className="text-center text-sm text-red-300">{updateError}</p>
+              <p className="update-dialog-error text-center text-sm text-red-300">{updateError}</p>
             ) : releaseInfo?.hasUpdate ? (
               <div className="flex flex-col items-center gap-3">
-                <p className="text-center text-sm text-amber-200">
+                <p className="update-dialog-warning text-center text-sm text-amber-200">
                   신규 버전 {withVersionPrefix(releaseInfo.latestVersion)}이(가) 있습니다.
                 </p>
                 <Button
@@ -531,7 +530,7 @@ export function NativeFrameBar() {
                 )}
               </div>
             ) : (
-              <p className="text-center text-sm text-emerald-300">
+              <p className="update-dialog-success text-center text-sm text-emerald-300">
                 {releaseInfo?.statusMessage || '최신 버전입니다.'}
               </p>
             )}
@@ -539,7 +538,7 @@ export function NativeFrameBar() {
 
           <DialogFooter>
             <DialogClose asChild>
-              <Button type="button" variant="ghost" className="h-9 px-3 text-xs text-gray-200">
+              <Button type="button" variant="ghost" className="h-9 px-3 text-xs text-[var(--app-text-primary)]">
                 닫기
               </Button>
             </DialogClose>
