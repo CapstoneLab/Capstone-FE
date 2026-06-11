@@ -42,6 +42,7 @@ import {
   getCachedRepos,
   getRepoDetectEnabled,
   getTrackedJobIds,
+  isGithubRateLimitError,
   mergeTrackedJobIds,
   removeTrackedJobId,
   setCachedRepos,
@@ -284,8 +285,19 @@ export function DashboardPage() {
           navigate('/auth', { replace: true })
           return
         }
+        const cached = getCachedRepos(cacheKey)
+        if (isGithubRateLimitError(error) && cached && cached.length > 0) {
+          setRepos(
+            cached.map((repo) => ({
+              ...repo,
+              detectEnabled: getRepoDetectEnabled(cacheKey, repo.id),
+            })),
+          )
+          setReposError(null)
+          return
+        }
         setReposError(
-          error instanceof Error ? error.message : t('dashboard.repoLoadFailed'),
+          error instanceof Error ? error.message : '레포지토리를 불러오지 못했습니다.',
         )
       })
       .finally(() => {
@@ -297,7 +309,7 @@ export function DashboardPage() {
     return () => {
       mounted = false
     }
-  }, [token, cacheKey, logout, navigate, t])
+  }, [token, cacheKey, logout, navigate])
 
   useEffect(() => {
     if (!token) {
@@ -374,7 +386,7 @@ export function DashboardPage() {
       } catch (error) {
         if (cancelled) return
         setJobsError(
-          error instanceof Error ? error.message : t('dashboard.jobsLoadFailed'),
+          error instanceof Error ? error.message : '파이프라인 결과를 불러오지 못했습니다.',
         )
       } finally {
         if (!cancelled && initial) setIsJobsLoading(false)
@@ -387,7 +399,7 @@ export function DashboardPage() {
       cancelled = true
       if (timer !== null) window.clearTimeout(timer)
     }
-  }, [token, cacheKey, legacyTokenCacheKey, t])
+  }, [token, cacheKey, legacyTokenCacheKey])
 
   const triggerLoading = () => {
     if (loadingTimerRef.current) {

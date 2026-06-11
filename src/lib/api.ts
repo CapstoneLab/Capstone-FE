@@ -39,6 +39,10 @@ function isGithubTokenMissing(detail: string): boolean {
   return /github access token not in cache|please log in again/i.test(detail)
 }
 
+export function isGithubRateLimitError(error: unknown): boolean {
+  return error instanceof Error && /api rate limit exceeded|rate limit/i.test(error.message)
+}
+
 function pick<T = unknown>(obj: UnknownRecord, ...keys: string[]): T | undefined {
   for (const key of keys) {
     const value = obj[key]
@@ -111,7 +115,7 @@ export async function fetchRepos(token: string): Promise<RepositoryItem[]> {
     if (res.status === 401 || isGithubTokenMissing(detail)) {
       throw new AuthExpiredError(detail || 'GitHub 인증이 만료되었습니다. 다시 로그인해 주세요.')
     }
-    throw new Error(`Failed to fetch repos (${res.status})`)
+    throw new Error(detail ? `Failed to fetch repos (${res.status}): ${detail}` : `Failed to fetch repos (${res.status})`)
   }
 
   return extractList(await res.json()).map(mapRepo)
@@ -1444,18 +1448,27 @@ export function setCachedRepos(key: string, repos: RepositoryItem[]): void {
 
 export async function fetchReposWithBranches(token: string): Promise<RepositoryItem[]> {
   const repos = await fetchRepos(token)
-  const enriched = await Promise.all(
-    repos.map(async (repo) => {
-      const [owner, name] = repo.name.split('/')
-      if (!owner || !name) return repo
-      const branches = await fetchBranches(token, owner, name)
-      if (branches.length === 0) return repo
-      const defaultBranch = repo.source.branch
-      const ordered = defaultBranch
-        ? [defaultBranch, ...branches.filter((b) => b !== defaultBranch)]
-        : branches
-      return { ...repo, branches: ordered }
-    }),
-  )
+  const enriched: RepositoryItem[] = []
+
+  for (const repo of repos) {
+    const [owner, name] = repo.name.split('/')
+    if (!owner || !name) {
+      enriched.push(repo)
+      continue
+    }
+
+    const branches = await fetchBranches(token, owner, name)
+    if (branches.length === 0) {
+      enriched.push(repo)
+      continue
+    }
+
+    const defaultBranch = repo.source.branch
+    const ordered = defaultBranch
+      ? [defaultBranch, ...branches.filter((b) => b !== defaultBranch)]
+      : branches
+    enriched.push({ ...repo, branches: ordered })
+  }
+
   return enriched
 }

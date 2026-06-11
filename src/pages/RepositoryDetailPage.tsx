@@ -138,7 +138,7 @@ export function RepositoryDetailPage() {
         setRepoError(
           error instanceof Error
             ? error.message
-            : t('repo.loadFailed'),
+            : '레포지토리 정보를 불러오지 못했습니다.',
         )
       })
       .finally(() => {
@@ -148,7 +148,7 @@ export function RepositoryDetailPage() {
     return () => {
       cancelled = true
     }
-  }, [token, resolvedRepoId, cacheKey, repo, logout, navigate, t])
+  }, [token, resolvedRepoId, cacheKey, repo, logout, navigate])
 
   // Find this repo's most recent tracked pipeline run, if any.
   useEffect(() => {

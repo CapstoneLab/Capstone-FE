@@ -25,6 +25,7 @@ import {
   getLaunchedRepos,
   getTrackedJobIds,
   hasLaunchedRepo,
+  isGithubRateLimitError,
   PipelineConflictError,
   setCachedRepos,
   startPipeline,
@@ -108,8 +109,14 @@ export function NewPipelinePage() {
           navigate('/auth', { replace: true })
           return
         }
+        const cached = getCachedRepos(cacheKey)
+        if (isGithubRateLimitError(error) && cached && cached.length > 0) {
+          setRepos(cached)
+          setReposError(null)
+          return
+        }
         setReposError(
-          error instanceof Error ? error.message : t('dashboard.repoLoadFailed'),
+          error instanceof Error ? error.message : '레포지토리를 불러오지 못했습니다.',
         )
       })
       .finally(() => {
@@ -121,7 +128,7 @@ export function NewPipelinePage() {
     return () => {
       mounted = false
     }
-  }, [token, cacheKey, logout, navigate, t])
+  }, [token, cacheKey, logout, navigate])
 
   const filteredRepos = useMemo(() => {
     return repos.filter((repo) => {
