@@ -52,6 +52,7 @@ import {
 import { getLanguageColor } from '@/lib/languageColors'
 import { useAuth } from '@/contexts/AuthContext'
 import { getAuthCacheKey } from '@/contexts/AuthContext'
+import { useLanguage } from '@/contexts/LanguageContext'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -219,6 +220,7 @@ function scoreTone(score: number): { color: string } {
 export function DashboardPage() {
   const navigate = useNavigate()
   const { token, user, logout } = useAuth()
+  const { locale, t } = useLanguage()
   const cacheKey = getAuthCacheKey(token, user)
   const legacyTokenCacheKey = token && user ? token.slice(0, 16) : null
   const [activeTab, setActiveTab] = useState<DashboardTab>('repo')
@@ -251,6 +253,10 @@ export function DashboardPage() {
   const loadingTimerRef = useRef<number | null>(null)
 
   useEffect(() => {
+    dayjs.locale(locale)
+  }, [locale])
+
+  useEffect(() => {
     if (!token) {
       setRepos([])
       return
@@ -279,7 +285,7 @@ export function DashboardPage() {
           return
         }
         setReposError(
-          error instanceof Error ? error.message : '레포지토리를 불러오지 못했습니다.',
+          error instanceof Error ? error.message : t('dashboard.repoLoadFailed'),
         )
       })
       .finally(() => {
@@ -291,7 +297,7 @@ export function DashboardPage() {
     return () => {
       mounted = false
     }
-  }, [token, cacheKey])
+  }, [token, cacheKey, logout, navigate, t])
 
   useEffect(() => {
     if (!token) {
@@ -368,7 +374,7 @@ export function DashboardPage() {
       } catch (error) {
         if (cancelled) return
         setJobsError(
-          error instanceof Error ? error.message : '파이프라인 결과를 불러오지 못했습니다.',
+          error instanceof Error ? error.message : t('dashboard.jobsLoadFailed'),
         )
       } finally {
         if (!cancelled && initial) setIsJobsLoading(false)
@@ -381,7 +387,7 @@ export function DashboardPage() {
       cancelled = true
       if (timer !== null) window.clearTimeout(timer)
     }
-  }, [token, cacheKey, legacyTokenCacheKey])
+  }, [token, cacheKey, legacyTokenCacheKey, t])
 
   const triggerLoading = () => {
     if (loadingTimerRef.current) {
@@ -462,7 +468,7 @@ export function DashboardPage() {
       labels: chartPipelines.map((item) => item.id),
       datasets: [
         {
-          label: '보안 점수 추이',
+          label: t('dashboard.scoreTrend'),
           data: chartPipelines.map((item) => item.score),
           borderColor: '#45bd87',
           backgroundColor: '#45bd87',
@@ -477,7 +483,7 @@ export function DashboardPage() {
         },
       ],
     }),
-    [chartPipelines],
+    [chartPipelines, t],
   )
 
   return (
@@ -485,22 +491,22 @@ export function DashboardPage() {
       <section className="space-y-6">
         <div className="flex flex-col justify-between gap-5 md:flex-row md:items-end">
           <div>
-            <h1 className="text-4xl font-bold">대시보드</h1>
+            <h1 className="text-4xl font-bold">{t('dashboard.title')}</h1>
             <p className="mt-2 text-gray-200">
-              레포지토리를 관리하고 파이프라인 실행 결과를 확인하세요
+              {t('dashboard.description')}
             </p>
           </div>
           <Button asChild size="lg" className="text-gray-900! shadow-none">
             <Link to="/pipeline/new" className="text-gray-900!">
-              <Play className="mr-2 h-4 w-4 text-gray-900" /> 새 파이프라인
+              <Play className="mr-2 h-4 w-4 text-gray-900" /> {t('common.newPipeline')}
             </Link>
           </Button>
         </div>
 
         <div className="inline-flex w-fit items-center rounded-xl border border-white/10 bg-[#2A2A2A] p-1">
           {([
-            { key: 'repo', label: '내 레포지토리', icon: BookOpen, count: repos.length },
-            { key: 'pipeline', label: '파이프라인 결과', icon: Activity, count: pipelines.length },
+            { key: 'repo', label: t('dashboard.repoTab'), icon: BookOpen, count: repos.length },
+            { key: 'pipeline', label: t('dashboard.pipelineTab'), icon: Activity, count: pipelines.length },
           ] as const).map(({ key, label, icon: Icon, count }) => {
             const active = activeTab === key
             return (
@@ -543,7 +549,7 @@ export function DashboardPage() {
             >
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
             <p className="inline-flex items-center gap-2 text-[14px] text-[#A1A1A1]">
-              <Eye className="h-4 w-4 text-[#6EE7B7]" /> 탐지 활성: {detectionOnCount}/{repos.length}
+              <Eye className="h-4 w-4 text-[#6EE7B7]" /> {t('dashboard.detectActive')}: {detectionOnCount}/{repos.length}
             </p>
 
             <label className="relative block w-full md:max-w-md">
@@ -554,7 +560,7 @@ export function DashboardPage() {
                   triggerLoading()
                   setSearchInput(event.target.value)
                 }}
-                placeholder="레포지토리 검색..."
+                placeholder={t('dashboard.repoSearch')}
                 className="h-11 w-full rounded-xl border border-white/10 bg-[#262626] pl-10 pr-3 text-sm text-gray-50 outline-none ring-green-500/45 placeholder:text-gray-300 focus:ring"
               />
             </label>
@@ -569,7 +575,7 @@ export function DashboardPage() {
               </Card>
             ) : filteredRepos.length === 0 ? (
               <Card className="p-4 text-center text-gray-200">
-                레포지토리가 없습니다. GitHub 연동 후 레포지토리 추가를 진행하세요.
+                {t('dashboard.noRepos')}
               </Card>
             ) : (
               filteredRepos.map((repo) => (
@@ -603,7 +609,7 @@ export function DashboardPage() {
                       </div>
                       <p className="mt-2 text-[12px] text-[#6B7280]">{repo.description}</p>
                       <p className="mt-5 flex flex-wrap items-center gap-4 text-[12px] text-[#6B7280]">
-                        <span>업데이트: {dayjs(repo.updatedAt).fromNow()}</span>
+                        <span>{t('dashboard.updated')}: {dayjs(repo.updatedAt).fromNow()}</span>
                         <span className="inline-flex items-center gap-1">
                           <Star className="h-4 w-4" /> {repo.stars}
                         </span>
@@ -636,13 +642,13 @@ export function DashboardPage() {
                         ))}
                         {repo.branches.length > 4 ? (
                           <Badge className="inline-flex items-center gap-1 rounded-full border-white/20 bg-[#3A3A3A] px-3 py-1 text-[12px] text-[#9CA3AF]">
-                            +{repo.branches.length - 4}개
+                            {t('dashboard.moreCount', { count: repo.branches.length - 4 })}
                           </Badge>
                         ) : null}
                       </div>
                       <div className="inline-flex items-center gap-2 text-[12px] text-[#D1D5DB]">
                         <Eye className="h-4 w-4 text-[#34D399]" />
-                        탐지
+                        {t('dashboard.detect')}
                         <button
                           type="button"
                           onClick={(event) => {
@@ -660,7 +666,7 @@ export function DashboardPage() {
                           className={`relative inline-flex h-6 w-11 items-center rounded-full transition ${
                             repo.detectEnabled ? 'bg-green-500' : 'bg-gray-500'
                           }`}
-                          aria-label="탐지 토글"
+                          aria-label={t('dashboard.detectToggle')}
                         >
                           <span
                             className={`inline-block h-5 w-5 transform rounded-full bg-white transition ${
@@ -689,7 +695,7 @@ export function DashboardPage() {
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <Card className="p-4">
                 <div className="flex items-start justify-between">
-                  <p className="text-[14px] text-[#6B7280]">전체 실행</p>
+                  <p className="text-[14px] text-[#6B7280]">{t('dashboard.totalRuns')}</p>
                   <Database className="h-6 w-6 text-[#6B7280]" />
                 </div>
                 <p className="mt-6 text-[32px] font-bold leading-none text-white">
@@ -698,7 +704,7 @@ export function DashboardPage() {
               </Card>
               <Card className="p-4">
                 <div className="flex items-start justify-between">
-                  <p className="text-[14px] text-[#6B7280]">성공률</p>
+                  <p className="text-[14px] text-[#6B7280]">{t('dashboard.successRate')}</p>
                   <Activity className="h-6 w-6 text-[#6B7280]" />
                 </div>
                 <p className="mt-6 text-[32px] font-bold leading-none text-white">
@@ -707,7 +713,7 @@ export function DashboardPage() {
               </Card>
               <Card className="p-4">
                 <div className="flex items-start justify-between">
-                  <p className="text-[14px] text-[#6B7280]">평균 보안 점수</p>
+                  <p className="text-[14px] text-[#6B7280]">{t('dashboard.avgSecurityScore')}</p>
                   <Shield className="h-6 w-6 text-[#6B7280]" />
                 </div>
                 <p className="mt-6 text-[32px] font-bold leading-none text-white">
@@ -716,7 +722,7 @@ export function DashboardPage() {
               </Card>
               <Card className="p-4">
                 <div className="flex items-start justify-between">
-                  <p className="text-[14px] text-[#6B7280]">평균 소요 시간</p>
+                  <p className="text-[14px] text-[#6B7280]">{t('dashboard.avgDuration')}</p>
                   <Clock3 className="h-6 w-6 text-[#6B7280]" />
                 </div>
                 <p className="mt-6 text-[32px] font-bold leading-none text-white">
@@ -726,7 +732,7 @@ export function DashboardPage() {
             </div>
 
             <div className="mt-6 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-              <h2 className="flex h-11 items-center text-[28px] font-extrabold leading-none text-white">파이프라인 실행 기록</h2>
+              <h2 className="flex h-11 items-center text-[28px] font-extrabold leading-none text-white">{t('dashboard.runHistory')}</h2>
               <label className="relative block w-full md:max-w-md">
                 <Search className="pointer-events-none absolute left-3 top-3.5 h-4 w-4 text-gray-300" />
                 <input
@@ -735,14 +741,14 @@ export function DashboardPage() {
                     triggerLoading()
                     setSearchInput(event.target.value)
                   }}
-                  placeholder="레포지토리 검색..."
+                  placeholder={t('dashboard.repoSearch')}
                   className="h-11 w-full rounded-xl border border-white/10 bg-[#262626] pl-10 pr-3 text-sm text-gray-50 outline-none ring-green-500/45 placeholder:text-gray-300 focus:ring"
                 />
               </label>
             </div>
 
             <Card className="p-4">
-              <p className="mb-3 text-sm text-gray-200">실행별 보안 점수 추이</p>
+              <p className="mb-3 text-sm text-gray-200">{t('dashboard.scoreTrend')}</p>
               <div className="h-52">
                 <Line
                   data={chartData}
@@ -776,7 +782,7 @@ export function DashboardPage() {
               <Card className="p-4 text-center text-[#FCA5A5]">{jobsError}</Card>
             ) : filteredPipelines.length === 0 ? (
               <Card className="p-4 text-center text-gray-200">
-                실행 기록이 없습니다. 새 파이프라인을 생성하세요.
+                {t('dashboard.noRuns')}
               </Card>
             ) : (
               filteredPipelines.map((run) => (
@@ -803,7 +809,7 @@ export function DashboardPage() {
                         {run.status === 'running' || run.status === 'queued' ? (
                           <Badge className="border-[#F59E0B] bg-[#78350F] px-2 py-0.5 text-[11px] text-[#FCD34D]">
                             <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[#FCD34D]" />
-                            {run.status === 'running' ? '실행 중' : '대기 중'}
+                            {run.status === 'running' ? t('dashboard.running') : t('dashboard.queued')}
                           </Badge>
                         ) : null}
                         {run.verdict ? (
@@ -832,7 +838,7 @@ export function DashboardPage() {
                           </span>
                         ) : null}
                         <span className="inline-flex items-center gap-1 text-[12px] text-[#6B7280]">
-                          <Shield className="h-4 w-4" /> {run.totalFindings} findings
+                          <Shield className="h-4 w-4" /> {run.totalFindings} {t('dashboard.findings')}
                         </span>
                       </div>
 
@@ -868,15 +874,18 @@ export function DashboardPage() {
                           <div className="mb-2 flex items-center justify-between text-sm">
                             <span className="text-[10px] text-[#E5E7EB]">
                               {run.currentStepName
-                                ? `${run.currentStepName} 진행 중...`
+                                ? t('dashboard.stepRunning', { step: run.currentStepName })
                                 : run.status === 'queued'
-                                  ? '대기 중...'
-                                  : '진행 중...'}
+                                  ? `${t('dashboard.queued')}...`
+                                  : t('dashboard.runningEllipsis')}
                             </span>
                             <span className="text-[12px] text-[#FCD34D]">
                               {run.totalSteps > 0
-                                ? `${run.completedSteps}/${run.totalSteps} 단계`
-                                : '결과 대기'}
+                                ? t('dashboard.stepProgress', {
+                                    completed: run.completedSteps,
+                                    total: run.totalSteps,
+                                  })
+                                : t('dashboard.waitingResult')}
                             </span>
                           </div>
                           <div className="h-2.5 w-full overflow-hidden rounded-full bg-[#404040]">
@@ -895,7 +904,7 @@ export function DashboardPage() {
                       ) : (
                         <div>
                           <div className="mb-2 flex items-center justify-between text-sm">
-                            <span className="text-[10px] text-[#E5E7EB]">보안 점수</span>
+                            <span className="text-[10px] text-[#E5E7EB]">{t('dashboard.securityScore')}</span>
                             <span
                               className="text-[14px] font-semibold"
                               style={{ color: scoreTone(run.score).color }}
@@ -930,7 +939,7 @@ export function DashboardPage() {
                           })
                         }}
                         className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-[#5B5B5B] bg-[#2E2E2E] text-[#22D3EE] transition-colors hover:bg-[#3A3A3A]"
-                        aria-label="실행 페이지 보기"
+                        aria-label={t('dashboard.viewRun')}
                       >
                         <GitBranch className="h-4 w-4" />
                       </button>
@@ -952,13 +961,13 @@ export function DashboardPage() {
                           })
                         }}
                         className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-[#5B5B5B] bg-[#2E2E2E] text-[#6366F1] transition-colors hover:bg-[#3A3A3A] disabled:cursor-not-allowed disabled:text-[#4B5563] disabled:hover:bg-[#2E2E2E]"
-                        aria-label="결과 페이지 보기"
+                        aria-label={t('dashboard.viewResult')}
                         title={
                           run.status === 'success' ||
                           run.status === 'failed' ||
                           run.status === 'cancelled'
-                            ? '결과 페이지 보기'
-                            : '파이프라인 종료 후 활성화됩니다'
+                            ? t('dashboard.viewResult')
+                            : t('dashboard.resultEnabledAfterDone')
                         }
                       >
                         <Copy className="h-4 w-4" />
@@ -967,7 +976,7 @@ export function DashboardPage() {
                         type="button"
                         onClick={() => setDeleteTargetId(run.jobId)}
                         className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-[#5B5B5B] bg-[#2E2E2E] text-[#EF4444]"
-                        aria-label="삭제"
+                        aria-label={t('dashboard.delete')}
                       >
                         <Trash2 className="h-4 w-4" />
                       </button>
@@ -984,17 +993,20 @@ export function DashboardPage() {
       <Dialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTargetId(null)}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>실행 기록을 삭제할까요?</DialogTitle>
+            <DialogTitle>{t('dashboard.deleteTitle')}</DialogTitle>
             <DialogDescription>
               {deleteTarget
-                ? `${deleteTarget.id} (${deleteTarget.repoName || deleteTarget.jobId}) 항목을 목록에서 제거합니다. 백엔드 데이터는 유지됩니다.`
+                ? t('dashboard.deleteDescription', {
+                    id: deleteTarget.id,
+                    name: deleteTarget.repoName || deleteTarget.jobId,
+                  })
                 : ''}
             </DialogDescription>
           </DialogHeader>
 
           <DialogFooter>
             <Button variant="outline" onClick={() => setDeleteTargetId(null)}>
-              취소
+              {t('dashboard.cancel')}
             </Button>
             <Button
               onClick={() => {
@@ -1011,7 +1023,7 @@ export function DashboardPage() {
               }}
               className="bg-[#EF4444] text-white shadow-none hover:bg-[#DC2626]"
             >
-              삭제
+              {t('dashboard.delete')}
             </Button>
           </DialogFooter>
         </DialogContent>

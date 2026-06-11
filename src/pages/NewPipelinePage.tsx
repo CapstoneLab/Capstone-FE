@@ -11,6 +11,7 @@ import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useAuth } from '@/contexts/AuthContext'
 import { getAuthCacheKey } from '@/contexts/AuthContext'
+import { useLanguage } from '@/contexts/LanguageContext'
 import {
   addLaunchedRepo,
   addTrackedJobId,
@@ -51,6 +52,7 @@ import {
 export function NewPipelinePage() {
   const navigate = useNavigate()
   const { token, user, logout } = useAuth()
+  const { t } = useLanguage()
   const cacheKey = getAuthCacheKey(token, user)
   const [search, setSearch] = useState('')
   const [repos, setRepos] = useState<RepositoryItem[]>(
@@ -107,7 +109,7 @@ export function NewPipelinePage() {
           return
         }
         setReposError(
-          error instanceof Error ? error.message : '레포지토리를 불러오지 못했습니다.',
+          error instanceof Error ? error.message : t('dashboard.repoLoadFailed'),
         )
       })
       .finally(() => {
@@ -119,7 +121,7 @@ export function NewPipelinePage() {
     return () => {
       mounted = false
     }
-  }, [token, cacheKey])
+  }, [token, cacheKey, logout, navigate, t])
 
   const filteredRepos = useMemo(() => {
     return repos.filter((repo) => {
@@ -268,7 +270,7 @@ export function NewPipelinePage() {
         : selectedVulnerabilityIds
       // Guard: never start a non-first-run pipeline with zero checks.
       if (checksToSend.length === 0) {
-        setStartError('최소 1개 이상의 검사 항목을 선택해 주세요.')
+        setStartError(t('pipelineNew.minSelectionError'))
         return
       }
       const repoUrlToSend =
@@ -281,7 +283,7 @@ export function NewPipelinePage() {
         commitSha: currentCommitSha || undefined,
         isFirstRun: isFirstRunForRepo,
       })
-      if (!jobId) throw new Error('서버가 job_id를 반환하지 않았습니다.')
+      if (!jobId) throw new Error(t('pipelineNew.serverNoJobId'))
       addTrackedJobId(cacheKey, jobId)
       const nextLaunched = addLaunchedRepo(cacheKey, selectedRepo.name)
       setLaunchedRepoUrls(nextLaunched)
@@ -302,7 +304,7 @@ export function NewPipelinePage() {
         return
       }
       setStartError(
-        error instanceof Error ? error.message : '파이프라인을 시작하지 못했습니다.',
+        error instanceof Error ? error.message : t('pipelineNew.startFailed'),
       )
     } finally {
       setIsStarting(false)
@@ -322,7 +324,7 @@ export function NewPipelinePage() {
       setStartError(
         error instanceof Error
           ? error.message
-          : '기존 파이프라인 취소에 실패했습니다.',
+          : t('pipelineNew.cancelExistingFailed'),
       )
       setConflictDialog(null)
     } finally {
@@ -334,15 +336,15 @@ export function NewPipelinePage() {
     <MainLayout>
       <section className="w-full space-y-5">
         <div>
-          <h1 className="text-5xl font-extrabold text-white md:text-4xl">새 파이프라인</h1>
+          <h1 className="text-5xl font-extrabold text-white md:text-4xl">{t('pipelineNew.title')}</h1>
           <p className="mt-2 text-sm text-[#6B7280]">
-            GitHub 레포지토리를 선택하고 파이프라인을 실행해보세요
+            {t('pipelineNew.description')}
           </p>
         </div>
 
         <Card className="border-[#404040] bg-[#262626] p-4">
           <div className="flex items-center gap-2 text-[24px] font-bold text-white">
-            <SquareMousePointer className="h-6 w-6 text-[#34D399]" /> 레포지토리 선택
+            <SquareMousePointer className="h-6 w-6 text-[#34D399]" /> {t('pipelineNew.selectRepo')}
           </div>
 
           <label className="relative mt-4 block">
@@ -350,7 +352,7 @@ export function NewPipelinePage() {
             <Input
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="레포지토리 검색..."
+              placeholder={t('dashboard.repoSearch')}
               className="pl-10"
             />
           </label>
@@ -370,7 +372,7 @@ export function NewPipelinePage() {
             </p>
           ) : filteredRepos.length === 0 ? (
             <p className="mt-4 rounded-lg border border-[#404040] bg-[#1E1E1E] p-4 text-center text-sm text-[#9CA3AF]">
-              표시할 레포지토리가 없습니다.
+              {t('pipelineNew.noRepos')}
             </p>
           ) : (
           <RadioGroup
@@ -413,7 +415,7 @@ export function NewPipelinePage() {
 
                 <div className="flex items-center gap-4 text-[12px] text-[#6B7280]">
                   <span className="inline-flex items-center gap-1">
-                    <GitBranch className="h-3.5 w-3.5" /> {repo.branches.length}개
+                    <GitBranch className="h-3.5 w-3.5" /> {t('pipelineNew.branchCount', { count: repo.branches.length })}
                   </span>
                   <span className="inline-flex items-center gap-1">
                     <Star className="h-3.5 w-3.5" /> {repo.stars}
@@ -440,12 +442,12 @@ export function NewPipelinePage() {
 
               <div className="w-full md:w-56">
                 <p className="inline-flex items-center gap-1 text-[12px] text-[#6B7280]">
-                  <GitBranch className="h-4 w-4" /> 실행 브랜치
+                  <GitBranch className="h-4 w-4" /> {t('pipelineNew.runBranch')}
                 </p>
                 <div className="mt-2">
                   <Select value={selectedBranch} onValueChange={setSelectedBranch}>
                     <SelectTrigger>
-                      <SelectValue placeholder="브랜치 선택" />
+                      <SelectValue placeholder={t('pipelineNew.selectBranch')} />
                     </SelectTrigger>
                     <SelectContent>
                       {selectedRepo.branches.map((branch) => (
@@ -466,9 +468,9 @@ export function NewPipelinePage() {
                 <div className="flex items-start gap-2 rounded-lg border border-[#3ECF8E]/40 bg-[#065F46]/20 p-3 text-[12px] text-[#A7F3D0]">
                   <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                   <div>
-                    <p className="font-semibold text-[#D1FAE5]">이 레포지토리의 첫 파이프라인 실행입니다.</p>
+                    <p className="font-semibold text-[#D1FAE5]">{t('pipelineNew.firstRunTitle')}</p>
                     <p className="mt-1 text-[#A7F3D0]">
-                      베이스라인 보안 평가를 위해 전체 검사 항목으로 진행됩니다. 다음 실행부터는 항목을 자유롭게 선택할 수 있어요.
+                      {t('pipelineNew.firstRunDescription')}
                     </p>
                   </div>
                 </div>
@@ -476,12 +478,15 @@ export function NewPipelinePage() {
 
               <div className="rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
                 <div className="flex items-center justify-between">
-                  <p className="text-[13px] font-semibold text-[#D1D5DB]">취약점 검사 항목 선택</p>
+                  <p className="text-[13px] font-semibold text-[#D1D5DB]">{t('pipelineNew.checkItems')}</p>
                   <div className="flex items-center gap-3">
                     <p className="text-[12px] text-[#6B7280]">
                       {isFirstRunForRepo
-                        ? `전체 ${allVulnerabilityIds.length}개 자동 선택`
-                        : `${selectedVulnerabilityIds.length} / ${allVulnerabilityIds.length}개 선택`}
+                        ? t('pipelineNew.allAutoSelected', { count: allVulnerabilityIds.length })
+                        : t('pipelineNew.selectedCount', {
+                            selected: selectedVulnerabilityIds.length,
+                            total: allVulnerabilityIds.length,
+                          })}
                     </p>
                     {!isFirstRunForRepo ? (
                       <button
@@ -490,8 +495,8 @@ export function NewPipelinePage() {
                         className="rounded-md border border-[#404040] px-2 py-1 text-[11px] text-[#9CA3AF] hover:border-[#3ECF8E]/50 hover:text-[#D1FAE5]"
                       >
                         {selectedVulnerabilityIds.length === allVulnerabilityIds.length
-                          ? '전체 해제'
-                          : '전체 선택'}
+                          ? t('pipelineNew.clearAll')
+                          : t('pipelineNew.selectAll')}
                       </button>
                     ) : null}
                   </div>
@@ -527,7 +532,7 @@ export function NewPipelinePage() {
                               onClick={() => toggleSeverityGroup(severity)}
                               className="text-[11px] text-[#6B7280] hover:text-[#D1FAE5]"
                             >
-                              {allInGroupSelected ? '해제' : '전체 선택'}
+                              {allInGroupSelected ? t('pipelineNew.clear') : t('pipelineNew.selectAll')}
                             </button>
                           ) : null}
                         </div>
@@ -574,7 +579,7 @@ export function NewPipelinePage() {
 
                 {hasNoSelection ? (
                   <p className="mt-3 rounded-md border border-[#7F1D1D] bg-[#450A0A]/40 p-2 text-center text-[12px] text-[#FCA5A5]">
-                    최소 1개 이상의 검사 항목을 선택해야 파이프라인을 실행할 수 있습니다.
+                    {t('pipelineNew.minSelection')}
                   </p>
                 ) : null}
               </div>
@@ -594,7 +599,7 @@ export function NewPipelinePage() {
             onClick={() => navigate('/dashboard')}
             disabled={isStarting}
           >
-            취소
+            {t('dashboard.cancel')}
           </Button>
           <Button
             onClick={() => void handleStartPipeline()}
@@ -606,7 +611,7 @@ export function NewPipelinePage() {
             ) : (
               <Play className="mr-1 h-4 w-4" />
             )}
-            {isStarting ? '시작 중...' : '파이프라인 실행'}
+            {isStarting ? t('pipelineNew.starting') : t('pipelineNew.runPipeline')}
           </Button>
         </div>
       </section>
@@ -619,12 +624,14 @@ export function NewPipelinePage() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>이미 실행 중인 파이프라인이 있어요</DialogTitle>
+            <DialogTitle>{t('pipelineNew.conflictTitle')}</DialogTitle>
             <DialogDescription>
-              {selectedRepo?.name || '이 레포'}
-              {selectedBranch ? ` (${selectedBranch})` : ''}에서 이미 파이프라인이 돌아가고 있습니다.
+              {t('pipelineNew.conflictDescription', {
+                repo: selectedRepo?.name || t('pipelineNew.thisRepo'),
+                branch: selectedBranch ? ` (${selectedBranch})` : '',
+              })}
               <br />
-              지금 돌고 있는 파이프라인을 취소하고 새로 실행할까요?
+              {t('pipelineNew.conflictQuestion')}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -633,19 +640,19 @@ export function NewPipelinePage() {
               onClick={() => setConflictDialog(null)}
               disabled={isResolvingConflict}
             >
-              아니오
+              {t('pipelineNew.no')}
             </Button>
             <Button
               onClick={() => void handleConfirmConflict()}
               disabled={isResolvingConflict || !conflictDialog?.existingJobId}
               className="bg-[#34D399] text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
             >
-              {isResolvingConflict ? '처리 중...' : '취소하고 새로 실행'}
+              {isResolvingConflict ? t('pipelineNew.processing') : t('pipelineNew.cancelAndRestart')}
             </Button>
           </DialogFooter>
           {!conflictDialog?.existingJobId ? (
             <p className="mt-3 text-center text-xs text-[#FCA5A5]">
-              기존 job ID를 알 수 없어 자동 취소가 불가합니다. 대시보드에서 직접 취소해 주세요.
+              {t('pipelineNew.missingJobId')}
             </p>
           ) : null}
         </DialogContent>

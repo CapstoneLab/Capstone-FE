@@ -21,6 +21,7 @@ import { useLocation, useNavigate, useNavigationType } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
 import { useAuth } from '@/contexts/AuthContext'
 import { useTheme, type ThemePreference } from '@/contexts/ThemeContext'
+import { LanguageSelect } from './LanguageSelect'
 import defaultProfileSvg from '@/assets/default-profile.svg'
 import appLogo from '@/assets/logo.png'
 import {
@@ -295,6 +296,8 @@ export function NativeFrameBar() {
         </div>
 
         <div className="flex items-center gap-1 [-webkit-app-region:no-drag]">
+          <LanguageSelect compact />
+
           {/* Theme switcher — placed in the right-side group so it lives in
               the titlebar but never overlaps the centered title. Three
               options: dark / light / system (system is the default). */}

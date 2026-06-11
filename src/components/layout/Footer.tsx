@@ -1,7 +1,10 @@
 import { Link } from 'react-router-dom'
 import { GitHubIcon } from '@/components/ui/github-icon'
+import { useLanguage } from '@/contexts/LanguageContext'
 
 export function Footer() {
+  const { t } = useLanguage()
+
   return (
     <footer className="border-t border-gray-600/70 bg-gray-800/60">
       <div className="mx-auto max-w-6xl px-6 py-12">
@@ -11,8 +14,7 @@ export function Footer() {
               <span className="text-green-400">Secu</span>Pipeline
             </p>
             <p className="mt-3 max-w-sm text-sm leading-6 text-gray-200">
-              자체 보안 CI/CD 자동화 데스크탑 앱으로 레포지토리 보안 분석부터 파이프라인 실행 결과까지
-              한 번에 관리합니다.
+              {t('footer.description')}
             </p>
             <a
               href="https://github.com/"
@@ -25,59 +27,59 @@ export function Footer() {
           </div>
 
           <div>
-            <h4 className="font-semibold text-gray-50">문서</h4>
+            <h4 className="font-semibold text-gray-50">{t('footer.docs')}</h4>
             <ul className="mt-3 space-y-2 text-sm text-gray-200">
               <li>
                 <Link to="/docs#getting-started" className="hover:text-green-300">
-                  시작하기
+                  {t('footer.gettingStarted')}
                 </Link>
               </li>
               <li>
                 <Link to="/docs#usage" className="hover:text-green-300">
-                  사용 가이드
+                  {t('footer.usage')}
                 </Link>
               </li>
               <li>
                 <Link to="/docs#security-checks" className="hover:text-green-300">
-                  보안 검사 항목
+                  {t('footer.securityChecks')}
                 </Link>
               </li>
               <li>
                 <Link to="/docs#pipeline-steps" className="hover:text-green-300">
-                  파이프라인 단계
+                  {t('footer.pipelineSteps')}
                 </Link>
               </li>
             </ul>
           </div>
 
           <div>
-            <h4 className="font-semibold text-gray-50">지원</h4>
+            <h4 className="font-semibold text-gray-50">{t('footer.support')}</h4>
             <ul className="mt-3 space-y-2 text-sm text-gray-200">
               <li>
                 <Link to="/docs#scoring" className="hover:text-green-300">
-                  보안 점수 & 등급
+                  {t('footer.scoring')}
                 </Link>
               </li>
               <li>
                 <Link to="/docs#troubleshooting" className="hover:text-green-300">
-                  자주 묻는 질문
+                  {t('footer.faq')}
                 </Link>
               </li>
               <li>
                 <Link to="/docs#architecture" className="hover:text-green-300">
-                  아키텍처
+                  {t('footer.architecture')}
                 </Link>
               </li>
               <li>
                 <a href="mailto:support@secupipeline.dev" className="hover:text-green-300">
-                  지원 문의
+                  {t('footer.contact')}
                 </a>
               </li>
             </ul>
           </div>
         </div>
         <hr className="my-8 border-gray-500/70" />
-        <p className="text-xs text-gray-300">© 2026 Secupipeline. All rights reserved.</p>
+        <p className="text-xs text-gray-300">{t('footer.rights')}</p>
       </div>
     </footer>
   )

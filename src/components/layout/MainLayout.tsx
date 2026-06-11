@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Clock3, Download, FileClock, Play } from 'lucide-react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
+import { useLanguage } from '@/contexts/LanguageContext'
 import { Footer } from './Footer'
 
 type MainLayoutProps = PropsWithChildren<{
@@ -17,6 +18,7 @@ type MainLayoutProps = PropsWithChildren<{
 export function MainLayout({ children, pipelineElapsed, onResultDownload }: MainLayoutProps) {
   const { pathname } = useLocation()
   const navigate = useNavigate()
+  const { t } = useLanguage()
   const [showPageHeader, setShowPageHeader] = useState(false)
   const [scrollbarWidth, setScrollbarWidth] = useState(0)
   const scrollContainerRef = useRef<HTMLDivElement | null>(null)
@@ -24,48 +26,48 @@ export function MainLayout({ children, pipelineElapsed, onResultDownload }: Main
   const pageMeta = useMemo(() => {
     if (pathname.startsWith('/dashboard')) {
       return {
-        title: '대시보드',
-        description: '레포지토리를 관리하고 파이프라인 실행 결과를 확인하세요',
+        title: t('layout.dashboard.title'),
+        description: t('layout.dashboard.description'),
       }
     }
     if (pathname.startsWith('/repository') || pathname.startsWith('/dashboard/repository/')) {
       return {
-        title: '레포지토리 상세',
-        description: '레포지토리 배포 정보, 파이프라인 상태, 브랜치 구성을 확인하세요',
+        title: t('layout.repository.title'),
+        description: t('layout.repository.description'),
       }
     }
     if (pathname.startsWith('/pipeline/new')) {
       return {
-        title: '새 파이프라인',
-        description: 'GitHub 레포지토리를 선택하고 파이프라인 실행을 시작하세요',
+        title: t('layout.pipelineNew.title'),
+        description: t('layout.pipelineNew.description'),
       }
     }
     if (pathname.startsWith('/pipeline/progress')) {
       return {
-        title: '파이프라인 진행',
-        description: '각 단계별 실행 로그와 진행 상태를 확인하세요',
+        title: t('layout.pipelineProgress.title'),
+        description: t('layout.pipelineProgress.description'),
       }
     }
     if (pathname.startsWith('/pipeline/result')) {
       return {
-        title: '보안 분석 결과',
-        description: '보안 점수와 취약점 분석 결과를 확인하세요',
+        title: t('layout.pipelineResult.title'),
+        description: t('layout.pipelineResult.description'),
       }
     }
     if (pathname.startsWith('/docs')) {
       return {
-        title: '문서',
-        description: '시작 가이드와 보안 분석 문서를 확인하세요',
+        title: t('layout.docs.title'),
+        description: t('layout.docs.description'),
       }
     }
     if (pathname.startsWith('/auth')) {
       return {
-        title: '로그인',
-        description: 'GitHub 계정 연동으로 빠르게 시작하세요',
+        title: t('layout.auth.title'),
+        description: t('layout.auth.description'),
       }
     }
     return null
-  }, [pathname])
+  }, [pathname, t])
 
   useEffect(() => {
     const target = scrollContainerRef.current
@@ -113,7 +115,7 @@ export function MainLayout({ children, pipelineElapsed, onResultDownload }: Main
           onClick={() => navigate('/pipeline/new')}
           className="h-9 bg-emerald-400 px-3 text-xs font-semibold text-[#111827] shadow-none hover:bg-emerald-300"
         >
-          <Play className="mr-1 h-3.5 w-3.5" />새 파이프라인
+          <Play className="mr-1 h-3.5 w-3.5" />{t('common.newPipeline')}
         </Button>
       )
     }
@@ -121,7 +123,7 @@ export function MainLayout({ children, pipelineElapsed, onResultDownload }: Main
     if (pathname.startsWith('/pipeline/progress')) {
       return (
         <div className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-gray-600/75 bg-[#242424] px-3 text-xs text-gray-200">
-          <Clock3 className="h-3.5 w-3.5 text-emerald-300" />실행 시간 {pipelineElapsed || '—'}
+          <Clock3 className="h-3.5 w-3.5 text-emerald-300" />{t('common.runningTime')} {pipelineElapsed || '-'}
         </div>
       )
     }
@@ -135,21 +137,21 @@ export function MainLayout({ children, pipelineElapsed, onResultDownload }: Main
             onClick={() => navigate('/approvals')}
             className="h-9 border-[#404040] bg-transparent px-3 text-xs text-[#D1D5DB] hover:bg-[#262626]"
           >
-            <FileClock className="mr-1.5 h-3.5 w-3.5" />감사 로그
+            <FileClock className="mr-1.5 h-3.5 w-3.5" />{t('common.auditLog')}
           </Button>
           <Button
             type="button"
             onClick={onResultDownload}
             className="h-9 border border-[#34D399] bg-[#34D399] px-3 text-xs font-semibold text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
           >
-          <Download className="mr-1.5 h-3.5 w-3.5" />결과 다운로드
+          <Download className="mr-1.5 h-3.5 w-3.5" />{t('common.downloadResult')}
           </Button>
         </div>
       )
     }
 
     return null
-  }, [navigate, pathname, pipelineElapsed, onResultDownload])
+  }, [navigate, pathname, pipelineElapsed, onResultDownload, t])
 
   return (
     <div className="relative h-full overflow-hidden bg-[#1E1E1E] text-gray-50">

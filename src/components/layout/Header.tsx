@@ -1,7 +1,10 @@
 import { Link } from 'react-router-dom'
 import { GitHubIcon } from '@/components/ui/github-icon'
+import { useLanguage } from '@/contexts/LanguageContext'
 
 export function Header() {
+  const { t } = useLanguage()
+
   return (
     <header className="fixed left-0 right-0 top-9 z-40 border-b border-gray-600/75 bg-[#1E1E1E]/80 backdrop-blur-md">
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
@@ -14,13 +17,13 @@ export function Header() {
             target="_blank"
             rel="noreferrer"
             className="grid h-9 w-9 place-items-center rounded-xl border border-gray-500 bg-gray-700/70 text-gray-50 hover:border-green-400 hover:text-green-300"
-            aria-label="GitHub"
+            aria-label={t('common.github')}
           >
             <GitHubIcon className="h-4 w-4" />
           </a>
           <img
             src="https://i.pravatar.cc/64?img=12"
-            alt="프로필"
+            alt={t('common.profile')}
             className="h-9 w-9 rounded-full border border-gray-400/80 object-cover"
           />
         </div>

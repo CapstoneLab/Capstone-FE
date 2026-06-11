@@ -22,6 +22,7 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { useAuth } from '@/contexts/AuthContext'
 import { useTheme } from '@/contexts/ThemeContext'
+import { useLanguage } from '@/contexts/LanguageContext'
 import {
   computeSecurityScore,
   fetchJobDetail,
@@ -274,6 +275,7 @@ export function PipelineProgressPage() {
   const navigate = useNavigate()
   const { token } = useAuth()
   const { resolvedTheme } = useTheme()
+  const { t } = useLanguage()
   const { state } = useLocation()
   const locationState = (state ?? {}) as LocationState
   const jobId = locationState.jobId ?? ''
@@ -322,7 +324,7 @@ export function PipelineProgressPage() {
         setError(
           detailRes.reason instanceof Error
             ? detailRes.reason.message
-            : '분석 결과를 불러오지 못했습니다.',
+            : t('result.loadFailed'),
         )
       }
       setIsLoading(false)
@@ -331,7 +333,7 @@ export function PipelineProgressPage() {
     return () => {
       cancelled = true
     }
-  }, [jobId, token])
+  }, [jobId, token, t])
 
   useEffect(() => {
     if ((window as unknown as { hljs?: unknown }).hljs) {
@@ -423,6 +425,8 @@ export function PipelineProgressPage() {
   const effectiveVerdict: VerdictKind | null =
     vd?.verdict ?? legacyToVerdictKind(result?.verdict ?? detail?.verdict ?? null, jobStatus)
   const verdictCfg = effectiveVerdict ? VERDICT_CONFIG[effectiveVerdict] : null
+  const verdictLabel = effectiveVerdict ? t(`result.verdict.${effectiveVerdict}.label`) : ''
+  const verdictMessage = effectiveVerdict ? t(`result.verdict.${effectiveVerdict}.message`) : ''
   // Theme-aware gate-banner classes: the dark tints/pale text wash out on the
   // light card, so swap to the light palette when the resolved theme is light.
   const isLight = resolvedTheme === 'light'
@@ -453,7 +457,7 @@ export function PipelineProgressPage() {
       branch,
       completedAt: result?.completedAt ?? null,
       verdict: effectiveVerdict,
-      verdictLabel: verdictCfg?.label ?? '',
+      verdictLabel,
       score,
       scoreLabel,
       counts,
@@ -463,14 +467,14 @@ export function PipelineProgressPage() {
     }),
     [
       jobId, repoName, repoUrl, branch, result?.completedAt, effectiveVerdict,
-      verdictCfg?.label, score, scoreLabel, counts, inScopeFindings,
+      verdictLabel, score, scoreLabel, counts, inScopeFindings,
       outOfScopeFindings, vd?.selectedItems,
     ],
   )
 
   const scoreChartData = useMemo(
     () => ({
-      labels: ['보안 점수', '남은 점수'],
+      labels: [t('result.securityScore'), t('result.remainingScore')],
       datasets: [
         {
           // Track color follows the theme — #404040 reads as a heavy dark arc on
@@ -482,7 +486,7 @@ export function PipelineProgressPage() {
         },
       ],
     }),
-    [score, displayScoreColor, isLight],
+    [score, displayScoreColor, isLight, t],
   )
 
   const severityChartData = useMemo(
@@ -577,7 +581,7 @@ export function PipelineProgressPage() {
             <Doughnut data={chartData} options={severityChartOptions} />
             <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
               <span className="text-[26px] font-bold leading-none text-white">{total}</span>
-              <span className="mt-0.5 text-[11px] text-[#9CA3AF]">건</span>
+              <span className="mt-0.5 text-[11px] text-[#9CA3AF]">{t('result.countUnit')}</span>
             </div>
           </div>
         ) : (
@@ -605,10 +609,10 @@ export function PipelineProgressPage() {
     return (
       <MainLayout>
         <Card className="p-6 text-center text-[#FCA5A5]">
-          job_id가 전달되지 않았습니다. 파이프라인을 다시 실행해 주세요.
+          {t('result.noJobId')}
         </Card>
         <div className="mt-3 flex justify-end">
-          <Button onClick={() => navigate('/pipeline/new')}>새 파이프라인</Button>
+          <Button onClick={() => navigate('/pipeline/new')}>{t('common.newPipeline')}</Button>
         </div>
       </MainLayout>
     )
@@ -619,7 +623,7 @@ export function PipelineProgressPage() {
       <MainLayout>
         <Card className="flex items-center justify-center gap-3 p-10 text-[#9CA3AF]">
           <Loader2 className="h-5 w-5 animate-spin text-[#34D399]" />
-          분석 결과를 불러오는 중...
+          {t('result.loading')}
         </Card>
       </MainLayout>
     )
@@ -636,9 +640,9 @@ export function PipelineProgressPage() {
             variant="outline"
             onClick={() => navigate('/pipeline/progress', { state: { jobId, repoName, branch } })}
           >
-            파이프라인 보기
+            {t('result.viewPipeline')}
           </Button>
-          <Button onClick={() => navigate('/dashboard')}>대시보드로</Button>
+          <Button onClick={() => navigate('/dashboard')}>{t('result.backDashboard')}</Button>
         </div>
       </MainLayout>
     )
@@ -687,7 +691,7 @@ export function PipelineProgressPage() {
           </span>
           {/* 항목명 + CWE 태그. policy_item == null 이면 "정책 항목 외" */}
           <span className="text-[14px] font-semibold text-white">
-            {item.policyItem || '정책 항목 외'}
+            {item.policyItem || t('result.policyItemOutside')}
           </span>
           {cwe ? (
             <span className="rounded-full border border-[#404040] px-2 py-0.5 text-[11px] text-[#9CA3AF]">
@@ -696,7 +700,7 @@ export function PipelineProgressPage() {
           ) : null}
           {!item.inScope ? (
             <span className="rounded-full border border-[#6B7280] px-2 py-0.5 text-[11px] text-[#9CA3AF]">
-              미검사
+              {t('result.unchecked')}
             </span>
           ) : null}
         </div>
@@ -731,22 +735,22 @@ export function PipelineProgressPage() {
                   <span className="h-2.5 w-2.5 rounded-full bg-[#22C55E]" />
                 </span>
                 <span className="truncate font-mono text-[11px] text-[#9CA3AF]">
-                  {location ?? '취약 코드'}
+                  {location ?? t('result.vulnerableCode')}
                 </span>
               </div>
               <button
                 type="button"
                 onClick={() => handleCopy(codeCopyKey, item.codeSnippet ?? '')}
-                title="코드 복사"
+                title={t('result.copyCode')}
                 className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-0.5 text-[11px] text-[#9CA3AF] transition-colors hover:text-white"
               >
                 {copiedKey === codeCopyKey ? (
                   <>
-                    <Check className="h-3 w-3" /> 복사됨
+                    <Check className="h-3 w-3" /> {t('result.copied')}
                   </>
                 ) : (
                   <>
-                    <Copy className="h-3 w-3" /> 복사
+                    <Copy className="h-3 w-3" /> {t('result.copy')}
                   </>
                 )}
               </button>
@@ -766,7 +770,7 @@ export function PipelineProgressPage() {
 
         {fullText ? (
           <div className="mt-3">
-            <p className="text-[12px] font-semibold text-[#D1D5DB]">설명</p>
+            <p className="text-[12px] font-semibold text-[#D1D5DB]">{t('result.description')}</p>
             <p className="mt-1 text-[12px] text-[#A3A3A3]">{fullText}</p>
           </div>
         ) : null}
@@ -775,7 +779,7 @@ export function PipelineProgressPage() {
           <details className="mt-3 rounded-lg border border-[#3ECF8E] bg-[#065F46] p-3">
             <summary className="flex cursor-pointer items-center justify-between gap-2 text-[14px] font-semibold text-[#D1FAE5]">
               <span className="inline-flex items-center gap-1">
-                <FileText className="h-3.5 w-3.5" /> AI 수정 제안
+                <FileText className="h-3.5 w-3.5" /> {t('result.aiSuggestion')}
               </span>
               <span
                 role="button"
@@ -790,16 +794,16 @@ export function PipelineProgressPage() {
                     handleCopy(aiCopyKey, item.aiSuggestion)
                   }
                 }}
-                title="제안 복사"
+                title={t('result.copySuggestion')}
                 className="inline-flex items-center gap-1 rounded-md border border-[#3ECF8E]/60 px-2 py-0.5 text-[11px] font-normal text-[#A7F3D0] transition-colors hover:bg-[#047857] hover:text-white"
               >
                 {copiedKey === aiCopyKey ? (
                   <>
-                    <Check className="h-3 w-3" /> 복사됨
+                    <Check className="h-3 w-3" /> {t('result.copied')}
                   </>
                 ) : (
                   <>
-                    <Copy className="h-3 w-3" /> 복사
+                    <Copy className="h-3 w-3" /> {t('result.copy')}
                   </>
                 )}
               </span>
@@ -817,16 +821,16 @@ export function PipelineProgressPage() {
         {/* Header */}
         <div className="flex items-start justify-between gap-3">
           <div>
-            <p className="text-[18px] font-bold text-white">보안 분석 결과</p>
+            <p className="text-[18px] font-bold text-white">{t('result.title')}</p>
             <p className="mt-2 flex items-center gap-2 text-[28px] font-bold leading-none text-white">
               <CodeXml className="h-7 w-7 text-[#34D399]" /> {repoName || jobId}
             </p>
             <p className="mt-1 flex flex-wrap items-center gap-x-2 text-[12px] text-[#6B7280]">
-              <span>브랜치 {branch || '-'}</span>
+              <span>{t('result.branch')} {branch || '-'}</span>
               {vd?.scannedCommitSha ? (
                 <span className="inline-flex items-center gap-1">
                   <GitCommitHorizontal className="h-3.5 w-3.5" />
-                  스캔 커밋: {vd.scannedCommitSha.slice(0, 12)}
+                  {t('result.scannedCommit')}: {vd.scannedCommitSha.slice(0, 12)}
                 </span>
               ) : null}
               <span>| ID: {jobId}</span>
@@ -840,7 +844,7 @@ export function PipelineProgressPage() {
               className="h-9 border-[#404040] bg-transparent px-3 text-xs text-[#D1D5DB] hover:bg-[#262626]"
             >
               <FileClock className="mr-1.5 h-3.5 w-3.5" />
-              감사 로그
+              {t('common.auditLog')}
             </Button>
             <Button
               type="button"
@@ -848,7 +852,7 @@ export function PipelineProgressPage() {
               className="h-9 border border-[#34D399] bg-[#34D399] px-3 text-xs font-semibold text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
             >
               <Download className="mr-1.5 h-3.5 w-3.5" />
-              결과 다운로드
+              {t('common.downloadResult')}
             </Button>
           </div>
         </div>
@@ -857,11 +861,11 @@ export function PipelineProgressPage() {
         {vd?.commitMismatch ? (
           <div className="rounded-xl border border-[#D97706] bg-[#78350F]/30 p-3">
             <p className="flex items-center gap-2 text-[13px] font-semibold text-[#FCD34D]">
-              <AlertTriangle className="h-4 w-4" /> 스캔 커밋 불일치
+              <AlertTriangle className="h-4 w-4" /> {t('result.commitMismatch')}
             </p>
             <p className="mt-1 text-[12px] text-[#FDE68A]">
-              요청 커밋을 가져오지 못해 브랜치 HEAD를 스캔했습니다 (force-push/rebase 추정).
-              {vd.requestedCommitSha ? ` 요청: ${vd.requestedCommitSha.slice(0, 12)}` : ''}
+              {t('result.commitMismatchDesc')}
+              {vd.requestedCommitSha ? ` ${t('result.requested')}: ${vd.requestedCommitSha.slice(0, 12)}` : ''}
             </p>
           </div>
         ) : null}
@@ -870,14 +874,14 @@ export function PipelineProgressPage() {
         <Card className="border-[#404040] bg-[#262626] p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="flex items-center gap-2 text-[16px] font-semibold text-white">
-              <ShieldCheck className="h-4 w-4 text-[#34D399]" /> 배포 게이트
+              <ShieldCheck className="h-4 w-4 text-[#34D399]" /> {t('result.deploymentGate')}
             </p>
             {verdictCfg ? (
               <span className="inline-flex items-center gap-2 text-[14px] font-semibold" style={{ color: accent }}>
-                현재 판정:
+                {t('result.currentVerdict')}:
                 <span className="inline-flex items-center gap-1.5">
                   <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: accent }} />
-                  {verdictCfg.label}
+                  {verdictLabel}
                 </span>
               </span>
             ) : null}
@@ -890,7 +894,7 @@ export function PipelineProgressPage() {
                 <div>
                   <p className={`flex items-center gap-2 text-[15px] font-semibold ${bannerTitleClass}`}>
                     <verdictCfg.icon className="h-4.5 w-4.5" />
-                    {verdictCfg.message}
+                    {verdictMessage}
                   </p>
                   {reasons.length > 0 ? (
                     <ul className={`mt-2 list-disc space-y-1 pl-5 text-[12px] ${bannerMsgClass}`}>
@@ -901,7 +905,7 @@ export function PipelineProgressPage() {
                   ) : null}
                   {effectiveVerdict === 'block' ? (
                     <p className={`mt-2 text-[12px] ${bannerMsgClass}`}>
-                      하드 차단입니다. 승인으로 통과할 수 없으니 코드를 수정한 뒤 다시 실행하세요.
+                      {t('result.hardBlockDesc')}
                     </p>
                   ) : null}
                 </div>
@@ -912,7 +916,7 @@ export function PipelineProgressPage() {
                     onClick={() => navigate('/pipeline/approval', { state: { jobId, repoName, branch } })}
                     className="h-8 shrink-0 bg-[#EA580C] px-3 text-xs text-white shadow-none hover:bg-[#C2410C]"
                   >
-                    승인 요청
+                    {t('result.requestApproval')}
                   </Button>
                 ) : null}
               </div>
@@ -933,8 +937,16 @@ export function PipelineProgressPage() {
                   <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: row.color }} />
                   <span className={active ? 'font-semibold text-white' : 'text-[#9CA3AF]'}>{row.label}</span>
                   <span className="text-[#6B7280]">→</span>
-                  <span className={active ? 'font-semibold text-white' : 'text-[#9CA3AF]'}>{row.action}</span>
-                  {active ? <span className="ml-auto text-[12px] text-[#34D399]">← 현재 여기</span> : null}
+                  <span className={active ? 'font-semibold text-white' : 'text-[#9CA3AF]'}>
+                    {row.match === 'block'
+                      ? t('result.gate.block')
+                      : row.match === 'block_pending_approval'
+                        ? t('result.gate.approval')
+                        : row.match === 'warn'
+                          ? t('result.gate.warn')
+                          : t('result.gate.pass')}
+                  </span>
+                  {active ? <span className="ml-auto text-[12px] text-[#34D399]">{t('result.currentHere')}</span> : null}
                 </div>
               )
             })}
@@ -945,11 +957,13 @@ export function PipelineProgressPage() {
         {outOfScopeCount > 0 ? (
           <div className="rounded-xl border border-[#404040] bg-[#1E1E1E] p-4">
             <p className="text-[13px] font-semibold text-[#D1D5DB]">
-              검사 범위 밖에서 취약점 {outOfScopeCount}건이 추가로 발견되었습니다.
+              {t('result.outScopeFound', { count: outOfScopeCount })}
             </p>
             <p className="mt-1 text-[12px] text-[#9CA3AF]">
-              배포 판정은 선택한 {vd?.selectedCount ?? selectedCatalogCount}개 항목만 기준입니다. 이{' '}
-              {outOfScopeCount}건은 판정에 포함되지 않았을 뿐, "안전"을 뜻하지는 않습니다.
+              {t('result.outScopeDesc', {
+                selected: vd?.selectedCount ?? selectedCatalogCount,
+                count: outOfScopeCount,
+              })}
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
               <Button
@@ -958,14 +972,14 @@ export function PipelineProgressPage() {
                 onClick={scrollToOutOfScope}
                 className="h-8 border-[#404040] bg-transparent px-3 text-xs text-[#D1D5DB] hover:bg-[#262626]"
               >
-                추가 발견 항목 보기
+                {t('result.viewExtraFindings')}
               </Button>
               <Button
                 type="button"
                 onClick={() => navigate('/pipeline/new')}
                 className="h-8 bg-[#34D399] px-3 text-xs text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
               >
-                전체 {securityCheckCatalog.length}개로 다시 검사
+                {t('result.rescanAll', { count: securityCheckCatalog.length })}
               </Button>
             </div>
           </div>
@@ -976,10 +990,10 @@ export function PipelineProgressPage() {
           <div className="rounded-xl border border-[#EA580C] bg-[#7C2D12]/30 p-4">
             <p className="flex items-center gap-2 text-[13px] font-semibold text-[#FDBA74]">
               <span className="h-2.5 w-2.5 rounded-full bg-[#F97316]" />
-              수용된 취약점 포함: {vd.acknowledgedCwes.join(', ')}
+              {t('result.acknowledgedCwes', { cwes: vd.acknowledgedCwes.join(', ') })}
             </p>
             <p className="mt-1 text-[12px] text-[#FED7AA]">
-              이 항목은 책임자 승인 하에 게이트를 통과했습니다. 점수에는 위험이 그대로 반영되어 있습니다.
+              {t('result.acknowledgedDesc')}
             </p>
           </div>
         ) : null}
@@ -987,7 +1001,7 @@ export function PipelineProgressPage() {
         {/* Score gauge (보조 지표) + severity counts */}
         <div className="grid gap-4 lg:grid-cols-2">
           <Card className="border-[#404040] bg-[#262626] p-4">
-            <p className="mb-3 text-[16px] font-semibold text-white">보안 점수</p>
+            <p className="mb-3 text-[16px] font-semibold text-white">{t('result.securityScore')}</p>
             <div className="relative mx-auto h-30 w-36">
               {/* Soft colored glow keyed to the gauge color, sitting under the
                   arc for a bit of depth (theme-independent — it's a tint). */}
@@ -1008,7 +1022,7 @@ export function PipelineProgressPage() {
               </p>
             </div>
             <div className="mt-3 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
-              <p className="text-[12px] text-[#6B7280]">코드 품질 점수</p>
+              <p className="text-[12px] text-[#6B7280]">{t('result.codeQualityScore')}</p>
               <p className="text-[24px] font-bold leading-none" style={{ color: displayScoreColor }}>
                 {score ?? '-'}
                 <span className="text-[24px]">/100</span>
@@ -1027,7 +1041,7 @@ export function PipelineProgressPage() {
             {vd?.scoreBreakdown &&
             severityOrder.some(({ key }) => (vd.scoreBreakdown[key] ?? 0) > 0) ? (
               <div className="mt-2 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
-                <p className="text-[12px] text-[#9CA3AF]">감점 내역</p>
+                <p className="text-[12px] text-[#9CA3AF]">{t('result.scoreBreakdown')}</p>
                 <div className="mt-2 space-y-1">
                   {severityOrder.map(({ key, label }) => (
                     <div key={key} className="flex items-center justify-between text-[12px] text-[#D1D5DB]">
@@ -1044,24 +1058,24 @@ export function PipelineProgressPage() {
           </Card>
 
           <Card className="border-[#404040] bg-[#262626] p-4">
-            <p className="mb-1 text-[16px] font-semibold text-white">등급별 취약점</p>
+            <p className="mb-1 text-[16px] font-semibold text-white">{t('result.severityFindings')}</p>
             {/* 위: 검사 범위 기준(in-scope) / 아래: 검사 범위 밖(out-of-scope) */}
             <div className="mb-2 flex items-center gap-2 text-[13px] font-medium text-[#34D399]">
-              <span className="h-2 w-2 rounded-full bg-[#34D399]" /> 검사 범위 기준
+              <span className="h-2 w-2 rounded-full bg-[#34D399]" /> {t('result.inScopeBasis')}
             </div>
-            {renderSeverityBreakdown(severityChartData, counts, totalCount, '탐지된 취약점 없음')}
+            {renderSeverityBreakdown(severityChartData, counts, totalCount, t('result.noFindingsDetected'))}
 
             <div className="my-3 border-t border-dashed border-[#404040]" />
 
             <div className="mb-2 flex items-center gap-2 text-[13px] font-medium text-[#9CA3AF]">
-              <span className="h-2 w-2 rounded-full bg-[#9CA3AF]" /> 검사 범위 밖 기준
-              <span className="text-[11px] text-[#6B7280]">(정책 미선택 — 게이트 영향 없음)</span>
+              <span className="h-2 w-2 rounded-full bg-[#9CA3AF]" /> {t('result.outScopeBasis')}
+              <span className="text-[11px] text-[#6B7280]">{t('result.policyNotSelected')}</span>
             </div>
             {renderSeverityBreakdown(
               outScopeChartData,
               outScopeCounts,
               outScopeTotal,
-              '범위 밖 취약점 없음',
+              t('result.noOutScopeFindings'),
             )}
           </Card>
         </div>
@@ -1070,7 +1084,7 @@ export function PipelineProgressPage() {
         {vd && vd.selectedItems.length >= 0 ? (
           <details className="rounded-xl border border-[#404040] bg-[#262626] p-4">
             <summary className="cursor-pointer text-[14px] font-semibold text-white">
-              검사 항목 ({selectedCatalogCount}/{securityCheckCatalog.length})
+              {t('result.checkItems')} ({selectedCatalogCount}/{securityCheckCatalog.length})
             </summary>
             <div className="mt-3 grid gap-2 sm:grid-cols-2">
               {securityCheckCatalog.map((c) => {
@@ -1086,7 +1100,7 @@ export function PipelineProgressPage() {
                       {c.title} <span className="text-[#6B7280]">{c.cwe}</span>
                     </span>
                     <span className={checked ? 'text-[#34D399]' : 'text-[#6B7280]'}>
-                      {checked ? '검사' : '미검사'}
+                      {checked ? t('result.checked') : t('result.unchecked')}
                     </span>
                   </div>
                 )
@@ -1098,7 +1112,7 @@ export function PipelineProgressPage() {
         {/* B-6: in-scope findings */}
         <Card className="border-[#404040] bg-[#262626] p-4">
           <p className="mb-3 flex items-center gap-2 text-[16px] font-semibold text-white">
-            <ShieldAlert className="h-4 w-4 text-[#34D399]" /> 탐지된 취약점
+            <ShieldAlert className="h-4 w-4 text-[#34D399]" /> {t('result.detectedFindings')}
             {inScopeFindings.length > 0 ? (
               <span className="text-[12px] font-normal text-[#6B7280]">({inScopeFindings.length})</span>
             ) : null}
@@ -1107,8 +1121,8 @@ export function PipelineProgressPage() {
           {inScopeFindings.length === 0 ? (
             <div className="rounded-xl border border-[#404040] bg-[#1E1E1E] p-6 text-center text-[12px] text-[#6B7280]">
               {result === null
-                ? '상세 취약점 데이터를 아직 불러올 수 없습니다. (백엔드 결과 준비 대기 중)'
-                : '검사 범위 내에서 탐지된 취약점이 없습니다.'}
+                ? t('result.detailPending')
+                : t('result.noInScopeFindings')}
             </div>
           ) : (
             <div className="space-y-3">{inScopeFindings.map(renderFinding)}</div>
@@ -1119,10 +1133,10 @@ export function PipelineProgressPage() {
         {outOfScopeFindings.length > 0 ? (
           <Card id="out-of-scope-section" className="border-[#404040] bg-[#262626] p-4">
             <p className="mb-1 flex items-center gap-2 text-[16px] font-semibold text-white">
-              <ShieldAlert className="h-4 w-4 text-[#9CA3AF]" /> 정책 범위 밖 {outOfScopeFindings.length}건
+              <ShieldAlert className="h-4 w-4 text-[#9CA3AF]" /> {t('result.outScopeTitle', { count: outOfScopeFindings.length })}
             </p>
             <p className="mb-3 text-[12px] text-[#9CA3AF]">
-              선택한 검사 항목 밖에서 탐지된 항목입니다. 이번 게이트 판정에는 영향을 주지 않습니다.
+              {t('result.outScopeSectionDesc')}
             </p>
             <div className="space-y-3">{outOfScopeFindings.map(renderFinding)}</div>
           </Card>

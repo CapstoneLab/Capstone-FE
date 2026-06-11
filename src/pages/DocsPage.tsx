@@ -26,6 +26,7 @@ import type { ComponentType } from 'react'
 import { useLocation } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
 import { Card } from '@/components/ui/card'
+import { useLanguage } from '@/contexts/LanguageContext'
 
 type Section = {
   id: string
@@ -243,6 +244,7 @@ function SeverityBadge({ severity }: { severity: 'critical' | 'high' }) {
 export function DocsPage() {
   const [activeId, setActiveId] = useState<string>('intro')
   const { hash } = useLocation()
+  const { locale, t } = useLanguage()
 
   useEffect(() => {
     if (!hash) return
@@ -301,13 +303,229 @@ export function DocsPage() {
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
 
+  if (locale === 'en') {
+    const enSections: Section[] = [
+      { id: 'intro', title: 'Overview', icon: FileText },
+      { id: 'getting-started', title: 'Getting Started', icon: Play },
+      { id: 'usage', title: 'Usage Guide', icon: Layers },
+      { id: 'security-checks', title: 'Security Checks', icon: Shield },
+      { id: 'pipeline-steps', title: 'Pipeline Steps', icon: Workflow },
+      { id: 'scoring', title: 'Security Score & Grade', icon: ShieldCheck },
+      { id: 'troubleshooting', title: 'FAQ', icon: CircleHelp },
+      { id: 'architecture', title: 'Architecture', icon: Network },
+    ]
+
+    return (
+      <MainLayout>
+        <section className="space-y-6">
+          <div>
+            <h1 className="text-4xl font-bold text-white">{t('docs.title')}</h1>
+            <p className="mt-2 text-sm text-[#9CA3AF]">{t('docs.description')}</p>
+          </div>
+
+          <div className="grid gap-6 lg:grid-cols-[220px_minmax(0,1fr)]">
+            <aside className="lg:sticky lg:top-24 lg:self-start">
+              <nav className="space-y-1 rounded-xl border border-[#404040] bg-[#262626] p-2">
+                {enSections.map(({ id, title, icon: Icon }) => {
+                  const isActive = activeId === id
+                  return (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => scrollTo(id)}
+                      className={`flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm transition-colors ${
+                        isActive
+                          ? 'bg-[#34D399]/10 text-[#34D399]'
+                          : 'text-[#D1D5DB] hover:bg-[#1F1F1F]'
+                      }`}
+                    >
+                      <Icon className="h-4 w-4 shrink-0" />
+                      <span>{title}</span>
+                    </button>
+                  )
+                })}
+              </nav>
+            </aside>
+
+            <div className="space-y-12">
+              <DocSection id="intro" title="Overview" icon={FileText}>
+                <p>
+                  <strong className="text-white">Secupipeline</strong> is a desktop tool that runs
+                  <span className="text-[#34D399]"> security-focused CI/CD pipelines</span> for GitHub
+                  repositories and visualizes the results. It automates dependency checks, SAST, build,
+                  and deployment steps, then scores detected vulnerabilities by severity.
+                </p>
+                <ul className="mt-3 list-inside list-disc space-y-1.5 text-[#D1D5DB]">
+                  <li>Connect repositories with one GitHub OAuth sign-in</li>
+                  <li>Select and run the core security checks you need</li>
+                  <li>Monitor step progress and live logs in real time</li>
+                  <li>Review security scores, severity counts, and verdicts</li>
+                  <li>Track, rerun, and delete execution history</li>
+                </ul>
+              </DocSection>
+
+              <DocSection id="getting-started" title="Getting Started" icon={Play}>
+                <ol className="space-y-4 text-[#D1D5DB]">
+                  <li>
+                    <p className="font-semibold text-white">1. Sign in with GitHub</p>
+                    <p className="mt-1 text-sm">
+                      Click <strong>Continue with GitHub</strong> on the login screen and approve the
+                      requested profile, repository, read-only code, and event permissions.
+                    </p>
+                  </li>
+                  <li>
+                    <p className="font-semibold text-white">2. Create a pipeline</p>
+                    <p className="mt-1 text-sm">
+                      Open <strong>New Pipeline</strong>, search for a repository, choose a branch,
+                      select vulnerability checks, then run the pipeline.
+                    </p>
+                  </li>
+                  <li>
+                    <p className="font-semibold text-white">3. Monitor progress</p>
+                    <p className="mt-1 text-sm">
+                      The app moves to the progress page automatically. You can inspect step status and
+                      live logs, then open the security result when the run finishes.
+                    </p>
+                  </li>
+                  <li>
+                    <p className="font-semibold text-white">4. Review results</p>
+                    <p className="mt-1 text-sm">
+                      Use the dashboard to review all runs, open results, rerun pipelines, or delete
+                      history when needed.
+                    </p>
+                  </li>
+                </ol>
+              </DocSection>
+
+              <DocSection id="usage" title="Usage Guide" icon={Layers}>
+                <div className="space-y-5">
+                  <SubSection title="Starting a Pipeline">
+                    <p>
+                      After selecting a repository, choose a branch and the vulnerability checks to run.
+                      The first run for a repository uses all checks as a baseline; later runs can be scoped.
+                    </p>
+                  </SubSection>
+                  <SubSection title="Monitoring">
+                    <p>
+                      The progress page polls the backend and updates step status, logs, total duration,
+                      and final state. Completed runs unlock the security analysis result page.
+                    </p>
+                  </SubSection>
+                  <SubSection title="Cancel and Delete">
+                    <p>
+                      A running pipeline can be canceled from the progress page. Deleting history removes
+                      stored job, step, finding, summary, and runner result data according to backend policy.
+                    </p>
+                  </SubSection>
+                  <SubSection title="Duplicate Runs">
+                    <p>
+                      If the same repository and branch already have a running pipeline, Secupipeline blocks
+                      the duplicate and lets you cancel the current run before starting a new one.
+                    </p>
+                  </SubSection>
+                </div>
+              </DocSection>
+
+              <DocSection id="security-checks" title="Security Checks" icon={Shield}>
+                <p className="text-sm text-[#9CA3AF]">
+                  Secupipeline focuses on high-impact vulnerability categories such as SQL injection,
+                  command injection, XSS, hardcoded secrets, path traversal, and insecure deserialization.
+                  Each check can be selected independently after the first baseline run.
+                </p>
+              </DocSection>
+
+              <DocSection id="pipeline-steps" title="Pipeline Steps" icon={Zap}>
+                <ol className="space-y-3">
+                  {[
+                    ['Repository Clone', 'Clone the selected GitHub branch into the runner.'],
+                    ['Dependency Install', 'Install dependencies from package manifests.'],
+                    ['Light Security Scan', 'Run fast checks such as secrets, SCA, and license scans.'],
+                    ['Tests', 'Run the project-defined test command when available.'],
+                    ['Deep Security Scan', 'Run Semgrep-based SAST rules for selected checks.'],
+                    ['Build', 'Produce production build artifacts.'],
+                    ['Deploy', 'Deploy artifacts when deployment policy is configured.'],
+                  ].map(([name, description], idx) => (
+                    <li key={name} className="flex gap-3 rounded-xl border border-[#404040] bg-[#1F1F1F] p-4">
+                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#262626] text-sm font-bold text-[#34D399]">
+                        {idx + 1}
+                      </div>
+                      <div>
+                        <p className="font-semibold text-white">{name}</p>
+                        <p className="mt-1 text-sm text-[#D1D5DB]">{description}</p>
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              </DocSection>
+
+              <DocSection id="scoring" title="Security Score & Grade" icon={ShieldCheck}>
+                <SubSection title="Scoring Formula">
+                  <p>
+                    The score starts at <strong>100</strong> and subtracts weighted penalties by severity.
+                    It never drops below 0 or rises above 100.
+                  </p>
+                  <pre className="mt-3 overflow-x-auto rounded-lg border border-[#2F2F2F] bg-[#0F0F0F] p-3 text-xs leading-5 text-[#34D399]">
+{`score = max(0, min(100, 100 - (
+  critical * 15
+  + high * 5
+  + medium * 2
+  + low * 0.5
+)))`}
+                  </pre>
+                </SubSection>
+                <SubSection title="Verdict">
+                  <p>
+                    The backend also returns a deployment verdict, such as pass, warning, approval required,
+                    or blocked, so teams can make release decisions quickly.
+                  </p>
+                </SubSection>
+              </DocSection>
+
+              <DocSection id="troubleshooting" title="FAQ" icon={CircleHelp}>
+                <div className="space-y-3">
+                  {[
+                    ['My GitHub token expired.', 'Sign in again with GitHub. Secupipeline redirects expired sessions to the login page.'],
+                    ['A duplicate pipeline dialog appeared.', 'The same repository and branch already have a running job. Cancel it and restart if needed.'],
+                    ['Can I stop a running pipeline?', 'Yes. Use the cancel button on the pipeline progress page. Completed jobs cannot be canceled.'],
+                    ['Do I choose checks every time?', 'The first repository run selects all checks. Later runs can be customized.'],
+                    ['Where are results stored?', 'Results are stored in the backend database and runner result files.'],
+                  ].map(([q, a]) => (
+                    <details key={q} className="rounded-xl border border-[#404040] bg-[#1F1F1F] p-4">
+                      <summary className="cursor-pointer text-sm font-semibold text-white hover:text-[#34D399]">
+                        Q. {q}
+                      </summary>
+                      <p className="mt-3 text-sm leading-6 text-[#D1D5DB]">A. {a}</p>
+                    </details>
+                  ))}
+                </div>
+              </DocSection>
+
+              <DocSection id="architecture" title="Architecture" icon={Network}>
+                <p>
+                  Secupipeline uses a three-tier architecture: the Electron frontend talks to the backend API,
+                  and the backend coordinates the Ubuntu runner that performs clone, install, scan, build,
+                  deploy, and result collection work.
+                </p>
+                <div className="mt-4 space-y-3">
+                  <ArchPill title="Frontend" desc="Electron + React + Vite. API requests go through the app API layer." />
+                  <ArchPill title="Backend" desc="Provides repository, pipeline, job, log, and result APIs and stores scan records." />
+                  <ArchPill title="Ubuntu Runner" desc="Runs git clone, dependency installation, scanners, and build/deploy commands." />
+                </div>
+              </DocSection>
+            </div>
+          </div>
+        </section>
+      </MainLayout>
+    )
+  }
+
   return (
     <MainLayout>
       <section className="space-y-6">
         <div>
-          <h1 className="text-4xl font-bold text-white">문서</h1>
+          <h1 className="text-4xl font-bold text-white">{t('docs.title')}</h1>
           <p className="mt-2 text-sm text-[#9CA3AF]">
-            Secupipeline 사용 방법, 보안 검사 항목, 파이프라인 구조까지 한 페이지에서 확인하세요.
+            {t('docs.description')}
           </p>
         </div>
 
