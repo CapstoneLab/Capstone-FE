@@ -23,7 +23,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import { useTheme, type ThemePreference } from '@/contexts/ThemeContext'
 import { LanguageSelect } from './LanguageSelect'
 import defaultProfileSvg from '@/assets/default-profile.svg'
-import appLogo from '@/assets/logo.png'
+import appLogo from '@/assets/app-logo.png'
 import {
   Dialog,
   DialogClose,

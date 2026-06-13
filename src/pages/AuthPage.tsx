@@ -6,7 +6,7 @@ import { Card } from '@/components/ui/card'
 import { GitHubIcon } from '@/components/ui/github-icon'
 import { useAuth } from '@/contexts/AuthContext'
 import { useLanguage } from '@/contexts/LanguageContext'
-import appLogo from '@/assets/logo.png'
+import appLogo from '@/assets/app-logo.png'
 
 const GITHUB_LOGIN_URL = `${import.meta.env.VITE_API_BASE_URL}/auth/github/login`
 
@@ -86,17 +86,17 @@ export function AuthPage() {
   }
 
   return (
-    <section className="min-h-full bg-[#1E1E1E] text-white">
-      <main className="mx-auto flex min-h-full w-full max-w-6xl items-center justify-center px-6 pb-10 pt-14">
+    <section className="auth-section flex min-h-full items-center justify-center">
+      <main className="mx-auto flex min-h-full w-full max-w-6xl items-center justify-center px-6 py-10">
         <div className="w-full max-w-md">
-          <Card className="border-gray-500/80 bg-[#242424] p-4 text-center">
+          <Card className="auth-card p-4 text-center shadow-sm">
             <img
               src={appLogo}
               alt="Secupipeline"
               className="mx-auto aspect-square h-28 w-28 rounded-2xl object-cover"
             />
-            <h1 className="mt-4 text-4xl font-extrabold text-white">{t('auth.title')}</h1>
-            <p className="mt-2 text-sm text-[#6B7280]">{t('auth.subtitle')}</p>
+            <h1 className="auth-text-primary mt-4 text-4xl font-extrabold">{t('auth.title')}</h1>
+            <p className="auth-text-secondary mt-2 text-sm">{t('auth.subtitle')}</p>
 
             <Button
               onClick={onSignIn}
@@ -107,25 +107,25 @@ export function AuthPage() {
               <GitHubIcon className="mr-2 h-4 w-4" />
               {isPending ? t('auth.signingIn') : t('auth.continueWithGithub')}
             </Button>
-            {status && <p className="mt-3 text-xs text-[#6B7280]">{status}</p>}
+            {status && <p className="auth-text-secondary mt-3 text-xs">{status}</p>}
           </Card>
 
-          <Card className="mt-5 border-gray-500/70 bg-[#242424] p-4">
-            <p className="text-sm font-semibold text-[#6B7280]">{t('auth.permissionsTitle')}</p>
+          <Card className="auth-card mt-5 p-4 shadow-sm">
+            <p className="auth-text-secondary text-sm font-semibold">{t('auth.permissionsTitle')}</p>
             <ul className="mt-3 space-y-3">
               {permissions.map((item) => (
                 <li key={item.text} className="flex items-start gap-2">
                   <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-[#34D399]" />
                   <div>
-                    <p className="text-base leading-none text-white">{item.text}</p>
-                    <p className="mt-1 text-[10px] text-[#6B7280]">{item.subText}</p>
+                    <p className="auth-text-primary text-base leading-none">{item.text}</p>
+                    <p className="auth-text-secondary mt-1 text-[10px]">{item.subText}</p>
                   </div>
                 </li>
               ))}
             </ul>
           </Card>
 
-          <p className="mt-6 text-center text-xs text-[#6B7280]">
+          <p className="auth-text-secondary mt-6 text-center text-xs">
             {t('auth.termsPrefix')}{' '}
             <a href="#" className="font-semibold text-[#34D399] underline underline-offset-2">
               {t('auth.privacy')}

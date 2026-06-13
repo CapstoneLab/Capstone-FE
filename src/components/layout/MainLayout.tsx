@@ -106,6 +106,7 @@ export function MainLayout({ children, pipelineElapsed, onResultDownload }: Main
   }, [pathname])
 
   const shouldShowScrollHeader = pathname !== '/' && !!pageMeta && showPageHeader
+  const isHome = pathname === '/'
 
   const pageHeaderRight = useMemo(() => {
     if (pathname.startsWith('/dashboard')) {
@@ -178,7 +179,7 @@ export function MainLayout({ children, pipelineElapsed, onResultDownload }: Main
         ref={scrollContainerRef}
         className="flex h-full flex-col overflow-y-auto overflow-x-hidden"
       >
-        <main className="relative mx-auto w-full max-w-6xl flex-1 px-6 pb-10 pt-6">{children}</main>
+        <main className={`relative w-full flex-1 ${isHome ? 'mx-0 max-w-none px-0 pb-0 pt-0' : 'mx-auto max-w-6xl px-6 pb-10 pt-6'}`}>{children}</main>
         <Footer />
       </div>
     </div>

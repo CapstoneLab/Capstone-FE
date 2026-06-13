@@ -81,10 +81,10 @@ app.setName('Secupipeline')
 
 function getAppIconPath() {
   const candidates = [
-    path.join(appRootDir, 'renderer-dist', 'icon.ico'),
-    path.join(appRootDir, 'renderer-dist', 'logo.png'),
-    path.join(appRootDir, 'public', 'icon.ico'),
-    path.join(appRootDir, 'public', 'logo.png'),
+    path.join(appRootDir, 'renderer-dist', 'app-logo.ico'),
+    path.join(appRootDir, 'renderer-dist', 'app-logo.png'),
+    path.join(appRootDir, 'public', 'app-logo.ico'),
+    path.join(appRootDir, 'public', 'app-logo.png'),
   ]
 
   return candidates.find((candidate) => fs.existsSync(candidate))

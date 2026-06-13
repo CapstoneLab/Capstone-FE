@@ -47,18 +47,9 @@ type LocationState = {
   branch?: string
 }
 
-// 800ms is a compromise: short enough to catch any incremental log flushes
-// the backend might do mid-step, long enough to keep backend load
-// reasonable. The backend currently appears to buffer logs and only flush
-// them at pipeline end — see the user-facing "로그 수신 대기 중..." message
-// for the resulting UX. Lowering this further wouldn't help unless the
-// backend supports SSE/streaming.
+// Poll often enough that each newly appended backend log batch is reflected
+// in the UI without making the desktop app noisy.
 const POLL_INTERVAL_MS = 800
-// After a job reaches a terminal status (success/failed/cancelled) the
-// runner may still flush trailing log lines for a beat. Keep polling for
-// a short grace window so the user actually sees the final logs instead
-// of "수집된 로그가 없습니다".
-const TERMINAL_GRACE_POLLS = 3
 const TERMINAL_JOB_STATUSES = new Set(['success', 'failed', 'cancelled'])
 const TERMINAL_STEP_STATUSES = new Set(['success', 'failed', 'cancelled', 'skipped'])
 
@@ -85,6 +76,60 @@ const PLACEHOLDER_STEPS: JobStep[] = [
   { stepId: 'ph-build', stepName: '빌드', stepType: 'build', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
   { stepId: 'ph-deploy', stepName: '배포', stepType: 'deploy', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
 ]
+
+function displayStepName(step: JobStep, idx: number) {
+  const template = PLACEHOLDER_STEPS[idx]
+  if (template) return template.stepName
+
+  const type = `${step.stepType} ${step.stepName}`.toLowerCase()
+  if (/clone|checkout|git/.test(type)) return '레포지토리 클론'
+  if (/install|deps|dependen|npm|pip|pnpm|yarn/.test(type)) return '의존성 설치'
+  if (/light|scan-light|security-light/.test(type)) return '경량 보안 검사'
+  if (/test|lint|coverage/.test(type)) return '테스트'
+  if (/deep|scan-deep|security-deep|sast-deep/.test(type)) return '심화 보안 검사'
+  if (/gate|verdict|threshold/.test(type)) return '보안 게이트'
+  if (/build|compile|bundle/.test(type)) return '빌드'
+  if (/deploy|release|publish/.test(type)) return '배포'
+  return step.stepName || step.stepType || `단계 ${idx + 1}`
+}
+
+function stepIndexFromLogLine(line: string): number | null {
+  const tag = line.match(/\[([a-zA-Z][a-zA-Z0-9_-]*)(?:\.log)?\]/)?.[1]?.toLowerCase()
+  if (!tag) return null
+  const key = tag.replace(/_/g, '-')
+  if (key.includes('clone') || key.includes('checkout')) return 0
+  if (key.includes('install') || key.includes('deps') || key.includes('dependency')) return 1
+  if (key.includes('lightweight-security') || key.includes('light-security') || key.includes('gitleaks')) return 2
+  if (key.includes('test') || key.includes('jest') || key.includes('lint')) return 3
+  if (key.includes('deep-security') || key.includes('semgrep') || key.includes('sast-deep')) return 4
+  if (key.includes('security-gate') || key.includes('gate') || key.includes('verdict')) return 5
+  if (key.includes('build') || key.includes('compile') || key.includes('bundle')) return 6
+  if (key.includes('deploy') || key.includes('release') || key.includes('publish')) return 7
+  return null
+}
+
+function stepLogKeysForIndex(idx: number): string[] {
+  switch (idx) {
+    case 0:
+      return ['clone', 'checkout']
+    case 1:
+      return ['install', 'deps', 'dependency']
+    case 2:
+      return ['lightweight-security', 'light-security', 'gitleaks']
+    case 3:
+      return ['test', 'jest', 'lint']
+    case 4:
+      return ['deep-security', 'sast-deep', 'semgrep']
+    case 5:
+      return ['security-gate', 'gate', 'verdict']
+    case 6:
+      return ['build', 'compile', 'bundle']
+    case 7:
+      return ['deploy', 'release', 'publish']
+    default:
+      return []
+  }
+}
 
 function iconForStep(step: JobStep): ComponentType<{ className?: string }> {
   const haystack = `${step.stepName} ${step.stepType}`
@@ -261,7 +306,6 @@ export function PipelineProcessPage() {
   const logContainerRef = useRef<HTMLDivElement | null>(null)
   const lastLogCount = useRef(0)
   const startedAtMsRef = useRef<number | null>(null)
-  const terminalPollCountRef = useRef(0)
   const hasObservedLiveRunRef = useRef(false)
   // Last live-computed duration per step. Lets a step keep showing its real
   // elapsed (e.g. 12s) right when status flips running→success, before the
@@ -285,6 +329,8 @@ export function PipelineProcessPage() {
     async function tick() {
       let isTerminal = false
       let nextJobForTick: JobDetail | null = null
+      let polledLogCount: number | null = null
+      let polledLogTags: string[] = []
       // Fetch independently so a transient failure in one endpoint does not
       // discard the other's payload (e.g. logs must keep streaming even if
       // job detail blips, and vice versa).
@@ -312,6 +358,15 @@ export function PipelineProcessPage() {
 
       if (logsResult.status === 'fulfilled') {
         const nextLogs = logsResult.value
+        polledLogCount = nextLogs.length
+        polledLogTags = Array.from(
+          new Set(
+            nextLogs
+              .map((line) => line.match(/\[([a-zA-Z][a-zA-Z0-9_-]*)(?:\.log)?\]/)?.[1])
+              .filter((tag): tag is string => Boolean(tag))
+              .map((tag) => tag.toLowerCase().replace(/_/g, '-')),
+          ),
+        )
         // Don't wipe accumulated logs on an empty response. The backend
         // returns [] both for "no logs yet" and for transient errors; in
         // either case keep the lines we already have so failures still
@@ -344,6 +399,18 @@ export function PipelineProcessPage() {
         console.error('[pipeline-poll] logs fetch failed:', logsResult.reason)
       }
 
+      if (import.meta.env.DEV) {
+        console.log('[pipeline-poll]', {
+          jobId,
+          at: new Date().toLocaleTimeString(),
+          jobOk: jobResult.status === 'fulfilled',
+          logsOk: logsResult.status === 'fulfilled',
+          status: nextJobForTick?.status ?? null,
+          logCount: polledLogCount,
+          tags: polledLogTags,
+        })
+      }
+
       // Only surface an error to the UI if BOTH fetches failed — otherwise
       // the user still gets useful data and shouldn't see a red banner.
       if (detailError && logsResult.status === 'rejected') {
@@ -358,14 +425,7 @@ export function PipelineProcessPage() {
 
       setIsInitialLoading(false)
 
-      // Keep polling for a short grace window after terminal status so any
-      // trailing logs (final failure message, last build line) actually
-      // reach the UI before we stop.
       if (!isTerminal) {
-        terminalPollCountRef.current = 0
-        timer = window.setTimeout(tick, POLL_INTERVAL_MS)
-      } else if (terminalPollCountRef.current < TERMINAL_GRACE_POLLS) {
-        terminalPollCountRef.current += 1
         timer = window.setTimeout(tick, POLL_INTERVAL_MS)
       }
     }
@@ -468,7 +528,7 @@ export function PipelineProcessPage() {
       for (const pat of tagPatterns) {
         const m = entry.line.match(pat)
         if (m && m[1]) {
-          key = m[1].toLowerCase()
+          key = m[1].toLowerCase().replace(/_/g, '-')
           break
         }
       }
@@ -480,6 +540,7 @@ export function PipelineProcessPage() {
   }, [allLogEntries])
 
   const generalLogEntries: LogEntry[] = stepLogsMap.get('__general__') ?? []
+  const hasTaggedStepLogs = Array.from(stepLogsMap.keys()).some((key) => key !== '__general__')
 
   // Compute a step's elapsed-since-job-start window so we can pull logs that
   // arrived *during* the step's lifetime even if their bracketed prefix
@@ -522,20 +583,36 @@ export function PipelineProcessPage() {
   }
 
   const findLogsForStep = (step: JobStep, key: string): LogEntry[] => {
-    // 1. Exact / case-insensitive name match against the bracketed prefix
+    const stepIdx = Number(key.replace('step-', ''))
+    if (Number.isInteger(stepIdx)) {
+      for (const logKey of stepLogKeysForIndex(stepIdx)) {
+        const exact = stepLogsMap.get(logKey)
+        if (exact && exact.length > 0) return exact
+      }
+    }
+
+    // 1. Exact / case-insensitive name match against the bracketed prefix.
+    // Normalize underscores so [security_gate.log] maps to security-gate.
     const nameKey = step.stepName?.toLowerCase()
-    if (nameKey && stepLogsMap.has(nameKey)) return stepLogsMap.get(nameKey)!
+    const normalizedNameKey = nameKey?.replace(/_/g, '-')
+    if (normalizedNameKey && stepLogsMap.has(normalizedNameKey)) return stepLogsMap.get(normalizedNameKey)!
     const typeKey = step.stepType?.toLowerCase()
-    if (typeKey && stepLogsMap.has(typeKey)) return stepLogsMap.get(typeKey)!
+    const normalizedTypeKey = typeKey?.replace(/_/g, '-')
+    if (normalizedTypeKey && stepLogsMap.has(normalizedTypeKey)) return stepLogsMap.get(normalizedTypeKey)!
+
+    // If the backend is tagging logs, never guess across tagged buckets.
+    // Security-related steps are too similar, so substring/icon fallback can
+    // accidentally show lightweight logs inside deep scan or gate sections.
+    if (hasTaggedStepLogs) return []
 
     // 2. Substring match — handles "[lightweight-security.log]" vs step
     //    type "security-light", etc.
-    if (typeKey || nameKey) {
+    if (normalizedTypeKey || normalizedNameKey) {
       for (const [logKey, lines] of stepLogsMap) {
         if (logKey === '__general__') continue
         if (
-          (typeKey && (logKey.includes(typeKey) || typeKey.includes(logKey))) ||
-          (nameKey && (logKey.includes(nameKey) || nameKey.includes(logKey)))
+          (normalizedTypeKey && (logKey.includes(normalizedTypeKey) || normalizedTypeKey.includes(logKey))) ||
+          (normalizedNameKey && (logKey.includes(normalizedNameKey) || normalizedNameKey.includes(logKey)))
         ) {
           return lines
         }
@@ -608,7 +685,37 @@ export function PipelineProcessPage() {
 
   const steps: JobStep[] = useMemo(() => {
     const usedApi = new Set<number>()
-    const merged: JobStep[] = PLACEHOLDER_STEPS.map((placeholder) => {
+    const taggedIndexes = logs
+      .map(stepIndexFromLogLine)
+      .filter((idx): idx is number => idx !== null)
+    const completedLogIndexes = new Set(taggedIndexes)
+    let completedPrefixCount = 0
+    while (completedLogIndexes.has(completedPrefixCount)) {
+      completedPrefixCount += 1
+    }
+    const runningIdx =
+      !isTerminal && jobStatus === 'running'
+        ? Math.min(completedPrefixCount, PLACEHOLDER_STEPS.length - 1)
+        : null
+
+    const statusFromLogs = (idx: number, backendStatus: JobStep['status']): JobStep['status'] => {
+      if (completedLogIndexes.has(idx)) {
+        return 'success'
+      }
+      if (runningIdx === idx) {
+        return 'running'
+      }
+      if (isTerminal) {
+        if (jobStatus === 'failed' && idx === completedPrefixCount) return 'failed'
+        if (backendStatus === 'success' || backendStatus === 'failed' || backendStatus === 'skipped') {
+          return backendStatus
+        }
+        return backendStatus
+      }
+      return 'pending'
+    }
+
+    const merged: JobStep[] = PLACEHOLDER_STEPS.map((placeholder, placeholderIdx) => {
       const placeholderIcon = iconForStep(placeholder)
       const apiIdx = apiSteps.findIndex((api, i) => {
         if (usedApi.has(i)) return false
@@ -618,26 +725,28 @@ export function PipelineProcessPage() {
       })
       if (apiIdx >= 0) {
         usedApi.add(apiIdx)
-        return { ...apiSteps[apiIdx], stepName: apiSteps[apiIdx].stepName || placeholder.stepName }
+        const apiStep = apiSteps[apiIdx]
+        return {
+          ...apiStep,
+          stepName: placeholder.stepName,
+          status: statusFromLogs(placeholderIdx, apiStep.status),
+        }
       }
-      // No API step yet — keep placeholder, but flip to 'running' if logs
-      // already arrived for it. Use the placeholder's stable index for the
-      // lifecycle key so the lookup matches what we'll use after merge.
-      const placeholderIdx = PLACEHOLDER_STEPS.indexOf(placeholder)
-      const matchedLogs = findLogsForStep(placeholder, lifecycleKeyFor(placeholderIdx))
-      if (matchedLogs.length > 0 && placeholder.status === 'pending') {
-        return { ...placeholder, status: 'running' as const }
+
+      const inferredStatus = statusFromLogs(placeholderIdx, placeholder.status)
+      if (inferredStatus !== placeholder.status) {
+        return { ...placeholder, status: inferredStatus }
       }
       return placeholder
     })
     // Append unmatched API steps (extras the backend reports beyond our 8-step template)
     apiSteps.forEach((api, i) => {
-      if (!usedApi.has(i)) merged.push(api)
+      if (!usedApi.has(i)) merged.push({ ...api, stepName: displayStepName(api, merged.length) })
     })
     return merged
     // findLogsForStep depends on stepLogsMap which depends on logs
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiSteps, stepLogsMap])
+  }, [apiSteps, stepLogsMap, logs, isTerminal, jobStatus])
 
   // Sequential reveal queue. The backend often batches 3–4 step completions
   // into a single poll, so without throttling we'd see them all flip from
@@ -655,7 +764,7 @@ export function PipelineProcessPage() {
   // sees logs only after the queue finishes animating.
   const isHistorySnapshot = isTerminal && !hasObservedLiveRunRef.current && apiSteps.length > 0
 
-  const REVEAL_INTERVAL_MS = 450
+  const REVEAL_INTERVAL_MS = 1100
   const [revealedCount, setRevealedCount] = useState<number | null>(null)
   // Wall-clock time each step transitioned to "displayed complete" — used
   // to derive a believable displayed duration when the backend's data is
@@ -676,20 +785,7 @@ export function PipelineProcessPage() {
       setStepRevealTimes({})
       return
     }
-    const completed = steps.filter((s) => TERMINAL_STEP_STATUSES.has(s.status)).length
-    setRevealedCount(completed)
-    // Backfill reveal times for already-completed steps using backend
-    // endedAt when present so their cards show *some* timing instead of 0.
-    if (completed > 0) {
-      const now = Date.now()
-      const backfill: Record<number, number> = {}
-      for (let i = 0; i < completed; i += 1) {
-        const endedAt = steps[i]?.endedAt
-        const parsed = endedAt ? Date.parse(endedAt) : Number.NaN
-        backfill[i] = !Number.isNaN(parsed) ? parsed : now
-      }
-      setStepRevealTimes(backfill)
-    }
+    setRevealedCount(0)
     // Intentionally only runs once we know steps — depend on steps but
     // re-check with the guard above.
   }, [steps, revealedCount, isHistorySnapshot])
@@ -731,6 +827,14 @@ export function PipelineProcessPage() {
     )
   }, [revealedCount, logs.length])
 
+  const runningDurationFor = (idx: number): number => {
+    if (idx <= 0) return Math.max(0, elapsedSec)
+    const previousStepEnd = stepLogKeysForIndex(idx - 1)
+      .flatMap((logKey) => stepLogsMap.get(logKey) ?? [])
+      .reduce((latest, entry) => Math.max(latest, entry.elapsedSec), 0)
+    return Math.max(0, elapsedSec - previousStepEnd)
+  }
+
   // Per-step displayed duration. Priority:
   //   1. revealTime[idx] - revealTime[idx-1]  (frontend-observed gap —
   //      our most reliable signal when backend timings are noisy)
@@ -739,6 +843,7 @@ export function PipelineProcessPage() {
   //   4. 1s default — guarantees no "0초" displayed.
   const rawDisplayedDurationFor = (step: JobStep, idx: number): number => {
     if (step.status === 'skipped') return 0
+    if (step.status === 'running') return runningDurationFor(idx)
 
     const capSecs = job?.durationSecs && job.durationSecs > 0 ? job.durationSecs : elapsedSec
     const storedDuration = boundedDurationSecs(
@@ -762,17 +867,11 @@ export function PipelineProcessPage() {
     return isHistorySnapshot ? 0 : 1
   }
 
-  // Effective display status: respect the reveal queue. A step that the
-  // backend has marked complete but the reveal queue hasn't reached yet
-  // is shown as running (the next one up) or pending (further out).
-  const displayedStatusFor = (idx: number, real: JobStep['status']): JobStep['status'] => {
-    if (isHistorySnapshot) return real
-    if (revealedCount === null) return real
-    if (idx < revealedCount) return real
-    if (!TERMINAL_STEP_STATUSES.has(real)) return real
-    // Backend says done, reveal hasn't caught up — show the next-up
-    // step as running, the rest as pending, so the UI feels sequential.
-    return idx === revealedCount ? 'running' : 'pending'
+  // Display the state inferred from the latest polled logs immediately.
+  // Step pacing is no longer simulated with a reveal queue; when a new
+  // [*.log] tag arrives, that step becomes the active running step.
+  const displayedStatusFor = (_idx: number, real: JobStep['status']): JobStep['status'] => {
+    return real
   }
 
   // Currently running step — surfaced to the top "execution status" panel
@@ -780,7 +879,7 @@ export function PipelineProcessPage() {
   // happening RIGHT NOW without having to click into a step. Picks the
   // first step whose DISPLAYED status is running.
   const currentStepIdx =
-    isTerminal || isHistorySnapshot
+    isHistorySnapshot
       ? -1
       : steps.findIndex((s, idx) => displayedStatusFor(idx, s.status) === 'running')
   const currentStep = currentStepIdx >= 0 ? steps[currentStepIdx] : null
@@ -950,18 +1049,47 @@ export function PipelineProcessPage() {
         .map((step, idx) => ({
           key: step.stepId || `${step.stepName}-${idx}`,
           status: step.status,
+          logs: findLogsForStep(step, lifecycleKeyFor(idx)),
         }))
-        .filter(({ status }) => TERMINAL_STEP_STATUSES.has(status))
+        .filter(({ status, logs }) => TERMINAL_STEP_STATUSES.has(status) && logs.length > 0)
         .map(({ key }) => key)
       if (historyKeys.length === 0) return
       setOpenSteps((prev) => (prev.length > 0 ? prev : historyKeys))
       return
     }
-    if (!currentStep) return
-    const idx = steps.indexOf(currentStep)
-    const key = currentStep.stepId || `${currentStep.stepName}-${idx}`
+    let idx = -1
+    for (let i = steps.length - 1; i >= 0; i -= 1) {
+      if (findLogsForStep(steps[i], lifecycleKeyFor(i)).length > 0) {
+        idx = i
+        break
+      }
+    }
+    if (idx < 0) return
+    const step = steps[idx]
+    const key = step.stepId || `${step.stepName}-${idx}`
     setOpenSteps((prev) => (prev.includes(key) ? prev : [...prev, key]))
-  }, [currentStep, steps, isHistorySnapshot])
+    // findLogsForStep is intentionally excluded; step/log changes are covered
+    // by the dependencies below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [steps, isHistorySnapshot, logs, stepLifecycle])
+
+  useEffect(() => {
+    setOpenSteps((prev) => {
+      const next = prev.filter((openKey) => {
+        const idx = steps.findIndex((step, stepIdx) =>
+          (step.stepId || `${step.stepName}-${stepIdx}`) === openKey,
+        )
+        if (idx < 0) return false
+        const step = steps[idx]
+        if (step.errorMessage) return true
+        return findLogsForStep(step, lifecycleKeyFor(idx)).length > 0
+      })
+      return next.length === prev.length ? prev : next
+    })
+    // findLogsForStep is intentionally excluded; step/log changes are covered
+    // by the dependencies below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [steps, logs, stepLifecycle])
 
   // Track each running step's live elapsed in a ref so the render can fall
   // back to this value during the brief running→complete transition window
@@ -1185,19 +1313,14 @@ export function PipelineProcessPage() {
                 const cIdx = steps.indexOf(currentStep)
                 const stepLogs = findLogsForStep(currentStep, lifecycleKeyFor(cIdx))
                 const latestLine = stepLogs[stepLogs.length - 1]
-                const startMs = currentStep.startedAt
-                  ? Date.parse(currentStep.startedAt)
-                  : Number.NaN
-                const stepElapsed = !Number.isNaN(startMs)
-                  ? Math.max(0, Math.round((Date.now() - startMs) / 1000))
-                  : 0
+                const stepElapsed = runningDurationFor(cIdx)
                 return (
                   <>
                     <div className="flex items-center gap-2">
                       <Loader2 className="h-5 w-5 animate-spin text-[#F59E0B]" />
                       <Icon className="h-5 w-5 text-[#F59E0B]" />
                       <p className="text-[16px] font-semibold text-white">
-                        현재: {currentStep.stepName || currentStep.stepType}
+                        현재: {displayStepName(currentStep, cIdx)}
                       </p>
                       <span className="ml-auto inline-flex items-center gap-1 text-[12px] text-[#FCD34D]">
                         <Clock3 className="h-3.5 w-3.5" />
@@ -1288,19 +1411,21 @@ export function PipelineProcessPage() {
             //   1. reveal-time slice [prev_reveal_log_count, this/live]
             //   2. lifecycle slice (handled inside findLogsForStep)
             let matchedLogs = rawMatchedLogs
-            if (rawMatchedLogs.length === 0 && revealedCount !== null && step.status !== 'skipped') {
+            if (
+              rawMatchedLogs.length === 0 &&
+              !hasTaggedStepLogs &&
+              revealedCount !== null &&
+              step.status !== 'skipped'
+            ) {
               const sliceStart = idx > 0 ? (stepRevealLogCounts[idx - 1] ?? 0) : 0
               const captured = stepRevealLogCounts[idx]
               const isCurrentRunning = idx === revealedCount
               const isLastStepEver = idx === steps.length - 1
               const allRevealedDone = revealedCount >= steps.length
-              // Live end so late-arriving logs land somewhere visible:
+              // Live end so late-arriving untagged logs land somewhere visible:
               //  - currently-displayed running step → live
-              //  - last step after all reveals done → live (catches the
-              //    end-of-pipeline log flush from buffered backends)
+              //  - last step after all reveals done → live
               //  - any step matching the actual backend running step → live
-              //    so a step that's running on the backend keeps streaming
-              //    even if reveal queue is ahead of it visually
               const realIsRunning = step.status === 'running'
               const useLiveEnd =
                 isCurrentRunning ||
@@ -1325,21 +1450,31 @@ export function PipelineProcessPage() {
             } else if (dStatus === 'running') {
               duration = rawDisplayedDurationFor(step, idx)
             }
+            const canOpenAccordion = matchedLogs.length > 0 || Boolean(step.errorMessage)
+            const isCurrentDisplayed = dStatus === 'running'
+            const isInactive = !isCurrentDisplayed && dStatus === 'pending' && !canOpenAccordion
 
             return (
               <AccordionItem
                 key={key}
                 value={key}
-                className={`rounded-2xl border bg-[#262626] p-4 ${borderColor}`}
+                className={`rounded-2xl border bg-[#262626] p-4 transition-opacity ${borderColor} ${
+                  isInactive ? 'opacity-45' : ''
+                }`}
               >
-                <AccordionTrigger className="py-0 hover:no-underline">
+                <AccordionTrigger
+                  disabled={!canOpenAccordion}
+                  className={`py-0 hover:no-underline disabled:cursor-default disabled:opacity-100 ${
+                    canOpenAccordion ? '' : '[&>svg]:hidden'
+                  }`}
+                >
                   <div className="flex items-center gap-3">
                     <StepStatusIcon status={dStatus} />
                     <div className="flex items-center gap-3">
                       <Icon className="h-5 w-5 text-[#6B7280]" />
                       <div className="flex flex-col gap-1">
                         <p className="text-[20px] font-semibold text-white">
-                          {step.stepName || '(unnamed)'}
+                          {displayStepName(step, idx)}
                         </p>
                         <div className="flex items-center gap-3 text-[14px]">
                           <span className="inline-flex items-center gap-1 text-[#6B7280]">
@@ -1363,14 +1498,10 @@ export function PipelineProcessPage() {
                     {matchedLogs.length === 0 ? (
                       <p className="font-mono text-[#6B7280]">
                         {step.status === 'running' || dStatus === 'running'
-                          ? '명령 실행 중... (로그 수신 대기)'
+                          ? '명령 실행 중...'
                           : step.status === 'pending' && dStatus === 'pending'
                             ? '이전 단계 완료 후 시작됩니다'
-                            : TERMINAL_STEP_STATUSES.has(step.status) && !isTerminal
-                              ? '단계 종료 — 백엔드가 로그를 flush할 때까지 대기 중'
-                              : !isTerminal
-                                ? '로그 수신 대기 중...'
-                                : '이 단계에서 출력된 로그가 없습니다'}
+                            : '이 단계에서 출력된 로그가 없습니다'}
                       </p>
                     ) : (
                       matchedLogs.map((entry, lineIdx) => (
@@ -1387,29 +1518,35 @@ export function PipelineProcessPage() {
           })}
         </Accordion>
 
-        <Card className="border-[#404040] bg-[#262626] p-4">
-          <div className="mb-3 flex items-center justify-between">
-            <p className="text-[16px] font-semibold text-white">실시간 로그</p>
-            <p className="text-[12px] text-[#6B7280]">{logs.length} 줄</p>
-          </div>
-          <div
-            ref={logContainerRef}
-            className="max-h-96 overflow-y-auto rounded-md border border-[#404040] bg-[#0F0F0F] p-3 text-xs text-[#D1D5DB]"
-          >
-            {logs.length === 0 ? (
-              <p className="font-mono text-[#6B7280]">
-                {isTerminal ? '수집된 로그가 없습니다.' : '로그를 기다리는 중...'}
-              </p>
-            ) : (
-              logs.map((line, idx) => (
-                <p key={idx} className="font-mono leading-5 break-all">
-                  <span className="mr-2 text-[#6B7280]">+{logTimestamps[idx] ?? 0}s</span>
-                  {line}
-                </p>
-              ))
-            )}
-          </div>
-        </Card>
+        <Accordion type="single" collapsible defaultValue="all-logs">
+          <AccordionItem value="all-logs" className="rounded-2xl border border-[#404040] bg-[#262626] p-4">
+            <AccordionTrigger className="py-0 hover:no-underline">
+              <div className="flex w-full items-center justify-between pr-3">
+                <p className="text-[16px] font-semibold text-white">실시간 전체 로그</p>
+                <p className="text-[12px] text-[#6B7280]">{logs.length} 줄</p>
+              </div>
+            </AccordionTrigger>
+            <AccordionContent className="pt-3">
+              <div
+                ref={logContainerRef}
+                className="max-h-96 overflow-y-auto rounded-md border border-[#404040] bg-[#0F0F0F] p-3 text-xs text-[#D1D5DB]"
+              >
+                {logs.length === 0 ? (
+                  <p className="font-mono text-[#6B7280]">
+                    {isTerminal ? '수집된 로그가 없습니다.' : '로그를 기다리는 중...'}
+                  </p>
+                ) : (
+                  logs.map((line, idx) => (
+                    <p key={idx} className="font-mono leading-5 break-all">
+                      <span className="mr-2 text-[#6B7280]">+{logTimestamps[idx] ?? 0}s</span>
+                      {line}
+                    </p>
+                  ))
+                )}
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+        </Accordion>
 
         <div className="flex justify-end gap-2 pt-1">
           {!isTerminal ? (

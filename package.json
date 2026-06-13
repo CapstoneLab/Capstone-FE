@@ -2,7 +2,7 @@
   "name": "secupipeline",
   "productName": "Secupipeline",
   "private": true,
-  "version": "1.2.1",
+  "version": "1.3.0",
   "type": "module",
   "main": "electron/main.cjs",
   "releaseRepository": "CapstoneLab/Capstone-FE",
@@ -34,6 +34,8 @@
     "dayjs": "^1.11.20",
     "framer-motion": "^12.40.0",
     "lucide-react": "^1.7.0",
+    "motion": "^12.40.0",
+    "ogl": "^1.0.11",
     "pnpm": "^11.3.0",
     "react": "^19.2.4",
     "react-chartjs-2": "^5.3.1",
@@ -68,7 +70,7 @@
   },
   "build": {
     "appId": "com.secupipeline.desktop",
-    "icon": "public/icon.ico",
+    "icon": "public/app-logo.ico",
     "directories": {
       "output": "release"
     },
@@ -78,7 +80,7 @@
       "package.json"
     ],
     "win": {
-      "icon": "public/icon.ico",
+      "icon": "public/app-logo.ico",
       "target": "nsis"
     }
   }

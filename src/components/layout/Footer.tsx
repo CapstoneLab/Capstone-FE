@@ -6,7 +6,7 @@ export function Footer() {
   const { t } = useLanguage()
 
   return (
-    <footer className="border-t border-gray-600/70 bg-gray-800/60">
+    <footer className="app-footer relative z-20 border-t">
       <div className="mx-auto max-w-6xl px-6 py-12">
         <div className="grid gap-10 md:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)]">
           <div>
