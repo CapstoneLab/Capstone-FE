@@ -28,6 +28,7 @@ declare global {
         get?: () => Promise<{
           appName: string
           version: string
+          platform: 'darwin' | 'win32' | 'linux'
         }>
       }
       window?: {

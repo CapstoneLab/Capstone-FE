@@ -50,6 +50,12 @@ function normalizeUpdaterErrorMessage(error: unknown) {
   return error.message.replace(/^Error invoking remote method\s+'[^']+':\s*/i, '').trim()
 }
 
+function detectRendererPlatform(): 'darwin' | 'win32' | 'linux' {
+  if (/Macintosh|Mac OS X/i.test(navigator.userAgent)) return 'darwin'
+  if (/Windows/i.test(navigator.userAgent)) return 'win32'
+  return 'linux'
+}
+
 export function NativeFrameBar() {
   const navigate = useNavigate()
   const location = useLocation()
@@ -69,9 +75,11 @@ export function NativeFrameBar() {
   const [appInfo, setAppInfo] = useState({
     appName: 'Secupipeline',
     version: '0.0.0',
+    platform: detectRendererPlatform(),
   })
   const [releaseInfo, setReleaseInfo] = useState<DesktopReleaseInfo | null>(null)
   const appIconSrc = appLogo
+  const isMacOS = appInfo.platform === 'darwin'
 
   useEffect(() => {
     let mounted = true
@@ -159,6 +167,7 @@ export function NativeFrameBar() {
         setAppInfo({
           appName: info.appName || 'Secupipeline',
           version: info.version || '0.0.0',
+          platform: info.platform || detectRendererPlatform(),
         })
       })
       .catch(() => {
@@ -169,6 +178,7 @@ export function NativeFrameBar() {
         setAppInfo({
           appName: 'Secupipeline',
           version: '0.0.0',
+          platform: detectRendererPlatform(),
         })
       })
 
@@ -246,7 +256,11 @@ export function NativeFrameBar() {
       className="fixed left-0 right-0 top-0 z-50 border-b [-webkit-app-region:drag]"
       style={titlebarStyle}
     >
-      <div className="relative flex h-9 w-full items-center justify-between px-3">
+      <div
+        className={`relative flex h-9 w-full items-center justify-between pr-3 ${
+          isMacOS ? 'pl-[82px]' : 'pl-3'
+        }`}
+      >
         <div className="flex items-center gap-1 [-webkit-app-region:no-drag]">
           <button
             type="button"
@@ -448,6 +462,8 @@ export function NativeFrameBar() {
             </DialogContent>
           </Dialog>
 
+          {!isMacOS ? (
+            <>
           <button
             type="button"
             aria-label="최소화"
@@ -475,6 +491,8 @@ export function NativeFrameBar() {
           >
             <X className="h-4 w-4" />
           </button>
+            </>
+          ) : null}
         </div>
       </div>
 

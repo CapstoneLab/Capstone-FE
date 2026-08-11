@@ -441,6 +441,7 @@ function sendMaximizedState(win) {
 }
 
 function createWindow() {
+  const isMacOS = process.platform === 'darwin'
   const win = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -448,8 +449,9 @@ function createWindow() {
     minHeight: 720,
     icon: getAppIconPath(),
     backgroundColor: '#1E1E1E',
-    frame: false,
-    titleBarStyle: 'hidden',
+    frame: isMacOS,
+    titleBarStyle: isMacOS ? 'hiddenInset' : 'hidden',
+    ...(isMacOS ? { trafficLightPosition: { x: 14, y: 12 } } : {}),
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
@@ -587,6 +589,7 @@ ipcMain.handle('app:get-info', () => {
   return {
     appName: 'Secupipeline',
     version: normalizeVersion(app.getVersion()),
+    platform: process.platform,
   }
 })
 
