@@ -4,13 +4,23 @@ import {
   type CheckSeverity,
   type SecurityCheckItem,
 } from '@/data/securityCatalog'
+import { API_BASE_URL } from '@/lib/config'
 
-const API_BASE =
-  window.location.protocol === 'file:'
-    ? import.meta.env.VITE_API_BASE_URL
-    : '/api-proxy'
+const API_BASE = API_BASE_URL
 
 type UnknownRecord = Record<string, unknown>
+
+function authHeaders(token?: string, hasBody = false): HeadersInit {
+  return {
+    Accept: 'application/json',
+    ...(hasBody ? { 'Content-Type': 'application/json' } : {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  }
+}
+
+function notifyIfUnauthorized(status: number): void {
+  if (status === 401) window.dispatchEvent(new Event('secupipeline:auth-expired'))
+}
 
 export class AuthExpiredError extends Error {
   readonly status: number
@@ -53,6 +63,26 @@ function pick<T = unknown>(obj: UnknownRecord, ...keys: string[]): T | undefined
   return undefined
 }
 
+function readableDetail(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!Array.isArray(value)) return ''
+  return value
+    .map((issue) => {
+      if (!issue || typeof issue !== 'object') return ''
+      const record = issue as UnknownRecord
+      const message = pick<string>(record, 'msg') ?? ''
+      const loc = pick<unknown[]>(record, 'loc')
+      const field = Array.isArray(loc) ? loc.filter((part) => part !== 'body').join('.') : ''
+      return field && message ? `${field}: ${message}` : message
+    })
+    .filter(Boolean)
+    .join(', ')
+}
+
+function errorMessage(payload: UnknownRecord): string {
+  return pick<string>(payload, 'message') ?? readableDetail(payload.detail)
+}
+
 function mapRepo(raw: UnknownRecord): RepositoryItem {
   const isPrivate = pick<boolean>(raw, 'private', 'isPrivate', 'visibility_private')
   const visibilityField = pick<string>(raw, 'visibility')
@@ -75,8 +105,11 @@ function mapRepo(raw: UnknownRecord): RepositoryItem {
     stars: pick<number>(raw, 'stargazers_count', 'stars', 'stargazersCount') ?? 0,
     language: pick<string>(raw, 'language') ?? '',
     branches: defaultBranch ? [defaultBranch] : [],
+    branchCommitShas: {},
     detectEnabled: false,
-    repositoryUrl: htmlUrl,
+    repositoryUrl: pick<string>(raw, 'clone_url', 'cloneUrl') ?? htmlUrl,
+    htmlUrl,
+    ownerLogin: pick<string>(raw, 'owner_login', 'ownerLogin') ?? fullName.split('/')[0] ?? '',
     domainUrl: '',
     pipelineStatus: 'pending',
     source: {
@@ -99,16 +132,17 @@ function extractList(data: unknown): UnknownRecord[] {
 
 export async function fetchRepos(token: string): Promise<RepositoryItem[]> {
   const res = await fetch(`${API_BASE}/api/repos`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: authHeaders(token),
   })
 
   if (!res.ok) {
+    notifyIfUnauthorized(res.status)
     const text = await res.text().catch(() => '')
     console.error('[api] /repos failed:', res.status, text)
     let detail = ''
     try {
       const parsed = JSON.parse(text) as UnknownRecord
-      detail = pick<string>(parsed, 'detail', 'message') ?? ''
+      detail = errorMessage(parsed)
     } catch {
       detail = text
     }
@@ -125,20 +159,25 @@ export async function fetchBranches(
   token: string,
   owner: string,
   repo: string,
-): Promise<string[]> {
+): Promise<Array<{ name: string; commitSha: string }>> {
   const res = await fetch(
     `${API_BASE}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches`,
-    { headers: { Authorization: `Bearer ${token}` } },
+    { headers: authHeaders(token) },
   )
 
   if (!res.ok) {
-    console.error('[api] /branches failed:', res.status)
-    return []
+    notifyIfUnauthorized(res.status)
+    throw new Error(`브랜치를 불러오지 못했습니다. (${res.status})`)
   }
 
   return extractList(await res.json())
-    .map((item) => pick<string>(item, 'name', 'branch') ?? '')
-    .filter(Boolean)
+    .map((item) => ({
+      name: pick<string>(item, 'name') ?? '',
+      commitSha:
+        pick<string>(item, 'commit_sha', 'commitSha') ??
+        pick<string>((pick<UnknownRecord>(item, 'commit') ?? {}), 'sha') ?? '',
+    }))
+    .filter((item) => item.name)
 }
 
 export type JobStatus = 'queued' | 'running' | 'success' | 'failed' | 'cancelled'
@@ -349,7 +388,7 @@ export async function fetchLatestCommit(
   const proxyUrl = `${API_BASE}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(branch)}`
   try {
     const res = await fetch(proxyUrl, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: authHeaders(token),
     })
     if (res.ok) {
       const data = (await res.json()) as UnknownRecord
@@ -532,12 +571,13 @@ export function setRepoDetectEnabled(
 
 export async function fetchJobDetail(token: string, jobId: string): Promise<JobDetail | null> {
   const res = await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: authHeaders(token),
   })
 
   if (res.status === 404) return null
 
   if (!res.ok) {
+    notifyIfUnauthorized(res.status)
     console.error('[api] /api/jobs failed:', res.status)
     throw new Error(`Failed to fetch job ${jobId} (${res.status})`)
   }
@@ -590,6 +630,7 @@ export type VerdictKind = 'pass' | 'warn' | 'block_pending_approval' | 'block'
 // (spec B-0: "그대로 사용, 재계산 금지").
 export type JobVerdictDetail = {
   verdict: VerdictKind | null
+  overallStatus: string
   /** Gauge/banner color — use directly, never recompute from score. */
   gaugeColor: string | null
   score: number | null
@@ -633,6 +674,12 @@ export type JobResult = {
   severitySummary: Record<SecuritySeverity, number>
   scannerSummaries: SecuritySummaryItem[]
   findings: SecurityFinding[]
+  pagination: {
+    total: number
+    limit: number
+    offset: number
+    hasMore: boolean
+  }
 }
 
 function mapFinding(raw: UnknownRecord, idx: number): SecurityFinding {
@@ -649,7 +696,7 @@ function mapFinding(raw: UnknownRecord, idx: number): SecurityFinding {
     id: pick<string | number>(raw, 'id', 'finding_id', 'findingId') !== undefined
       ? String(pick<string | number>(raw, 'id', 'finding_id', 'findingId'))
       : String(idx),
-    scanner: pick<string>(raw, 'scanner', 'scanner_name', 'scannerName') ?? '',
+    scanner: pick<string>(raw, 'scanner') ?? '',
     ruleId: pick<string>(raw, 'rule_id', 'ruleId') ?? '',
     policyItem,
     cwe: pick<string>(raw, 'cwe', 'cwe_id', 'cweId') ?? null,
@@ -667,15 +714,8 @@ function mapFinding(raw: UnknownRecord, idx: number): SecurityFinding {
     codeSnippet: pick<string>(raw, 'code_snippet', 'codeSnippet') ?? null,
     codeSnippetStartLine:
       pick<number>(raw, 'code_snippet_start_line', 'codeSnippetStartLine') ?? null,
-    description: pick<string>(raw, 'message', 'description') ?? '',
-    aiSuggestion:
-      pick<string>(
-        raw,
-        'ai_recommendation',
-        'aiRecommendation',
-        'ai_suggestion',
-        'aiSuggestion',
-      ) ?? '',
+    description: pick<string>(raw, 'description') ?? '',
+    aiSuggestion: pick<string>(raw, 'ai_suggestion', 'aiSuggestion') ?? '',
     references: Array.isArray(refsRaw) ? (refsRaw as string[]) : [],
   }
 }
@@ -773,9 +813,10 @@ function mapJobResult(raw: UnknownRecord): JobResult {
   const verdictDetail: JobVerdictDetail | null = isNewVerdict
     ? {
         verdict: (verdictKind as VerdictKind) ?? null,
-        gaugeColor: pick<string>(verdictObj, 'gauge_color', 'gaugeColor') ?? null,
-        score: pick<number>(verdictObj, 'score') ?? null,
-        scoreLabel: pick<string>(verdictObj, 'score_label', 'scoreLabel') ?? null,
+        overallStatus: pick<string>(verdictObj, 'overall_status', 'overallStatus') ?? '',
+        gaugeColor: pick<string>(scores, 'gauge_color', 'gaugeColor') ?? null,
+        score: pick<number>(scores, 'security_score', 'securityScore') ?? null,
+        scoreLabel: pick<string>(scores, 'score_label', 'scoreLabel') ?? null,
         counts,
         selectedItems: Array.isArray(selRaw) ? (selRaw as string[]) : [],
         selectedCount: pick<number>(verdictObj, 'selected_count', 'selectedCount') ?? null,
@@ -837,6 +878,7 @@ function mapJobResult(raw: UnknownRecord): JobResult {
   const codeQualityScore = pick<number>(scores, 'code_quality_score', 'codeQualityScore')
   const totalFindings =
     pick<number>(verdictObj, 'total_findings', 'totalFindings') ?? findings.length
+  const paginationRaw = (pick<UnknownRecord>(raw, 'pagination') ?? {}) as UnknownRecord
 
   return {
     jobId: pick<string>(raw, 'job_id', 'jobId') ?? '',
@@ -846,9 +888,7 @@ function mapJobResult(raw: UnknownRecord): JobResult {
     completedAt: pick<string>(raw, 'completed_at', 'completedAt') ?? null,
     // Prefer the verdict's pre-computed score (new model) — never recompute
     // when the backend already gave us one.
-    securityScore:
-      verdictDetail?.score ??
-      (typeof securityScore === 'number' ? securityScore : computeSecurityScore(severitySummary)),
+    securityScore: verdictDetail?.score ?? (typeof securityScore === 'number' ? securityScore : null),
     codeQualityScore: typeof codeQualityScore === 'number' ? codeQualityScore : null,
     verdict:
       (pick<JobVerdict>(verdictObj, 'overall_status', 'overallStatus') as JobVerdict) ?? null,
@@ -858,6 +898,12 @@ function mapJobResult(raw: UnknownRecord): JobResult {
     severitySummary,
     scannerSummaries,
     findings,
+    pagination: {
+      total: pick<number>(paginationRaw, 'total') ?? findings.length,
+      limit: pick<number>(paginationRaw, 'limit') ?? 100,
+      offset: pick<number>(paginationRaw, 'offset') ?? 0,
+      hasMore: pick<boolean>(paginationRaw, 'has_more', 'hasMore') ?? false,
+    },
   }
 }
 
@@ -868,17 +914,22 @@ function mapJobResult(raw: UnknownRecord): JobResult {
 export async function fetchJobResult(
   token: string,
   jobId: string,
+  options: { severity?: SecuritySeverity[]; limit?: number; offset?: number } = {},
 ): Promise<JobResult | null> {
+  const params = new URLSearchParams()
+  if (options.severity?.length) params.set('severity', options.severity.join(','))
+  params.set('limit', String(Math.min(1000, Math.max(1, options.limit ?? 100))))
+  params.set('offset', String(Math.max(0, options.offset ?? 0)))
   const res = await fetch(
-    `${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/result`,
-    { headers: { Authorization: `Bearer ${token}` } },
+    `${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/result?${params}`,
+    { headers: authHeaders(token) },
   )
 
   // 404: endpoint/job not found. 425: job not finished — no result yet.
   if (res.status === 404 || res.status === 425) return null
 
   if (!res.ok) {
-    console.error('[api] /api/jobs/{id}/result failed:', res.status)
+    notifyIfUnauthorized(res.status)
     throw new Error(`Failed to fetch job result ${jobId} (${res.status})`)
   }
 
@@ -917,16 +968,17 @@ async function postApproval(
     `${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/approval/${action}`,
     {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      headers: authHeaders(token, action !== 'request'),
+      ...(action === 'request' ? {} : { body: JSON.stringify(body) }),
     },
   )
 
   if (!res.ok) {
+    notifyIfUnauthorized(res.status)
     const text = await res.text().catch(() => '')
     let detail = ''
     try {
-      detail = pick<string>(JSON.parse(text) as UnknownRecord, 'detail', 'message') ?? ''
+      detail = errorMessage(JSON.parse(text) as UnknownRecord)
     } catch {
       detail = text
     }
@@ -1039,10 +1091,11 @@ export async function fetchApprovals(
 ): Promise<ApprovalLogEntry[]> {
   const qs = status ? `?status=${encodeURIComponent(status)}` : ''
   const res = await fetch(`${API_BASE}/api/approvals${qs}`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: authHeaders(token),
   })
 
   if (!res.ok) {
+    notifyIfUnauthorized(res.status)
     console.error('[api] /api/approvals failed:', res.status)
     if (res.status === 401) {
       const text = await res.text().catch(() => '')
@@ -1071,11 +1124,11 @@ function normalizeGrade(grade: string | undefined): CheckSeverity {
 
 export async function fetchSecurityCatalog(token: string): Promise<SecurityCheckItem[]> {
   const res = await fetch(`${API_BASE}/api/security/catalog`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: authHeaders(token),
   })
   if (!res.ok) {
-    console.error('[api] /api/security/catalog failed:', res.status)
-    return []
+    notifyIfUnauthorized(res.status)
+    throw new Error(`보안 정책 카탈로그를 불러오지 못했습니다. (${res.status})`)
   }
   const data = (await res.json()) as UnknownRecord
   const items = (pick<unknown[]>(data, 'items') ?? []) as UnknownRecord[]
@@ -1095,7 +1148,7 @@ export async function fetchSecurityCatalog(token: string): Promise<SecurityCheck
 
 export type StartPipelinePayload = {
   repoUrl: string
-  branch?: string
+  branch: string
   /** Deployment environment. production/staging는 더 엄격 — Medium도 승인 필요로
    *  승격됨 (백엔드 게이트 정책). */
   environment?: PipelineEnvironment
@@ -1106,8 +1159,62 @@ export type StartPipelinePayload = {
   selectedItems?: string[]
   /** Latest commit SHA of the selected repo+branch (best-effort). */
   commitSha?: string
-  /** First run for this repo → backend runs the full baseline regardless. */
-  isFirstRun?: boolean
+}
+
+export type ApprovalRecord = {
+  id: string
+  jobId: string
+  commitSha: string | null
+  scannedCommitSha: string | null
+  repo: string
+  branch: string
+  targetCwes: string[]
+  blockReasons: string[]
+  acknowledgedCwes: string[]
+  followupJobId: string | null
+  reason: string | null
+  approverId: string | null
+  status: 'pending' | 'approved' | 'rejected'
+  approvedAt: string | null
+  expiresAt: string | null
+  createdAt: string | null
+}
+
+function mapApprovalRecord(raw: UnknownRecord): ApprovalRecord {
+  const strings = (key: string): string[] => {
+    const value = pick<unknown[]>(raw, key)
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+  }
+  return {
+    id: String(pick<string | number>(raw, 'id') ?? ''),
+    jobId: pick<string>(raw, 'job_id') ?? '',
+    commitSha: pick<string>(raw, 'commit_sha') ?? null,
+    scannedCommitSha: pick<string>(raw, 'scanned_commit_sha') ?? null,
+    repo: pick<string>(raw, 'repo') ?? '',
+    branch: pick<string>(raw, 'branch') ?? '',
+    targetCwes: strings('target_cwes'),
+    blockReasons: strings('block_reasons'),
+    acknowledgedCwes: strings('acknowledged_cwes'),
+    followupJobId: pick<string>(raw, 'followup_job_id') ?? null,
+    reason: pick<string>(raw, 'reason') ?? null,
+    approverId: pick<string>(raw, 'approver_id') ?? null,
+    status: pick<ApprovalRecord['status']>(raw, 'status') ?? 'pending',
+    approvedAt: pick<string>(raw, 'approved_at') ?? null,
+    expiresAt: pick<string>(raw, 'expires_at') ?? null,
+    createdAt: pick<string>(raw, 'created_at') ?? null,
+  }
+}
+
+export async function fetchApproval(token: string, jobId: string): Promise<ApprovalRecord | null> {
+  const res = await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/approval`, {
+    headers: authHeaders(token),
+  })
+  if (res.status === 404) return null
+  if (!res.ok) {
+    notifyIfUnauthorized(res.status)
+    throw new Error(`승인 정보를 불러오지 못했습니다. (${res.status})`)
+  }
+  return mapApprovalRecord((await res.json()) as UnknownRecord)
 }
 
 export type StartPipelineResponse = {
@@ -1120,37 +1227,37 @@ export async function startPipeline(
   token: string,
   payload: StartPipelinePayload,
 ): Promise<StartPipelineResponse> {
-  const body: UnknownRecord = { repo_url: payload.repoUrl }
-  if (payload.branch) body.branch = payload.branch
-  if (payload.environment) body.environment = payload.environment
-  if (payload.triggerSource) body.trigger_source = payload.triggerSource
-  // Only the selected checks run — catalog keys (e.g. "sql-injection").
-  if (payload.selectedItems && payload.selectedItems.length > 0) {
-    body.selected_items = payload.selectedItems
+  const body: UnknownRecord = {
+    repo_url: payload.repoUrl,
+    branch: payload.branch,
+    trigger_source: payload.triggerSource ?? 'manual',
+    selected_items: payload.selectedItems ?? [],
+    source: import.meta.env.VITE_PIPELINE_SOURCE || 'capstone',
+    environment: payload.environment ?? 'development',
+    workflow_path: null,
+    commit_sha: payload.commitSha || null,
   }
-  if (payload.commitSha) body.commit_sha = payload.commitSha
-  if (payload.isFirstRun !== undefined) body.is_first_run = payload.isFirstRun
-
+  // Only the selected checks run — catalog keys (e.g. "sql-injection").
   // Pipeline-start endpoint (API spec §2-1). /api/pipelines is preferred over
   // /start-pipeline because it adds duplicate-run prevention: a 409 CONFLICT
   // when the same repo+branch already has a running pipeline (handled below).
   const res = await fetch(`${API_BASE}/api/pipelines`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
+      ...authHeaders(token, true),
     },
     body: JSON.stringify(body),
   })
 
   if (!res.ok) {
+    notifyIfUnauthorized(res.status)
     const text = await res.text().catch(() => '')
-    console.error('[api] /api/pipelines failed:', res.status, text)
+    notifyIfUnauthorized(res.status)
     let detail = ''
     let parsed: UnknownRecord | null = null
     try {
       parsed = JSON.parse(text) as UnknownRecord
-      detail = pick<string>(parsed, 'detail', 'message') ?? ''
+      detail = errorMessage(parsed)
     } catch {
       detail = text
     }
@@ -1191,17 +1298,18 @@ export async function cancelPipeline(
     `${API_BASE}/api/pipelines/${encodeURIComponent(jobId)}/cancel`,
     {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
+      headers: authHeaders(token),
     },
   )
 
   if (!res.ok) {
+    notifyIfUnauthorized(res.status)
     const text = await res.text().catch(() => '')
     console.error('[api] /api/pipelines/{id}/cancel failed:', res.status, text)
     let detail = ''
     try {
       const parsed = JSON.parse(text) as UnknownRecord
-      detail = pick<string>(parsed, 'detail', 'message') ?? ''
+      detail = errorMessage(parsed)
     } catch {
       detail = text
     }
@@ -1226,17 +1334,18 @@ export async function deletePipeline(token: string, jobId: string): Promise<void
     `${API_BASE}/api/pipelines/${encodeURIComponent(jobId)}`,
     {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
+      headers: authHeaders(token),
     },
   )
 
   if (!res.ok && res.status !== 204) {
+    notifyIfUnauthorized(res.status)
     const text = await res.text().catch(() => '')
     console.error('[api] DELETE /api/pipelines/{id} failed:', res.status, text)
     let detail = ''
     try {
       const parsed = JSON.parse(text) as UnknownRecord
-      detail = pick<string>(parsed, 'detail', 'message') ?? ''
+      detail = errorMessage(parsed)
     } catch {
       detail = text
     }
@@ -1254,12 +1363,12 @@ export async function fetchPipelineLogs(
 ): Promise<string[]> {
   const res = await fetch(
     `${API_BASE}/api/pipelines/${encodeURIComponent(jobId)}/logs`,
-    { headers: { Authorization: `Bearer ${token}` } },
+    { headers: authHeaders(token) },
   )
 
   if (!res.ok) {
-    console.error('[api] /api/pipelines/{id}/logs failed:', res.status)
-    return []
+    notifyIfUnauthorized(res.status)
+    throw new Error(`로그를 불러오지 못했습니다. (${res.status})`)
   }
 
   const data = (await res.json()) as UnknownRecord
@@ -1285,12 +1394,12 @@ export async function fetchPipelineSteps(
 ): Promise<PipelineStepsResponse> {
   const res = await fetch(
     `${API_BASE}/api/pipelines/${encodeURIComponent(jobId)}/steps`,
-    { headers: { Authorization: `Bearer ${token}` } },
+    { headers: authHeaders(token) },
   )
 
   if (!res.ok) {
-    console.error('[api] /api/pipelines/{id}/steps failed:', res.status)
-    return { steps: [], job: null }
+    notifyIfUnauthorized(res.status)
+    throw new Error(`파이프라인 단계를 불러오지 못했습니다. (${res.status})`)
   }
 
   const data = (await res.json()) as UnknownRecord
@@ -1457,17 +1566,22 @@ export async function fetchReposWithBranches(token: string): Promise<RepositoryI
       continue
     }
 
-    const branches = await fetchBranches(token, owner, name)
-    if (branches.length === 0) {
+    const branchItems = await fetchBranches(token, owner, name)
+    if (branchItems.length === 0) {
       enriched.push(repo)
       continue
     }
 
     const defaultBranch = repo.source.branch
+    const branchNames = branchItems.map((item) => item.name)
     const ordered = defaultBranch
-      ? [defaultBranch, ...branches.filter((b) => b !== defaultBranch)]
-      : branches
-    enriched.push({ ...repo, branches: ordered })
+      ? [defaultBranch, ...branchNames.filter((b) => b !== defaultBranch)]
+      : branchNames
+    enriched.push({
+      ...repo,
+      branches: ordered,
+      branchCommitShas: Object.fromEntries(branchItems.map((item) => [item.name, item.commitSha])),
+    })
   }
 
   return enriched

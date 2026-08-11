@@ -7,8 +7,7 @@ import { GitHubIcon } from '@/components/ui/github-icon'
 import { useAuth } from '@/contexts/AuthContext'
 import { useLanguage } from '@/contexts/LanguageContext'
 import appLogo from '@/assets/app-logo.png'
-
-const GITHUB_LOGIN_URL = `${import.meta.env.VITE_API_BASE_URL}/auth/github/login`
+import { githubLoginUrl } from '@/lib/config'
 
 export function AuthPage() {
   const navigate = useNavigate()
@@ -65,7 +64,7 @@ export function AuthPage() {
     try {
       const startGithubLogin = window.desktop?.auth?.startGithubLogin
       if (typeof startGithubLogin === 'function') {
-        const result = await startGithubLogin(GITHUB_LOGIN_URL)
+        const result = await startGithubLogin(githubLoginUrl)
         if (result?.token) {
           await login(result.token)
           navigate('/dashboard', { replace: true })
@@ -73,7 +72,7 @@ export function AuthPage() {
           setIsPending(false)
         }
       } else {
-        window.location.href = GITHUB_LOGIN_URL
+        window.location.assign(githubLoginUrl)
       }
     } catch (error) {
       setStatus(

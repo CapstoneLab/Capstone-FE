@@ -16,19 +16,17 @@ import {
   addLaunchedRepo,
   addTrackedJobId,
   AuthExpiredError,
-  cancelPipeline,
   fetchJobsByIds,
-  fetchLatestCommit,
   fetchReposWithBranches,
   fetchSecurityCatalog,
   getCachedRepos,
   getLaunchedRepos,
   getTrackedJobIds,
-  hasLaunchedRepo,
   isGithubRateLimitError,
   PipelineConflictError,
   setCachedRepos,
   startPipeline,
+  type PipelineEnvironment,
 } from '@/lib/api'
 import {
   Dialog,
@@ -41,9 +39,7 @@ import {
 import { getLanguageColor } from '@/lib/languageColors'
 import type { RepositoryItem } from '@/data/repositories'
 import {
-  allCheckIds,
   buildCatalogBySeverity,
-  securityCheckCatalog,
   severityMeta,
   severityOrder,
   type CheckSeverity,
@@ -65,16 +61,13 @@ export function NewPipelinePage() {
   const [reposError, setReposError] = useState<string | null>(null)
   const [selectedRepoId, setSelectedRepoId] = useState('')
   const [selectedBranch, setSelectedBranch] = useState('')
-  // Latest commit for the current repo+branch, tagged with the selection key
-  // it was fetched for so a stale SHA is never sent after switching repos.
-  const [commitInfo, setCommitInfo] = useState<{ key: string; sha: string } | null>(null)
-  // Security policy catalog — fetched from GET /api/security/catalog, with the
-  // bundled list as a fallback so the selection UI always renders.
-  const [catalog, setCatalog] = useState<SecurityCheckItem[]>(securityCheckCatalog)
+  const [environment, setEnvironment] = useState<PipelineEnvironment>('development')
+  // Security policy catalog — the server response is the single source of truth.
+  const [catalog, setCatalog] = useState<SecurityCheckItem[]>([])
   // Default to ALL checks selected (spec: "전체 선택" 기본값 권장).
   const [selectedVulnerabilityIds, setSelectedVulnerabilityIds] =
-    useState<string[]>(allCheckIds)
-  const [launchedRepoUrls, setLaunchedRepoUrls] = useState<string[]>(() =>
+    useState<string[]>([])
+  const [, setLaunchedRepoUrls] = useState<string[]>(() =>
     token ? getLaunchedRepos(cacheKey) : [],
   )
   const [isStarting, setIsStarting] = useState(false)
@@ -138,57 +131,32 @@ export function NewPipelinePage() {
 
   const selectedRepo = repos.find((repo) => repo.id === selectedRepoId) ?? null
 
-  const isFirstRunForRepo = useMemo(() => {
-    if (!selectedRepo) return false
-    // hasLaunchedRepo normalizes both sides (lowercase, strips github.com/.git/trailing slash)
-    return !hasLaunchedRepo(cacheKey, selectedRepo.name)
-    // launchedRepoUrls in deps so this recomputes after addLaunchedRepo
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedRepo, launchedRepoUrls, cacheKey])
+  const isFirstRunForRepo = false
 
   const allVulnerabilityIds = useMemo(() => catalog.map((c) => c.id), [catalog])
   const bySeverity = useMemo(() => buildCatalogBySeverity(catalog), [catalog])
 
-  // Load the policy catalog from the API; keep the local fallback if it fails
-  // or returns nothing. Only sets state in the async callback.
+  // Load the policy catalog from the API and select every returned item by default.
   useEffect(() => {
     if (!token) return
     let cancelled = false
     fetchSecurityCatalog(token)
       .then((items) => {
-        if (!cancelled && items.length > 0) setCatalog(items)
+        if (!cancelled && items.length > 0) {
+          setCatalog(items)
+          setSelectedVulnerabilityIds(items.map((item) => item.id))
+        }
       })
-      .catch(() => {})
+      .catch((error) => {
+        if (!cancelled) setStartError(error instanceof Error ? error.message : '보안 정책을 불러오지 못했습니다.')
+      })
     return () => {
       cancelled = true
     }
   }, [token])
 
-  // Selection key for the commit we want — so we never send a SHA fetched for
-  // a different repo/branch than the one currently selected.
-  const selectionKey =
-    selectedRepo && selectedBranch ? `${selectedRepo.id}@${selectedBranch}` : ''
-  const currentCommitSha =
-    commitInfo && commitInfo.key === selectionKey ? commitInfo.sha : ''
-
-  // Best-effort fetch of the selected repo+branch's latest commit SHA so the
-  // POST /api/pipelines body can include `commit_sha`. Only sets state inside
-  // the async callback (no synchronous setState in the effect body).
-  useEffect(() => {
-    if (!token || !selectedRepo || !selectedBranch) return
-    const [owner, repo] = selectedRepo.name.split('/')
-    if (!owner || !repo) return
-    const key = `${selectedRepo.id}@${selectedBranch}`
-    let cancelled = false
-    fetchLatestCommit(token, owner, repo, selectedBranch)
-      .then((commit) => {
-        if (!cancelled && commit?.sha) setCommitInfo({ key, sha: commit.sha })
-      })
-      .catch(() => {})
-    return () => {
-      cancelled = true
-    }
-  }, [token, selectedRepo, selectedBranch])
+  // Use the commit SHA returned with the selected branch.
+  const currentCommitSha = selectedRepo?.branchCommitShas?.[selectedBranch] ?? ''
 
   useEffect(() => {
     if (repos.length === 0) return
@@ -284,11 +252,11 @@ export function NewPipelinePage() {
         selectedRepo.repositoryUrl || `https://github.com/${selectedRepo.name}`
       const { jobId } = await startPipeline(token, {
         repoUrl: repoUrlToSend,
-        branch: selectedBranch || undefined,
-        triggerSource: 'windows-api',
+        branch: selectedBranch,
+        triggerSource: 'manual',
+        environment,
         selectedItems: checksToSend,
         commitSha: currentCommitSha || undefined,
-        isFirstRun: isFirstRunForRepo,
       })
       if (!jobId) throw new Error(t('pipelineNew.serverNoJobId'))
       addTrackedJobId(cacheKey, jobId)
@@ -318,25 +286,15 @@ export function NewPipelinePage() {
     }
   }
 
-  async function handleConfirmConflict() {
-    if (!conflictDialog || !token) return
+  function handleConfirmConflict() {
+    const existingJobId = conflictDialog?.existingJobId
+    if (!existingJobId) return
     setIsResolvingConflict(true)
-    try {
-      if (conflictDialog.existingJobId) {
-        await cancelPipeline(token, conflictDialog.existingJobId)
-      }
-      setConflictDialog(null)
-      await handleStartPipeline()
-    } catch (error) {
-      setStartError(
-        error instanceof Error
-          ? error.message
-          : t('pipelineNew.cancelExistingFailed'),
-      )
-      setConflictDialog(null)
-    } finally {
-      setIsResolvingConflict(false)
-    }
+    addTrackedJobId(cacheKey, existingJobId)
+    setConflictDialog(null)
+    navigate('/pipeline/progress', {
+      state: { jobId: existingJobId, repoName: selectedRepo?.name ?? '', branch: selectedBranch },
+    })
   }
 
   return (
@@ -465,6 +423,19 @@ export function NewPipelinePage() {
                     </SelectContent>
                   </Select>
                 </div>
+                <p className="mt-3 text-[12px] text-[#6B7280]">실행 환경</p>
+                <Select value={environment} onValueChange={(value) => setEnvironment(value as PipelineEnvironment)}>
+                  <SelectTrigger className="mt-2"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="development">Development</SelectItem>
+                    <SelectItem value="feature">Feature</SelectItem>
+                    <SelectItem value="staging">Staging</SelectItem>
+                    <SelectItem value="production">Production</SelectItem>
+                  </SelectContent>
+                </Select>
+                {environment === 'production' || environment === 'staging' ? (
+                  <p className="mt-2 text-[11px] text-[#FBBF24]">이 환경에서는 Medium 탐지도 승인 대상으로 승격될 수 있습니다.</p>
+                ) : null}
               </div>
             </div>
 
@@ -483,7 +454,7 @@ export function NewPipelinePage() {
                 </div>
               ) : null}
 
-              <div className="rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
+              <div className="rounded-lg bg-transparent p-3">
                 <div className="flex items-center justify-between">
                   <p className="text-[13px] font-semibold text-[#D1D5DB]">{t('pipelineNew.checkItems')}</p>
                   <div className="flex items-center gap-3">
@@ -520,7 +491,7 @@ export function NewPipelinePage() {
                     return (
                       <div
                         key={severity}
-                        className="rounded-lg border border-[#2F2F2F] bg-[#171717] p-2.5"
+                        className="rounded-lg bg-transparent p-2.5"
                       >
                         <div className="flex items-center justify-between">
                           <p className="inline-flex items-center gap-2 text-[13px] font-semibold text-[#E5E7EB]">
@@ -654,7 +625,7 @@ export function NewPipelinePage() {
               disabled={isResolvingConflict || !conflictDialog?.existingJobId}
               className="bg-[#34D399] text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
             >
-              {isResolvingConflict ? t('pipelineNew.processing') : t('pipelineNew.cancelAndRestart')}
+              {isResolvingConflict ? t('pipelineNew.processing') : t('pipelineNew.openExisting')}
             </Button>
           </DialogFooter>
           {!conflictDialog?.existingJobId ? (

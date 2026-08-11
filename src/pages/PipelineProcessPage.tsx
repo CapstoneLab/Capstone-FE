@@ -49,7 +49,7 @@ type LocationState = {
 
 // Poll often enough that each newly appended backend log batch is reflected
 // in the UI without making the desktop app noisy.
-const POLL_INTERVAL_MS = 800
+const POLL_INTERVAL_MS = 2500
 const TERMINAL_JOB_STATUSES = new Set(['success', 'failed', 'cancelled'])
 const TERMINAL_STEP_STATUSES = new Set(['success', 'failed', 'cancelled', 'skipped'])
 
@@ -426,7 +426,7 @@ export function PipelineProcessPage() {
       setIsInitialLoading(false)
 
       if (!isTerminal) {
-        timer = window.setTimeout(tick, POLL_INTERVAL_MS)
+        timer = window.setTimeout(tick, document.hidden ? 10000 : POLL_INTERVAL_MS)
       }
     }
 

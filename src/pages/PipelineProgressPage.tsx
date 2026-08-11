@@ -24,7 +24,6 @@ import { useAuth } from '@/contexts/AuthContext'
 import { useTheme } from '@/contexts/ThemeContext'
 import { useLanguage } from '@/contexts/LanguageContext'
 import {
-  computeSecurityScore,
   fetchJobDetail,
   fetchJobResult,
   type JobDetail,
@@ -237,40 +236,6 @@ function shortSummary(text: string): string {
   return s
 }
 
-function escapeCodeHtml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-}
-
-function highlightCodeSnippet(code: string): string {
-  const highlighter = (window as unknown as {
-    hljs?: {
-      highlight?: (code: string, options: { language: string; ignoreIllegals: boolean }) => { value: string }
-      highlightAuto?: (code: string, languageSubset?: string[]) => { value: string }
-    }
-  }).hljs
-
-  try {
-    return (
-      highlighter?.highlight?.(code, { language: 'javascript', ignoreIllegals: true }).value ??
-      highlighter?.highlightAuto?.(code, ['javascript', 'typescript', 'json']).value ??
-      escapeCodeHtml(code)
-    )
-  } catch {
-    return escapeCodeHtml(code)
-  }
-}
-
-function scoreBandColor(score: number | null): string {
-  if (score == null) return '#9CA3AF'
-  if (score >= 80) return '#22C55E'
-  if (score >= 50) return '#F97316'
-  return '#EF4444'
-}
-
 export function PipelineProgressPage() {
   const navigate = useNavigate()
   const { token } = useAuth()
@@ -290,15 +255,32 @@ export function PipelineProgressPage() {
   // shown as "복사됨" briefly.
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const [downloadOpen, setDownloadOpen] = useState(false)
-  const [highlightReady, setHighlightReady] = useState(
-    () => !!(window as unknown as { hljs?: unknown }).hljs,
-  )
+  const [isLoadingMore, setIsLoadingMore] = useState(false)
 
   async function handleCopy(key: string, text: string) {
     const ok = await copyToClipboard(text)
     if (!ok) return
     setCopiedKey(key)
     window.setTimeout(() => setCopiedKey((cur) => (cur === key ? null : cur)), 1500)
+  }
+
+  async function handleLoadMore() {
+    if (!token || !jobId || !result?.pagination.hasMore || isLoadingMore) return
+    setIsLoadingMore(true)
+    try {
+      const next = await fetchJobResult(token, jobId, {
+        limit: result.pagination.limit,
+        offset: result.findings.length,
+      })
+      if (next) {
+        setResult((current) => current ? {
+          ...next,
+          findings: [...current.findings, ...next.findings],
+        } : next)
+      }
+    } finally {
+      setIsLoadingMore(false)
+    }
   }
 
   useEffect(() => {
@@ -335,36 +317,6 @@ export function PipelineProgressPage() {
     }
   }, [jobId, token, t])
 
-  useEffect(() => {
-    if ((window as unknown as { hljs?: unknown }).hljs) {
-      setHighlightReady(true)
-      return
-    }
-
-    const cssId = 'highlightjs-github-dark-css'
-    if (!document.getElementById(cssId)) {
-      const link = document.createElement('link')
-      link.id = cssId
-      link.rel = 'stylesheet'
-      link.href = 'https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github-dark.min.css'
-      document.head.appendChild(link)
-    }
-
-    const scriptId = 'highlightjs-cdn-script'
-    const existing = document.getElementById(scriptId) as HTMLScriptElement | null
-    if (existing) {
-      existing.addEventListener('load', () => setHighlightReady(true), { once: true })
-      return
-    }
-
-    const script = document.createElement('script')
-    script.id = scriptId
-    script.src = 'https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/lib/common.min.js'
-    script.async = true
-    script.onload = () => setHighlightReady(true)
-    document.body.appendChild(script)
-  }, [])
-
   const repoName = result?.repoName || detail?.repoName || locationState.repoName || ''
   const branch = result?.branch || detail?.branch || locationState.branch || ''
   const repoUrl = result?.repoUrl || detail?.repoUrl || ''
@@ -372,6 +324,7 @@ export function PipelineProgressPage() {
 
   // The rich gate verdict (new model). null => legacy/summary-only payload.
   const vd: JobVerdictDetail | null = result?.verdictDetail ?? null
+  const isResultPending = vd?.overallStatus === 'pending' || jobStatus === 'queued' || jobStatus === 'running'
 
   // Backend score (B-0: prefer as-is). gauge_color too. The final `score` is
   // reconciled against the in-scope findings just below — a perfect 100 while
@@ -414,12 +367,9 @@ export function PipelineProgressPage() {
   // null, or a suspiciously perfect 100 while in-scope findings exist (empty-
   // derived — the same defect that zeroed the counts), is recomputed from the
   // same counts the chart shows so the gauge actually reflects the deduction.
-  const score =
-    (rawScore == null || rawScore === 100) && totalCount > 0
-      ? computeSecurityScore(counts)
-      : rawScore
+  const score = rawScore
   const scoreLabel = vd?.scoreLabel || (score != null ? `${score}/100` : null)
-  const displayScoreColor = scoreBandColor(score)
+  const displayScoreColor = vd?.gaugeColor ?? '#9CA3AF'
 
   // Effective verdict — prefer the rich model, else map the legacy verdict.
   const effectiveVerdict: VerdictKind | null =
@@ -756,14 +706,27 @@ export function PipelineProgressPage() {
               </button>
             </div>
             <pre className="result-code-block overflow-x-auto bg-[#0F0F0F] p-3 text-[12px] leading-relaxed text-[#D1D5DB]">
-              <code
-                className="language-javascript font-mono"
-                dangerouslySetInnerHTML={{
-                  __html: highlightReady
-                    ? highlightCodeSnippet(item.codeSnippet)
-                    : escapeCodeHtml(item.codeSnippet),
-                }}
-              />
+              <code className="font-mono">
+                {item.codeSnippet.split('\n').map((line, index) => {
+                  const lineNo = item.codeSnippetStartLine == null
+                    ? null
+                    : item.codeSnippetStartLine + index
+                  const vulnerable = lineNo === item.lineStart
+                  return (
+                    <span
+                      key={`${item.id}:${lineNo ?? index}`}
+                      className={`result-code-line block ${vulnerable ? 'result-code-line--vulnerable bg-red-950/70 text-red-100' : ''}`}
+                    >
+                      {lineNo == null ? null : (
+                        <span className="result-code-line-number mr-4 inline-block w-10 select-none text-right text-[#6B7280]">
+                          {lineNo}
+                        </span>
+                      )}
+                      {line || ' '}
+                    </span>
+                  )
+                })}
+              </code>
             </pre>
           </div>
         ) : null}
@@ -1120,7 +1083,7 @@ export function PipelineProgressPage() {
 
           {inScopeFindings.length === 0 ? (
             <div className="rounded-xl border border-[#404040] bg-[#1E1E1E] p-6 text-center text-[12px] text-[#6B7280]">
-              {result === null
+              {result === null || isResultPending
                 ? t('result.detailPending')
                 : t('result.noInScopeFindings')}
             </div>
@@ -1140,6 +1103,15 @@ export function PipelineProgressPage() {
             </p>
             <div className="space-y-3">{outOfScopeFindings.map(renderFinding)}</div>
           </Card>
+        ) : null}
+
+        {result?.pagination.hasMore ? (
+          <div className="flex justify-center">
+            <Button type="button" variant="outline" disabled={isLoadingMore} onClick={() => void handleLoadMore()}>
+              {isLoadingMore ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              탐지 결과 더 보기 ({result.findings.length}/{result.pagination.total})
+            </Button>
+          </div>
         ) : null}
       </section>
 

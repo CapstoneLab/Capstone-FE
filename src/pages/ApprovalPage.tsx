@@ -9,6 +9,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import {
   ApprovalForbiddenError,
   approveJob,
+  fetchApproval,
   fetchJobResult,
   rejectJob,
   requestApproval,
@@ -47,8 +48,8 @@ export function ApprovalPage() {
   useEffect(() => {
     if (!jobId || !token) return
     let cancelled = false
-    fetchJobResult(token, jobId)
-      .then((res) => {
+    Promise.all([fetchJobResult(token, jobId), fetchApproval(token, jobId)])
+      .then(([res, approval]) => {
         if (cancelled) return
         setResult(res)
         // C-3 default: pre-select every blocking High CWE (전체 승인 기본).
@@ -57,6 +58,17 @@ export function ApprovalPage() {
             .filter((f) => f.inScope && f.severity === 'high' && f.cwe)
             .map((f) => f.cwe as string)
           setSelectedCwes(new Set(cwes))
+        }
+        setRequested(approval?.status === 'pending')
+        if (approval?.status === 'approved') {
+          setApproveResult({
+            status: approval.status,
+            followupJobId: approval.followupJobId,
+            acknowledgedCwes: approval.acknowledgedCwes,
+            message: approval.reason ?? '',
+          })
+        } else if (approval?.status === 'rejected') {
+          setRejected(true)
         }
       })
       .catch((err) => {

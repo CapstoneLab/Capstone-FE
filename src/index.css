@@ -326,8 +326,22 @@ body {
 
 :root[data-theme='light'] .result-code-block,
 :root[data-theme='light'] .result-code-block code {
-  background-color: #0d1117 !important;
-  color: #d1d5db !important;
+  background-color: #27313a !important;
+  color: #dce5ec !important;
+}
+
+:root[data-theme='light'] .result-code-block {
+  border: 1px solid #3b4752;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+:root[data-theme='light'] .result-code-line-number {
+  color: #8796a5 !important;
+}
+
+:root[data-theme='light'] .result-code-line--vulnerable {
+  background-color: #674247 !important;
+  color: #fff1f2 !important;
 }
 
 /* Named gray-scale surfaces. The @theme gray scale is DARK (gray-700 =

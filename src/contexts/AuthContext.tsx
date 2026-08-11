@@ -1,12 +1,10 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-
-const API_BASE =
-  window.location.protocol === 'file:'
-    ? import.meta.env.VITE_API_BASE_URL
-    : '/api-proxy'
+import { API_BASE_URL } from '@/lib/config'
 
 export type User = {
+  id: string | number | null
+  githubId: string | number | null
   login: string
   name: string | null
   avatarUrl: string | null
@@ -25,6 +23,22 @@ const AuthContext = createContext<AuthState | null>(null)
 
 const TOKEN_KEY = 'secupipeline:token'
 
+function readBrowserToken(): string | null {
+  try {
+    return sessionStorage.getItem(TOKEN_KEY)
+  } catch {
+    return null
+  }
+}
+
+function writeBrowserToken(token: string): void {
+  sessionStorage.setItem(TOKEN_KEY, token)
+}
+
+function clearBrowserToken(): void {
+  sessionStorage.removeItem(TOKEN_KEY)
+}
+
 export function getAuthCacheKey(token: string | null, user: User | null): string {
   const login = user?.login?.trim().toLowerCase()
   if (login) return `user:${login}`
@@ -32,8 +46,8 @@ export function getAuthCacheKey(token: string | null, user: User | null): string
 }
 
 async function fetchMe(token: string): Promise<User> {
-  const res = await fetch(`${API_BASE}/auth/me`, {
-    headers: { Authorization: `Bearer ${token}` },
+  const res = await fetch(`${API_BASE_URL}/auth/me`, {
+    headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
   })
 
   if (!res.ok) {
@@ -43,13 +57,13 @@ async function fetchMe(token: string): Promise<User> {
   }
 
   const data = await res.json()
-  console.log('[AuthContext] /auth/me response:', data)
-
   const login =
     data.github_login ?? data.githubLogin ?? data.login ?? data.username ?? ''
   const name = data.display_name ?? data.displayName ?? data.name ?? login ?? null
 
   return {
+    id: data.id ?? null,
+    githubId: data.github_id ?? data.githubId ?? null,
     login,
     name,
     avatarUrl: data.avatar_url ?? data.avatarUrl ?? data.profileImageUrl ?? null,
@@ -61,14 +75,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [token, setToken] = useState<string | null>(() => {
     try {
-      return localStorage.getItem(TOKEN_KEY)
+      return window.desktop?.auth?.getSavedToken ? null : readBrowserToken()
     } catch {
       return null
     }
   })
   const [isLoading, setIsLoading] = useState(() => {
     try {
-      return !!localStorage.getItem(TOKEN_KEY) || !!window.desktop?.auth?.getSavedToken
+      return !!readBrowserToken() || !!window.desktop?.auth?.getSavedToken
     } catch {
       return !!window.desktop?.auth?.getSavedToken
     }
@@ -78,8 +92,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setIsLoading(true)
     try {
       const userInfo = await fetchMe(newToken)
-      localStorage.setItem(TOKEN_KEY, newToken)
-      await window.desktop?.auth?.setSavedToken?.(newToken)
+      if (window.desktop?.auth?.setSavedToken) {
+        await window.desktop.auth.setSavedToken(newToken)
+      } else {
+        writeBrowserToken(newToken)
+      }
       setToken(newToken)
       setUser(userInfo)
     } finally {
@@ -88,7 +105,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const logout = useCallback(() => {
-    localStorage.removeItem(TOKEN_KEY)
+    clearBrowserToken()
     void window.desktop?.auth?.clearSavedToken?.()
     setToken(null)
     setUser(null)
@@ -107,7 +124,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .then((savedToken) => {
         if (!mounted) return
         if (savedToken) {
-          localStorage.setItem(TOKEN_KEY, savedToken)
           setToken(savedToken)
         } else {
           setIsLoading(false)
@@ -137,7 +153,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       })
       .catch(() => {
         if (mounted) {
-          localStorage.removeItem(TOKEN_KEY)
+          clearBrowserToken()
           void window.desktop?.auth?.clearSavedToken?.()
           setToken(null)
         }
@@ -152,6 +168,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       mounted = false
     }
   }, [token, user])
+
+  useEffect(() => {
+    const handleExpired = () => logout()
+    window.addEventListener('secupipeline:auth-expired', handleExpired)
+    return () => window.removeEventListener('secupipeline:auth-expired', handleExpired)
+  }, [logout])
 
   const value = useMemo(
     () => ({ user, token, isLoading, login, logout }),

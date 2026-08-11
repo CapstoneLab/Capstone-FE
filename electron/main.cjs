@@ -614,7 +614,7 @@ ipcMain.handle('auth:open-github-login', async (event, payload) => {
       try {
         const parsed = new URL(url)
         const token = parsed.searchParams.get('token')
-        if (token && parsed.pathname.includes('/auth/success')) {
+        if (token && (parsed.pathname.includes('/auth/success') || parsed.pathname.includes('/auth/callback'))) {
           if (!resolved) {
             resolved = true
             event.sender.send('auth:token-received', token)

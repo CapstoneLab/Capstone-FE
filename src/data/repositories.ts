@@ -16,8 +16,11 @@ export type RepositoryItem = {
   stars: number
   language: string
   branches: string[]
+  branchCommitShas: Record<string, string>
   detectEnabled: boolean
   repositoryUrl: string
+  htmlUrl: string
+  ownerLogin: string
   domainUrl: string
   pipelineStatus: PipelineStatus
   source: RepositorySourceInfo
@@ -33,8 +36,11 @@ export const repositorySeed: RepositoryItem[] = [
     stars: 12,
     language: 'TypeScript',
     branches: ['main', 'develop', 'feature/login'],
+    branchCommitShas: {},
     detectEnabled: true,
     repositoryUrl: 'https://github.com/myuser/web-app',
+    htmlUrl: 'https://github.com/myuser/web-app',
+    ownerLogin: 'myuser',
     domainUrl: 'web-app.example.com',
     pipelineStatus: 'success',
     source: {
@@ -53,8 +59,11 @@ export const repositorySeed: RepositoryItem[] = [
     stars: 8,
     language: 'TypeScript',
     branches: ['main', 'develop', 'feature/login', 'release/v1'],
+    branchCommitShas: {},
     detectEnabled: true,
     repositoryUrl: 'https://github.com/myuser/api-server',
+    htmlUrl: 'https://github.com/myuser/api-server',
+    ownerLogin: 'myuser',
     domainUrl: 'api-server.example.com',
     pipelineStatus: 'pending',
     source: {
