@@ -1,4 +1,4 @@
-name: CD Release Windows EXE
+name: CD Release Desktop
 
 on:
   workflow_dispatch:
@@ -12,18 +12,20 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
+  metadata:
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.semver.outputs.tag }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -41,10 +43,9 @@ jobs:
             echo "Version '$VERSION' is not a valid semantic version (example: 1.2.3)."
             exit 1
           fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Check if release already exists
-        id: release_check
+      - name: Stop if release already exists
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
@@ -54,30 +55,25 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${{ steps.semver.outputs.tag }}")
           if [ "$STATUS" = "200" ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Release ${{ steps.semver.outputs.tag }} already exists. Bump package.json version before releasing."
+            exit 1
           fi
 
-      - name: Stop if release already exists
-        if: steps.release_check.outputs.exists == 'true'
-        shell: bash
-        run: |
-          echo "Release ${{ steps.semver.outputs.tag }} already exists. Bump package.json version before releasing."
-          exit 1
+  build-windows:
+    needs: metadata
+    runs-on: windows-latest
 
-      - name: Create release tag (idempotent)
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch --tags origin
-          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.semver.outputs.tag }}" >/dev/null 2>&1; then
-            echo "Tag ${{ steps.semver.outputs.tag }} already exists on origin, skipping creation."
-          else
-            git tag "${{ steps.semver.outputs.tag }}"
-            git push origin "${{ steps.semver.outputs.tag }}"
-          fi
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
 
       - name: Install dependencies
         run: npm ci
@@ -88,29 +84,87 @@ jobs:
       - name: Package Windows EXE
         run: npx electron-builder --win nsis --publish never --config.win.signAndEditExecutable=false
 
-      - name: Resolve installer path
-        id: resolve_installer
-        shell: pwsh
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows
+          path: release/*.exe
+          if-no-files-found: error
+
+  build-macos:
+    needs: metadata
+    runs-on: macos-14
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build renderer
+        run: npm run build
+
+      - name: Package macOS DMGs
+        run: npx electron-builder --mac dmg --x64 --arm64 --publish never
+
+      - name: Upload macOS installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-macos
+          path: release/*.dmg
+          if-no-files-found: error
+
+  release:
+    needs:
+      - metadata
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Download packaged installers
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create release tag
+        shell: bash
         run: |
-          $installer = Get-ChildItem -Path "release" -Filter "*.exe" |
-            Where-Object { $_.Name -like "*Setup*" } |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch --tags origin
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ needs.metadata.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Tag ${{ needs.metadata.outputs.tag }} already exists on origin, skipping creation."
+          else
+            git tag "${{ needs.metadata.outputs.tag }}"
+            git push origin "${{ needs.metadata.outputs.tag }}"
+          fi
 
-          if (-not $installer) {
-            throw "Installer EXE not found in release folder."
-          }
-
-          "installer_path=$($installer.FullName)" >> $env:GITHUB_OUTPUT
-
-      - name: Upload EXE to GitHub Release
+      - name: Publish desktop installers
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.semver.outputs.tag }}
-          name: Release ${{ steps.semver.outputs.tag }}
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          name: Release ${{ needs.metadata.outputs.tag }}
           generate_release_notes: true
-          files: |
-            ${{ steps.resolve_installer.outputs.installer_path }}
+          files: release-assets/*
           token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}

@@ -1,7 +1,8 @@
-import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
+import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { ApprovalPage } from '@/pages/ApprovalPage'
 import { AuditLogPage } from '@/pages/AuditLogPage'
+import { AuthCallbackPage } from '@/pages/AuthCallbackPage'
 import { AuthPage } from '@/pages/AuthPage'
 import { DashboardPage } from '@/pages/DashboardPage'
 import { DocsPage } from '@/pages/DocsPage'
@@ -12,45 +13,20 @@ import { PipelineProgressPage } from '@/pages/PipelineProgressPage'
 import { RepositoryDetailPage } from '@/pages/RepositoryDetailPage'
 import { useAuth } from '@/contexts/AuthContext'
 import { NativeFrameBar } from '@/components/layout/NativeFrameBar'
-import { useEffect, useState } from 'react'
-
-function AuthCallback() {
-  const navigate = useNavigate()
-  const { login } = useAuth()
-  const [callbackToken] = useState(() => new URL(window.location.href).searchParams.get('token'))
-  const [error, setError] = useState<string | null>(() =>
-    callbackToken ? null : '인증 토큰이 없습니다. 다시 로그인해 주세요.',
-  )
-
-  useEffect(() => {
-    const url = new URL(window.location.href)
-    url.searchParams.delete('token')
-    window.history.replaceState({}, document.title, `${url.pathname}${url.search}${url.hash}`)
-
-    if (!callbackToken) return
-
-    let cancelled = false
-    login(callbackToken)
-      .then(() => {
-        if (!cancelled) navigate('/dashboard', { replace: true })
-      })
-      .catch(() => {
-        if (!cancelled) setError('로그인 정보를 확인하지 못했습니다. 다시 로그인해 주세요.')
-      })
-    return () => { cancelled = true }
-  }, [callbackToken, login, navigate])
-
-  return <div className="flex h-full items-center justify-center text-sm text-gray-300">{error ?? 'GitHub 로그인을 확인하는 중입니다...'}</div>
-}
 
 function AuthRedirect({ children }: { children: React.ReactNode }) {
   const { user, isLoading } = useAuth()
-  if (isLoading) return null
+  if (isLoading) {
+    return (
+      <div className="flex h-full items-center justify-center text-sm text-gray-300">
+        로그인 정보를 확인하는 중입니다...
+      </div>
+    )
+  }
   if (user) return <Navigate to="/dashboard" replace />
   return <>{children}</>
 }
 
-// Page-level transition applies only below the native titlebar.
 const pageVariants = {
   initial: { opacity: 0, y: -24, scale: 0.99 },
   animate: { opacity: 1, y: 0, scale: 1 },
@@ -100,7 +76,7 @@ function App() {
                 </PageTransition>
               }
             />
-            <Route path="/auth/callback" element={<PageTransition><AuthCallback /></PageTransition>} />
+            <Route path="/auth/callback" element={<PageTransition><AuthCallbackPage /></PageTransition>} />
             <Route path="/docs" element={<PageTransition><DocsPage /></PageTransition>} />
             <Route path="/dashboard" element={<PageTransition><DashboardPage /></PageTransition>} />
             <Route path="/repository" element={<PageTransition><RepositoryDetailPage /></PageTransition>} />

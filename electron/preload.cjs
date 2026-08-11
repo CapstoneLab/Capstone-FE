@@ -21,19 +21,9 @@ contextBridge.exposeInMainWorld('desktop', {
     },
   },
   auth: {
-    startGithubLogin: (url) => ipcRenderer.invoke('auth:open-github-login', { url }),
     getSavedToken: () => ipcRenderer.invoke('auth:get-token'),
     setSavedToken: (token) => ipcRenderer.invoke('auth:set-token', token),
     clearSavedToken: () => ipcRenderer.invoke('auth:clear-token'),
-    onAuthToken: (callback) => {
-      if (typeof callback !== 'function') {
-        return () => {}
-      }
-
-      const listener = (_event, token) => callback(token)
-      ipcRenderer.on('auth:token-received', listener)
-      return () => ipcRenderer.removeListener('auth:token-received', listener)
-    },
   },
   report: {
     savePdf: (html, fileName) =>

@@ -1,14 +1,19 @@
-const DEFAULT_API_BASE_URL = 'https://api.pwd.kr/capstonelab/capstone-back'
+export const DEFAULT_API_BASE_URL = 'https://112.186.136.153'
 
 export const REMOTE_API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL || DEFAULT_API_BASE_URL
 ).replace(/\/+$/, '')
 
+const isViteBrowserDevelopment =
+  import.meta.env.DEV &&
+  typeof window !== 'undefined' &&
+  window.location.protocol !== 'file:'
+
 // Electron development loads the renderer from Vite's localhost origin. Route
 // API fetches through Vite there so the browser never performs a cross-origin
 // request. Packaged Electron (`file:`) and deployed web builds use the real URL.
 export const API_BASE_URL =
-  import.meta.env.DEV && window.location.protocol !== 'file:'
+  isViteBrowserDevelopment
     ? '/api-proxy'
     : REMOTE_API_BASE_URL
 

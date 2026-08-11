@@ -1,15 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { API_BASE_URL } from '@/lib/config'
+import { fetchCurrentUser, type AuthUser } from '@/lib/auth'
 
-export type User = {
-  id: string | number | null
-  githubId: string | number | null
-  login: string
-  name: string | null
-  avatarUrl: string | null
-  email: string | null
-}
+export type User = AuthUser
 
 type AuthState = {
   user: User | null
@@ -39,36 +32,15 @@ function clearBrowserToken(): void {
   sessionStorage.removeItem(TOKEN_KEY)
 }
 
+function clearPersistedToken(): void {
+  clearBrowserToken()
+  void window.desktop?.auth?.clearSavedToken?.()
+}
+
 export function getAuthCacheKey(token: string | null, user: User | null): string {
   const login = user?.login?.trim().toLowerCase()
   if (login) return `user:${login}`
   return token ? token.slice(0, 16) : 'anonymous'
-}
-
-async function fetchMe(token: string): Promise<User> {
-  const res = await fetch(`${API_BASE_URL}/auth/me`, {
-    headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
-  })
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    console.error('[AuthContext] /auth/me failed:', res.status, text)
-    throw new Error(`Failed to fetch user info (${res.status})`)
-  }
-
-  const data = await res.json()
-  const login =
-    data.github_login ?? data.githubLogin ?? data.login ?? data.username ?? ''
-  const name = data.display_name ?? data.displayName ?? data.name ?? login ?? null
-
-  return {
-    id: data.id ?? null,
-    githubId: data.github_id ?? data.githubId ?? null,
-    login,
-    name,
-    avatarUrl: data.avatar_url ?? data.avatarUrl ?? data.profileImageUrl ?? null,
-    email: data.email ?? null,
-  }
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -91,7 +63,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const login = useCallback(async (newToken: string) => {
     setIsLoading(true)
     try {
-      const userInfo = await fetchMe(newToken)
+      const userInfo = await fetchCurrentUser(newToken, {
+        onUnauthorized: clearPersistedToken,
+      })
       if (window.desktop?.auth?.setSavedToken) {
         await window.desktop.auth.setSavedToken(newToken)
       } else {
@@ -99,14 +73,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
       setToken(newToken)
       setUser(userInfo)
+    } catch (error) {
+      clearPersistedToken()
+      setToken(null)
+      setUser(null)
+      throw error
     } finally {
       setIsLoading(false)
     }
   }, [])
 
   const logout = useCallback(() => {
-    clearBrowserToken()
-    void window.desktop?.auth?.clearSavedToken?.()
+    clearPersistedToken()
     setToken(null)
     setUser(null)
   }, [])
@@ -145,7 +123,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     let mounted = true
 
-    fetchMe(token)
+    fetchCurrentUser(token, { onUnauthorized: clearPersistedToken })
       .then((userInfo) => {
         if (mounted) {
           setUser(userInfo)
@@ -153,8 +131,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       })
       .catch(() => {
         if (mounted) {
-          clearBrowserToken()
-          void window.desktop?.auth?.clearSavedToken?.()
+          clearPersistedToken()
           setToken(null)
         }
       })

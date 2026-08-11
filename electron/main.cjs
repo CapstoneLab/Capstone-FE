@@ -236,21 +236,31 @@ function isAllowedDownloadUrl(url) {
   }
 }
 
-function pickInstallerAsset(assets) {
+function pickInstallerAsset(assets, platform = process.platform, architecture = process.arch) {
   if (!Array.isArray(assets)) {
     return null
   }
 
-  const exeAssets = assets.filter((asset) =>
-    typeof asset?.name === 'string' ? asset.name.toLowerCase().endsWith('.exe') : false,
+  const extension = platform === 'darwin' ? '.dmg' : platform === 'win32' ? '.exe' : null
+  if (!extension) return null
+
+  const installerAssets = assets.filter((asset) =>
+    typeof asset?.name === 'string' ? asset.name.toLowerCase().endsWith(extension) : false,
   )
 
-  if (exeAssets.length === 0) {
+  if (installerAssets.length === 0) {
     return null
   }
 
-  const setupAsset = exeAssets.find((asset) => asset.name.toLowerCase().includes('setup'))
-  return setupAsset || exeAssets[0]
+  if (platform === 'darwin') {
+    const architectureAsset = installerAssets.find((asset) =>
+      asset.name.toLowerCase().includes(`-${architecture}.`),
+    )
+    return architectureAsset || installerAssets[0]
+  }
+
+  const setupAsset = installerAssets.find((asset) => asset.name.toLowerCase().includes('setup'))
+  return setupAsset || installerAssets[0]
 }
 
 async function fetchLatestRelease() {
@@ -327,7 +337,14 @@ async function fetchLatestRelease() {
 
 async function downloadInstaller(url, version, onProgress) {
   const safeVersion = normalizeVersion(version || 'latest').replace(/[^0-9A-Za-z._-]/g, '') || 'latest'
-  const fileName = `secupipeline-${safeVersion}-setup.exe`
+  let extension = process.platform === 'darwin' ? '.dmg' : '.exe'
+  try {
+    const urlExtension = path.extname(new URL(url).pathname).toLowerCase()
+    if (urlExtension === '.exe' || urlExtension === '.dmg') extension = urlExtension
+  } catch {
+    // Keep the platform-specific fallback extension.
+  }
+  const fileName = `secupipeline-${safeVersion}-setup${extension}`
   const targetDir = path.join(app.getPath('temp'), 'secupipeline-updates')
   const targetPath = path.join(targetDir, fileName)
 
@@ -517,8 +534,6 @@ ipcMain.handle('window:is-maximized', (event) => {
   return target.isMaximized()
 })
 
-const apiBaseUrl = process.env.VITE_API_BASE_URL || 'https://api.pwd.kr/capstonelab/capstone-back'
-const DEFAULT_AUTH_LOGIN_URL = `${apiBaseUrl}/auth/github/login`
 const AUTH_STORE_FILE = 'auth-session.json'
 
 function authStorePath() {
@@ -563,84 +578,6 @@ function clearSavedAuthToken() {
     return false
   }
 }
-
-const ALLOWED_AUTH_HOSTS = new Set([
-  '127.0.0.1',
-  'localhost',
-  (() => { try { return new URL(apiBaseUrl).hostname } catch { return '' } })(),
-].filter(Boolean))
-
-function isAllowedAuthUrl(url) {
-  try {
-    const parsed = new URL(url)
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return false
-    }
-    return ALLOWED_AUTH_HOSTS.has(parsed.hostname.toLowerCase())
-  } catch {
-    return false
-  }
-}
-
-ipcMain.handle('auth:open-github-login', async (event, payload) => {
-  const requested = typeof payload?.url === 'string' && payload.url.trim()
-  const target =
-    requested && isAllowedAuthUrl(requested)
-      ? requested
-      : process.env.AUTH_LOGIN_URL && isAllowedAuthUrl(process.env.AUTH_LOGIN_URL)
-        ? process.env.AUTH_LOGIN_URL
-        : DEFAULT_AUTH_LOGIN_URL
-
-  const parentWindow = BrowserWindow.fromWebContents(event.sender)
-
-  const authWindow = new BrowserWindow({
-    width: 600,
-    height: 700,
-    parent: parentWindow || undefined,
-    modal: true,
-    show: false,
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-    },
-  })
-
-  authWindow.once('ready-to-show', () => authWindow.show())
-
-  return new Promise((resolve) => {
-    let resolved = false
-
-    const checkForToken = (url) => {
-      try {
-        const parsed = new URL(url)
-        const token = parsed.searchParams.get('token')
-        if (token && (parsed.pathname.includes('/auth/success') || parsed.pathname.includes('/auth/callback'))) {
-          if (!resolved) {
-            resolved = true
-            event.sender.send('auth:token-received', token)
-            authWindow.close()
-            resolve({ opened: true, url: target, token })
-          }
-        }
-      } catch {
-        // ignore parse errors
-      }
-    }
-
-    authWindow.webContents.on('will-redirect', (_e, url) => checkForToken(url))
-    authWindow.webContents.on('did-navigate', (_e, url) => checkForToken(url))
-    authWindow.webContents.on('did-navigate-in-page', (_e, url) => checkForToken(url))
-
-    authWindow.on('closed', () => {
-      if (!resolved) {
-        resolved = true
-        resolve({ opened: true, url: target, token: null })
-      }
-    })
-
-    authWindow.loadURL(target)
-  })
-})
 
 ipcMain.handle('auth:get-token', () => readSavedAuthToken())
 ipcMain.handle('auth:set-token', (_event, token) => writeSavedAuthToken(token))
@@ -726,6 +663,16 @@ ipcMain.handle('updater:download-and-install', async (event, payload) => {
   }
 
   const installerPath = await downloadInstaller(installerUrl, version, sendProgress)
+
+  if (process.platform === 'darwin') {
+    const openError = await shell.openPath(installerPath)
+    if (openError) throw new Error(openError)
+    return { started: true }
+  }
+
+  if (process.platform !== 'win32') {
+    throw new Error('Unsupported desktop update platform.')
+  }
 
   spawn(installerPath, [], {
     detached: true,

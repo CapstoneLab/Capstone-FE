@@ -2,7 +2,7 @@
   "name": "secupipeline",
   "productName": "Secupipeline",
   "private": true,
-  "version": "1.4.0",
+  "version": "1.5.0",
   "type": "module",
   "main": "electron/main.cjs",
   "releaseRepository": "CapstoneLab/Capstone-FE",
@@ -16,7 +16,9 @@
     "build": "tsc -b && vite build",
     "pack:win": "npm run build && electron-builder --win nsis --publish never --config.win.signAndEditExecutable=false",
     "pack:win:dir": "npm run build && electron-builder --win --dir --publish never --config.win.signAndEditExecutable=false",
+    "pack:mac": "npm run build && electron-builder --mac dmg --x64 --arm64 --publish never",
     "start": "electron .",
+    "test": "vitest run",
     "lint": "eslint .",
     "preview": "vite preview"
   },
@@ -66,6 +68,7 @@
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.57.0",
     "vite": "^8.0.1",
+    "vitest": "^4.1.10",
     "wait-on": "^9.0.4"
   },
   "build": {
@@ -81,7 +84,22 @@
     ],
     "win": {
       "icon": "public/app-logo.ico",
-      "target": "nsis"
+      "target": "nsis",
+      "artifactName": "${productName}.Setup.${version}.${ext}"
+    },
+    "mac": {
+      "icon": "public/app-logo.png",
+      "category": "public.app-category.developer-tools",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
     }
   }
 }

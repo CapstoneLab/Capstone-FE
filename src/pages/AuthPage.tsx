@@ -7,11 +7,11 @@ import { GitHubIcon } from '@/components/ui/github-icon'
 import { useAuth } from '@/contexts/AuthContext'
 import { useLanguage } from '@/contexts/LanguageContext'
 import appLogo from '@/assets/app-logo.png'
-import { githubLoginUrl } from '@/lib/config'
+import { beginGithubLogin } from '@/lib/auth'
 
 export function AuthPage() {
   const navigate = useNavigate()
-  const { login, user } = useAuth()
+  const { user } = useAuth()
   const { t } = useLanguage()
   const [status, setStatus] = useState<string | null>(null)
   const [isPending, setIsPending] = useState(false)
@@ -40,40 +40,12 @@ export function AuthPage() {
     }
   }, [user, navigate])
 
-  useEffect(() => {
-    const unsubscribe = window.desktop?.auth?.onAuthToken?.((token) => {
-      login(token)
-        .then(() => navigate('/dashboard', { replace: true }))
-        .catch((err) => {
-          console.error('[AuthPage] login failed:', err)
-          setStatus(t('auth.loginFailed', {
-            message: err instanceof Error ? err.message : t('auth.unknownError'),
-          }))
-        })
-        .finally(() => setIsPending(false))
-    })
-
-    return () => {
-      unsubscribe?.()
-    }
-  }, [login, navigate, t])
-
-  const onSignIn = async () => {
+  const onSignIn = () => {
+    if (isPending) return
     setIsPending(true)
     setStatus(null)
     try {
-      const startGithubLogin = window.desktop?.auth?.startGithubLogin
-      if (typeof startGithubLogin === 'function') {
-        const result = await startGithubLogin(githubLoginUrl)
-        if (result?.token) {
-          await login(result.token)
-          navigate('/dashboard', { replace: true })
-        } else {
-          setIsPending(false)
-        }
-      } else {
-        window.location.assign(githubLoginUrl)
-      }
+      beginGithubLogin()
     } catch (error) {
       setStatus(
         error instanceof Error
