@@ -8,6 +8,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import { useLanguage } from '@/contexts/LanguageContext'
 import appLogo from '@/assets/app-logo.png'
 import { beginGithubLogin } from '@/lib/auth'
+import { githubLoginUrl } from '@/lib/config'
 
 export function AuthPage() {
   const navigate = useNavigate()
@@ -40,12 +41,16 @@ export function AuthPage() {
     }
   }, [user, navigate])
 
-  const onSignIn = () => {
+  const onSignIn = async () => {
     if (isPending) return
     setIsPending(true)
     setStatus(null)
     try {
-      beginGithubLogin()
+      if (window.desktop?.auth?.openGithubLogin) {
+        await window.desktop.auth.openGithubLogin(githubLoginUrl)
+      } else {
+        beginGithubLogin()
+      }
     } catch (error) {
       setStatus(
         error instanceof Error

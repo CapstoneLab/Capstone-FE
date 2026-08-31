@@ -39,9 +39,13 @@ declare global {
         onMaximizedChange?: (callback: (isMaximized: boolean) => void) => () => void
       }
       auth?: {
+        openGithubLogin?: (url: string) => Promise<boolean>
         getSavedToken?: () => Promise<string | null>
         setSavedToken?: (token: string) => Promise<boolean>
         clearSavedToken?: () => Promise<boolean>
+        getPendingCallback?: () => Promise<string | null>
+        acknowledgeCallback?: (url: string) => Promise<void>
+        onCallback?: (callback: (url: string) => void) => () => void
       }
       report?: {
         savePdf?: (

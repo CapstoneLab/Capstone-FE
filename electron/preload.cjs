@@ -21,9 +21,24 @@ contextBridge.exposeInMainWorld('desktop', {
     },
   },
   auth: {
+    openGithubLogin: (url) => ipcRenderer.invoke('auth:open-github-login', url),
     getSavedToken: () => ipcRenderer.invoke('auth:get-token'),
     setSavedToken: (token) => ipcRenderer.invoke('auth:set-token', token),
     clearSavedToken: () => ipcRenderer.invoke('auth:clear-token'),
+    getPendingCallback: () => ipcRenderer.invoke('auth:get-pending-callback'),
+    acknowledgeCallback: (url) => ipcRenderer.invoke('auth:ack-callback', url),
+    onCallback: (callback) => {
+      if (typeof callback !== 'function') {
+        return () => {}
+      }
+
+      const listener = (_event, url) => {
+        callback(url)
+        void ipcRenderer.invoke('auth:ack-callback', url)
+      }
+      ipcRenderer.on('auth:callback', listener)
+      return () => ipcRenderer.removeListener('auth:callback', listener)
+    },
   },
   report: {
     savePdf: (html, fileName) =>

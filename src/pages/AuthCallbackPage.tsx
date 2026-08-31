@@ -1,25 +1,46 @@
-import { useEffect, useLayoutEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useEffect, useLayoutEffect, useMemo, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
 import { useAuth } from '@/contexts/AuthContext'
 import { parseAuthCallbackUrl } from '@/lib/auth'
 
+type AuthCallbackLocationState = {
+  callbackUrl?: unknown
+}
+
 export function AuthCallbackPage() {
   const navigate = useNavigate()
+  const location = useLocation()
   const { login, logout } = useAuth()
-  const [callback] = useState(() => parseAuthCallbackUrl(window.location.href))
-  const [error, setError] = useState<string | null>(() =>
-    callback.token ? null : callback.error || '인증 토큰이 없습니다. 다시 로그인해 주세요.',
+  const desktopCallbackUrl = (location.state as AuthCallbackLocationState | null)?.callbackUrl
+  const callback = useMemo(
+    () =>
+      parseAuthCallbackUrl(
+        typeof desktopCallbackUrl === 'string' ? desktopCallbackUrl : window.location.href,
+      ),
+    [desktopCallbackUrl],
   )
+  const [loginFailure, setLoginFailure] = useState<{
+    token: string
+    message: string
+  } | null>(null)
+  const error = callback.token
+    ? loginFailure?.token === callback.token
+      ? loginFailure.message
+      : null
+    : callback.error || '인증 토큰이 없습니다. 다시 로그인해 주세요.'
 
   useLayoutEffect(() => {
+    // Desktop callbacks arrive over IPC and never enter the renderer address bar.
+    if (typeof desktopCallbackUrl === 'string') return
     window.history.replaceState({}, document.title, callback.sanitizedUrl)
-  }, [callback.sanitizedUrl])
+  }, [callback.sanitizedUrl, desktopCallbackUrl])
 
   useEffect(() => {
     if (!callback.token) return
 
     let cancelled = false
+
     login(callback.token)
       .then(() => {
         if (!cancelled) navigate('/dashboard', { replace: true })
@@ -27,7 +48,10 @@ export function AuthCallbackPage() {
       .catch((reason: unknown) => {
         if (cancelled) return
         logout()
-        setError(reason instanceof Error ? reason.message : '로그인 정보를 확인하지 못했습니다.')
+        setLoginFailure({
+          token: callback.token!,
+          message: reason instanceof Error ? reason.message : '로그인 정보를 확인하지 못했습니다.',
+        })
       })
 
     return () => {

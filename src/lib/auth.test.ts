@@ -33,6 +33,15 @@ describe('GitHub OAuth', () => {
     expect(callback.token).toBeNull()
     expect(callback.error).toBe('GitHub authorization failed')
   })
+
+  it('reads a JWT from the desktop custom protocol callback', () => {
+    const callback = parseAuthCallbackUrl(
+      'secupipeline://auth/callback?jwt=header.payload.signature',
+    )
+
+    expect(callback.token).toBe('header.payload.signature')
+    expect(callback.sanitizedUrl).not.toContain('header.payload.signature')
+  })
 })
 
 describe('/auth/me', () => {

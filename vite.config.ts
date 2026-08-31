@@ -8,7 +8,9 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const apiBaseUrl = env.VITE_API_BASE_URL || 'https://112.186.136.153'
   const apiOrigin = new URL(apiBaseUrl).origin
-  const apiPath = new URL(apiBaseUrl).pathname
+  // Strip trailing slashes so `/api-proxy/auth/me` never becomes
+  // `//auth/me` when the configured API URL has the root pathname (`/`).
+  const apiPath = new URL(apiBaseUrl).pathname.replace(/\/+$/, '')
 
   return {
   base: './',

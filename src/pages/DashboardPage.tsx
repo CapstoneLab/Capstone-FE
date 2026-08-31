@@ -36,19 +36,21 @@ import { MainLayout } from '@/components/layout/MainLayout'
 import { type RepositoryItem } from '@/data/repositories'
 import {
   AuthExpiredError,
+  deletePipeline,
   deriveJobStatus,
   fetchJobsByIds,
+  fetchPipelineHistory,
+  fetchRepos,
   fetchReposWithBranches,
   getCachedRepos,
   getRepoDetectEnabled,
-  getTrackedJobIds,
   isGithubRateLimitError,
-  mergeTrackedJobIds,
   removeTrackedJobId,
   setCachedRepos,
   setRepoDetectEnabled,
   type JobDetail,
   type JobVerdict,
+  type PipelineHistoryItem,
 } from '@/lib/api'
 import { getLanguageColor } from '@/lib/languageColors'
 import { useAuth } from '@/contexts/AuthContext'
@@ -161,8 +163,72 @@ const verdictMeta: Record<JobVerdict, { label: string; className: string }> = {
   },
 }
 
+function repoNameFromHistoryUrl(repoUrl: string): string {
+  if (!repoUrl) return ''
+  try {
+    return new URL(repoUrl).pathname.replace(/^\/+|\.git$|\/+$/g, '')
+  } catch {
+    return repoUrl.replace(/^https?:\/\/[^/]+\//, '').replace(/\.git$|\/+$/g, '')
+  }
+}
+
+function mapHistoryToPipelineItem(
+  history: PipelineHistoryItem,
+  detail?: JobDetail,
+): PipelineItem {
+  const enriched = detail ? mapJobToPipelineItem(detail) : null
+
+  return {
+    id: shortJobId(history.jobId),
+    jobId: history.jobId,
+    repoName: enriched?.repoName || repoNameFromHistoryUrl(history.repoUrl),
+    description: `${history.triggerSource || 'pipeline'} · ${history.branch || '-'}`,
+    branch: history.branch,
+    durationSec: history.durationSecs || enriched?.durationSec || 0,
+    status: history.status,
+    score: enriched?.score ?? 0,
+    verdict: enriched?.verdict ?? null,
+    verdictReason: enriched?.verdictReason ?? null,
+    totalFindings: enriched?.totalFindings ?? 0,
+    severityCounts: enriched?.severityCounts ?? { critical: 0, high: 0, medium: 0, low: 0 },
+    executedAt: history.completedAt ?? history.startedAt ?? history.createdAt ?? '',
+    totalSteps: history.totalSteps,
+    completedSteps: history.completedSteps,
+    currentStepName: history.latestStepName,
+  }
+}
+
+async function fetchPipelineHistoryDetails(
+  token: string,
+  historyItems: PipelineHistoryItem[],
+): Promise<Map<string, JobDetail>> {
+  const details = await fetchJobsByIds(token, historyItems.map((item) => item.jobId))
+  return new Map(details.map((item) => [item.jobId, item]))
+}
+
+async function enrichPipelineHistory(
+  token: string,
+  historyItems: PipelineHistoryItem[],
+): Promise<PipelineItem[]> {
+  const detailsById = await fetchPipelineHistoryDetails(token, historyItems)
+  return historyItems.map((item) => mapHistoryToPipelineItem(item, detailsById.get(item.jobId)))
+}
+
+function preservePipelineSecurity(item: PipelineItem, existing?: PipelineItem): PipelineItem {
+  if (!existing) return item
+  return {
+    ...item,
+    score: existing.score,
+    verdict: existing.verdict,
+    verdictReason: existing.verdictReason,
+    totalFindings: existing.totalFindings,
+    severityCounts: existing.severityCounts,
+  }
+}
+
 const PIPELINE_CACHE_PREFIX = 'secupipeline:pipeline-items:'
 const TERMINAL_PIPELINE_STATUS = new Set(['success', 'failed', 'cancelled'])
+const HISTORY_PAGE_SIZE = 20
 
 function getCachedPipelines(key: string): PipelineItem[] {
   try {
@@ -188,30 +254,6 @@ function setCachedPipelines(key: string, pipelines: PipelineItem[]): void {
   }
 }
 
-function mergeCachedPipelines(targetKey: string, sourceKey: string | null): PipelineItem[] {
-  const target = getCachedPipelines(targetKey)
-  if (!sourceKey || sourceKey === targetKey) return target
-
-  const source = getCachedPipelines(sourceKey)
-  if (source.length === 0) return target
-
-  const mergedById = new Map<string, PipelineItem>()
-  ;[...source, ...target].forEach((item) => {
-    if (item.jobId) mergedById.set(item.jobId, item)
-  })
-
-  const merged = Array.from(mergedById.values())
-  setCachedPipelines(targetKey, merged)
-  return merged
-}
-
-function getAllKnownTrackedJobIds(key: string, cached: PipelineItem[]): string[] {
-  const ids = new Set<string>(getTrackedJobIds(key))
-  cached.forEach((item) => ids.add(item.jobId))
-
-  return Array.from(ids).filter(Boolean)
-}
-
 function scoreTone(score: number): { color: string } {
   if (score >= 80) return { color: '#22C55E' }
   if (score >= 50) return { color: '#F97316' }
@@ -220,10 +262,9 @@ function scoreTone(score: number): { color: string } {
 
 export function DashboardPage() {
   const navigate = useNavigate()
-  const { token, user, logout } = useAuth()
+  const { token, user, isLoading: isAuthLoading, logout } = useAuth()
   const { locale, t } = useLanguage()
   const cacheKey = getAuthCacheKey(token, user)
-  const legacyTokenCacheKey = token && user ? token.slice(0, 16) : null
   const [activeTab, setActiveTab] = useState<DashboardTab>('repo')
   const [tabDirection, setTabDirection] = useState(1)
   const [searchInput, setSearchInput] = useState('')
@@ -243,39 +284,75 @@ export function DashboardPage() {
   const [pipelines, setPipelines] = useState<PipelineItem[]>(() => getCachedPipelines(cacheKey))
   const [isLoading, setIsLoading] = useState(false)
   const [isReposLoading, setIsReposLoading] = useState(
-    () => !!token && !getCachedRepos(cacheKey),
+    () => isAuthLoading || (!!token && !getCachedRepos(cacheKey)),
   )
   const [isJobsLoading, setIsJobsLoading] = useState(
-    () => !!token && getTrackedJobIds(cacheKey).length > 0 && getCachedPipelines(cacheKey).length === 0,
+    isAuthLoading,
   )
+  const [isHistoryLoadingMore, setIsHistoryLoadingMore] = useState(false)
+  const [historyTotal, setHistoryTotal] = useState(0)
+  const [historyHasMore, setHistoryHasMore] = useState(false)
+  const [hasLoadedHistory, setHasLoadedHistory] = useState(false)
+  const [isDeletingPipeline, setIsDeletingPipeline] = useState(false)
   const [reposError, setReposError] = useState<string | null>(null)
   const [jobsError, setJobsError] = useState<string | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null)
   const loadingTimerRef = useRef<number | null>(null)
+  const historyRepoQuery = activeTab === 'pipeline' ? searchKeyword : ''
 
   useEffect(() => {
     dayjs.locale(locale)
   }, [locale])
 
   useEffect(() => {
+    if (isAuthLoading) {
+      setIsReposLoading(true)
+      return
+    }
+
     if (!token) {
       setRepos([])
+      setIsReposLoading(false)
       return
     }
 
     let mounted = true
+    const cached = getCachedRepos(cacheKey)
+    if (cached) {
+      setRepos(
+        cached.map((repo) => ({
+          ...repo,
+          detectEnabled: getRepoDetectEnabled(cacheKey, repo.id),
+        })),
+      )
+    } else {
+      setRepos([])
+    }
+    setIsReposLoading(!cached)
     setReposError(null)
 
-    fetchReposWithBranches(token)
-      .then((list) => {
+    fetchRepos(token)
+      .then((baseRepos) => {
         if (mounted) {
-          const hydrated = list.map((repo) => ({
+          const hydrated = baseRepos.map((repo) => ({
             ...repo,
             detectEnabled: getRepoDetectEnabled(cacheKey, repo.id),
           }))
           setRepos(hydrated)
-          setCachedRepos(cacheKey, list)
+          setCachedRepos(cacheKey, baseRepos)
+          setIsReposLoading(false)
         }
+        return fetchReposWithBranches(token, baseRepos)
+      })
+      .then((enrichedRepos) => {
+        if (!mounted) return
+        const hydrated = enrichedRepos.map((repo) => ({
+          ...repo,
+          detectEnabled: getRepoDetectEnabled(cacheKey, repo.id),
+        }))
+        setRepos(hydrated)
+        setCachedRepos(cacheKey, enrichedRepos)
       })
       .catch((error: unknown) => {
         if (!mounted) return
@@ -309,82 +386,92 @@ export function DashboardPage() {
     return () => {
       mounted = false
     }
-  }, [token, cacheKey, logout, navigate])
+  }, [token, cacheKey, isAuthLoading, logout, navigate])
 
   useEffect(() => {
+    if (isAuthLoading) {
+      setIsJobsLoading(true)
+      return
+    }
+
     if (!token) {
       setPipelines([])
-      return
-    }
-
-    const cached = mergeCachedPipelines(cacheKey, legacyTokenCacheKey)
-    if (legacyTokenCacheKey) {
-      mergeTrackedJobIds(cacheKey, legacyTokenCacheKey)
-    }
-    const ids = getAllKnownTrackedJobIds(cacheKey, cached)
-
-    if (ids.length === 0) {
-      if (cached.length > 0) {
-        setPipelines(cached)
-      } else {
-        setPipelines([])
-      }
+      setHistoryTotal(0)
+      setHistoryHasMore(false)
+      setHasLoadedHistory(false)
       setIsJobsLoading(false)
-      return
-    }
-
-    const visibleCached = cached.filter((item) => ids.includes(item.jobId))
-    if (visibleCached.length > 0) {
-      setPipelines(visibleCached)
-    }
-
-    const cachedById = new Map(visibleCached.map((item) => [item.jobId, item]))
-    const idsToFetch =
-      visibleCached.length > 0
-        ? ids.filter((id) => {
-            const cachedItem = cachedById.get(id)
-            return !cachedItem || !TERMINAL_PIPELINE_STATUS.has(cachedItem.status)
-          })
-        : ids
-
-    if (idsToFetch.length === 0) {
-      setIsJobsLoading(false)
-      setJobsError(null)
       return
     }
 
     let cancelled = false
     let timer: number | null = null
-    setIsJobsLoading(visibleCached.length === 0)
+    const cached = getCachedPipelines(cacheKey)
+    if (cached.length > 0) setPipelines(cached)
+    setIsJobsLoading(cached.length === 0)
     setJobsError(null)
 
     async function tick(initial: boolean) {
       try {
-        const jobs = await fetchJobsByIds(token!, idsToFetch)
+        const response = await fetchPipelineHistory(token!, {
+          repo: historyRepoQuery,
+          limit: HISTORY_PAGE_SIZE,
+          offset: 0,
+        })
+        const fetchedItems = response.items.map((item) => mapHistoryToPipelineItem(item))
         if (cancelled) return
-        const fetchedItems = jobs.map(mapJobToPipelineItem)
-        const fetchedById = new Map(fetchedItems.map((item) => [item.jobId, item]))
-        const merged =
-          visibleCached.length > 0
-            ? ids
-                .map((id) => fetchedById.get(id) ?? cachedById.get(id))
-                .filter((item): item is PipelineItem => !!item)
-            : fetchedItems
 
-        if (merged.length > 0 || visibleCached.length === 0) {
-          setPipelines(merged)
-        }
-        if (merged.length > 0) {
+        setPipelines((previous) => {
+          const previousById = new Map(previous.map((item) => [item.jobId, item]))
+          const refreshedItems = fetchedItems.map((item) =>
+            preservePipelineSecurity(item, previousById.get(item.jobId)),
+          )
+
+          if (initial) {
+            setCachedPipelines(cacheKey, refreshedItems)
+            return refreshedItems
+          }
+
+          const fetchedIds = new Set(refreshedItems.map((item) => item.jobId))
+          const merged = [
+            ...refreshedItems,
+            ...previous.filter((item) => !fetchedIds.has(item.jobId)),
+          ]
           setCachedPipelines(cacheKey, merged)
-        }
+          setHistoryHasMore(merged.length < response.total)
+          return merged
+        })
+        setHistoryTotal(response.total)
+        if (initial) setHistoryHasMore(response.hasMore)
+        setHasLoadedHistory(true)
         setJobsError(null)
 
-        const hasActive = fetchedItems.some((p) => !TERMINAL_PIPELINE_STATUS.has(p.status))
+        if (initial && response.items.length > 0) {
+          const historyById = new Map(response.items.map((item) => [item.jobId, item]))
+          void fetchPipelineHistoryDetails(token!, response.items).then((detailsById) => {
+            if (cancelled || detailsById.size === 0) return
+            setPipelines((previous) => {
+              const enriched = previous.map((item) => {
+                const history = historyById.get(item.jobId)
+                const detail = detailsById.get(item.jobId)
+                return history && detail ? mapHistoryToPipelineItem(history, detail) : item
+              })
+              setCachedPipelines(cacheKey, enriched)
+              return enriched
+            })
+          })
+        }
+
+        const hasActive = response.items.some((item) => !TERMINAL_PIPELINE_STATUS.has(item.status))
         if (!cancelled && hasActive) {
           timer = window.setTimeout(() => tick(false), 3000)
         }
       } catch (error) {
         if (cancelled) return
+        if (error instanceof AuthExpiredError) {
+          logout()
+          navigate('/auth', { replace: true })
+          return
+        }
         setJobsError(
           error instanceof Error ? error.message : '파이프라인 결과를 불러오지 못했습니다.',
         )
@@ -399,7 +486,69 @@ export function DashboardPage() {
       cancelled = true
       if (timer !== null) window.clearTimeout(timer)
     }
-  }, [token, cacheKey, legacyTokenCacheKey])
+  }, [token, cacheKey, historyRepoQuery, isAuthLoading, logout, navigate])
+
+  const loadMoreHistory = async () => {
+    if (!token || isHistoryLoadingMore || !historyHasMore) return
+
+    setIsHistoryLoadingMore(true)
+    setJobsError(null)
+    try {
+      const response = await fetchPipelineHistory(token, {
+        repo: searchKeyword,
+        limit: HISTORY_PAGE_SIZE,
+        offset: pipelines.length,
+      })
+      const nextItems = await enrichPipelineHistory(token, response.items)
+      setPipelines((previous) => {
+        const previousIds = new Set(previous.map((item) => item.jobId))
+        const merged = [...previous, ...nextItems.filter((item) => !previousIds.has(item.jobId))]
+        setCachedPipelines(cacheKey, merged)
+        return merged
+      })
+      setHistoryTotal(response.total)
+      setHistoryHasMore(response.hasMore)
+      setHasLoadedHistory(true)
+    } catch (error) {
+      if (error instanceof AuthExpiredError) {
+        logout()
+        navigate('/auth', { replace: true })
+        return
+      }
+      setJobsError(
+        error instanceof Error ? error.message : '파이프라인 히스토리를 불러오지 못했습니다.',
+      )
+    } finally {
+      setIsHistoryLoadingMore(false)
+    }
+  }
+
+  const confirmDeletePipeline = async () => {
+    if (!token || !deleteTarget || isDeletingPipeline) return
+
+    setIsDeletingPipeline(true)
+    setDeleteError(null)
+    try {
+      await deletePipeline(token, deleteTarget.jobId)
+      removeTrackedJobId(cacheKey, deleteTarget.jobId)
+      setPipelines((previous) => {
+        const next = previous.filter((item) => item.jobId !== deleteTarget.jobId)
+        setCachedPipelines(cacheKey, next)
+        return next
+      })
+      setHistoryTotal((previous) => Math.max(0, previous - 1))
+      setDeleteTargetId(null)
+    } catch (error) {
+      if (error instanceof AuthExpiredError) {
+        logout()
+        navigate('/auth', { replace: true })
+        return
+      }
+      setDeleteError(error instanceof Error ? error.message : '파이프라인을 삭제하지 못했습니다.')
+    } finally {
+      setIsDeletingPipeline(false)
+    }
+  }
 
   const triggerLoading = () => {
     if (loadingTimerRef.current) {
@@ -518,7 +667,7 @@ export function DashboardPage() {
         <div className="inline-flex w-fit items-center rounded-xl border border-white/10 bg-[#2A2A2A] p-1">
           {([
             { key: 'repo', label: t('dashboard.repoTab'), icon: BookOpen, count: repos.length },
-            { key: 'pipeline', label: t('dashboard.pipelineTab'), icon: Activity, count: pipelines.length },
+            { key: 'pipeline', label: t('dashboard.pipelineTab'), icon: Activity, count: hasLoadedHistory ? historyTotal : pipelines.length },
           ] as const).map(({ key, label, icon: Icon, count }) => {
             const active = activeTab === key
             return (
@@ -711,7 +860,7 @@ export function DashboardPage() {
                   <Database className="h-6 w-6 text-[#6B7280]" />
                 </div>
                 <p className="mt-6 text-[32px] font-bold leading-none text-white">
-                  {pipelines.length}
+                  {historyTotal}
                 </p>
               </Card>
               <Card className="p-4">
@@ -797,7 +946,8 @@ export function DashboardPage() {
                 {t('dashboard.noRuns')}
               </Card>
             ) : (
-              filteredPipelines.map((run) => (
+              <>
+              {filteredPipelines.map((run) => (
                 <Card
                   key={run.jobId}
                   className="border-white/10 bg-[#262626] p-4"
@@ -995,14 +1145,35 @@ export function DashboardPage() {
                     </div>
                   </div>
                 </Card>
-              ))
+              ))}
+              {historyHasMore ? (
+                <div className="flex justify-center pt-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={isHistoryLoadingMore}
+                    onClick={() => void loadMoreHistory()}
+                  >
+                    {isHistoryLoadingMore ? t('dashboard.loadingMore') : t('dashboard.loadMore')}
+                  </Button>
+                </div>
+              ) : null}
+              </>
             )}
             </motion.div>
           )}
         </AnimatePresence>
       </section>
 
-      <Dialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTargetId(null)}>
+      <Dialog
+        open={!!deleteTarget}
+        onOpenChange={(open) => {
+          if (!open && !isDeletingPipeline) {
+            setDeleteTargetId(null)
+            setDeleteError(null)
+          }
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{t('dashboard.deleteTitle')}</DialogTitle>
@@ -1014,28 +1185,26 @@ export function DashboardPage() {
                   })
                 : ''}
             </DialogDescription>
+            {deleteError ? <p className="mt-2 text-sm text-[#FCA5A5]">{deleteError}</p> : null}
           </DialogHeader>
 
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteTargetId(null)}>
+            <Button
+              variant="outline"
+              disabled={isDeletingPipeline}
+              onClick={() => {
+                setDeleteTargetId(null)
+                setDeleteError(null)
+              }}
+            >
               {t('dashboard.cancel')}
             </Button>
             <Button
-              onClick={() => {
-                if (!deleteTarget) {
-                  return
-                }
-                removeTrackedJobId(cacheKey, deleteTarget.jobId)
-                setPipelines((prev) => {
-                  const next = prev.filter((item) => item.jobId !== deleteTarget.jobId)
-                  setCachedPipelines(cacheKey, next)
-                  return next
-                })
-                setDeleteTargetId(null)
-              }}
+              disabled={isDeletingPipeline}
+              onClick={() => void confirmDeletePipeline()}
               className="bg-[#EF4444] text-white shadow-none hover:bg-[#DC2626]"
             >
-              {t('dashboard.delete')}
+              {isDeletingPipeline ? t('dashboard.deleting') : t('dashboard.delete')}
             </Button>
           </DialogFooter>
         </DialogContent>

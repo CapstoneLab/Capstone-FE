@@ -2,7 +2,7 @@
   "name": "secupipeline",
   "productName": "Secupipeline",
   "private": true,
-  "version": "1.5.1",
+  "version": "1.5.2",
   "type": "module",
   "main": "electron/main.cjs",
   "releaseRepository": "CapstoneLab/Capstone-FE",
@@ -73,6 +73,14 @@
   },
   "build": {
     "appId": "com.secupipeline.desktop",
+    "protocols": [
+      {
+        "name": "Secupipeline Authentication",
+        "schemes": [
+          "secupipeline"
+        ]
+      }
+    ],
     "icon": "public/app-logo.ico",
     "directories": {
       "output": "release"

@@ -111,7 +111,11 @@ export type AuthCallbackData = {
 
 export function parseAuthCallbackUrl(href: string): AuthCallbackData {
   const url = new URL(href)
-  const token = url.searchParams.get('token')?.trim() || null
+  const token =
+    url.searchParams.get('token')?.trim() ||
+    url.searchParams.get('access_token')?.trim() ||
+    url.searchParams.get('jwt')?.trim() ||
+    null
   const error =
     url.searchParams.get('message') ||
     url.searchParams.get('detail') ||
@@ -120,6 +124,8 @@ export function parseAuthCallbackUrl(href: string): AuthCallbackData {
     null
 
   url.searchParams.delete('token')
+  url.searchParams.delete('access_token')
+  url.searchParams.delete('jwt')
 
   return {
     token,

@@ -1290,6 +1290,131 @@ export type CancelPipelineResponse = {
   message: string
 }
 
+export type PipelineHistoryItem = {
+  jobId: string
+  repoUrl: string
+  branch: string
+  triggerSource: string
+  status: JobStatus
+  overallResult: string | null
+  source: string
+  environment: string
+  commitSha: string
+  selectedItems: string[]
+  latestStepName: string | null
+  completedSteps: number
+  totalSteps: number
+  progressPercent: number
+  createdAt: string | null
+  startedAt: string | null
+  completedAt: string | null
+  lastEventAt: string | null
+  durationSecs: number
+}
+
+export type PipelineHistoryResponse = {
+  items: PipelineHistoryItem[]
+  total: number
+  limit: number
+  offset: number
+  hasMore: boolean
+}
+
+export type PipelineHistoryQuery = {
+  status?: JobStatus
+  repo?: string
+  limit?: number
+  offset?: number
+}
+
+function mapPipelineHistoryItem(raw: UnknownRecord): PipelineHistoryItem {
+  const status = pick<JobStatus>(raw, 'status') ?? 'queued'
+  const completedSteps = pick<number>(raw, 'completed_steps', 'completedSteps') ?? 0
+  const totalSteps = pick<number>(raw, 'total_steps', 'totalSteps') ?? 0
+  const progressPercent = pick<number>(raw, 'progress_percent', 'progressPercent')
+  const durationSecs = pick<number>(raw, 'duration_secs', 'durationSecs') ?? 0
+  const selectedItems = pick<unknown[]>(raw, 'selected_items', 'selectedItems') ?? []
+
+  return {
+    jobId: pick<string>(raw, 'job_id', 'jobId') ?? '',
+    repoUrl: pick<string>(raw, 'repo_url', 'repoUrl') ?? '',
+    branch: pick<string>(raw, 'branch') ?? '',
+    triggerSource: pick<string>(raw, 'trigger_source', 'triggerSource') ?? '',
+    status,
+    overallResult: pick<string>(raw, 'overall_result', 'overallResult') ?? null,
+    source: pick<string>(raw, 'source') ?? '',
+    environment: pick<string>(raw, 'environment') ?? '',
+    commitSha: pick<string>(raw, 'commit_sha', 'commitSha') ?? '',
+    selectedItems: selectedItems.filter((item): item is string => typeof item === 'string'),
+    latestStepName: pick<string>(raw, 'latest_step_name', 'latestStepName') ?? null,
+    completedSteps,
+    totalSteps,
+    progressPercent:
+      typeof progressPercent === 'number'
+        ? Math.max(0, Math.min(100, progressPercent))
+        : totalSteps > 0
+          ? Math.max(0, Math.min(100, Math.round((completedSteps * 100) / totalSteps)))
+          : TERMINAL_JOB_STATUSES.has(status)
+            ? 100
+            : 0,
+    createdAt: pick<string>(raw, 'created_at', 'createdAt') ?? null,
+    startedAt: pick<string>(raw, 'started_at', 'startedAt') ?? null,
+    completedAt: pick<string>(raw, 'completed_at', 'completedAt') ?? null,
+    lastEventAt: pick<string>(raw, 'last_event_at', 'lastEventAt') ?? null,
+    durationSecs: Math.max(0, durationSecs),
+  }
+}
+
+const TERMINAL_JOB_STATUSES = new Set<JobStatus>(['success', 'failed', 'cancelled'])
+
+export async function fetchPipelineHistory(
+  token: string,
+  query: PipelineHistoryQuery = {},
+): Promise<PipelineHistoryResponse> {
+  const params = new URLSearchParams()
+  if (query.status) params.set('status', query.status)
+  if (query.repo?.trim()) params.set('repo', query.repo.trim())
+  params.set('limit', String(Math.max(1, Math.min(100, query.limit ?? 20))))
+  params.set('offset', String(Math.max(0, query.offset ?? 0)))
+
+  const res = await fetch(`${API_BASE}/api/pipelines/history?${params.toString()}`, {
+    headers: authHeaders(token),
+  })
+
+  if (!res.ok) {
+    notifyIfUnauthorized(res.status)
+    const text = await res.text().catch(() => '')
+    let detail = ''
+    try {
+      detail = errorMessage(JSON.parse(text) as UnknownRecord)
+    } catch {
+      detail = text
+    }
+    if (res.status === 401) {
+      throw new AuthExpiredError(detail)
+    }
+    throw new Error(
+      detail
+        ? `파이프라인 히스토리 조회 실패 (${res.status}): ${detail}`
+        : `파이프라인 히스토리 조회 실패 (${res.status})`,
+    )
+  }
+
+  const data = (await res.json()) as UnknownRecord
+  const items = (pick<unknown[]>(data, 'items') ?? [])
+    .filter((item): item is UnknownRecord => !!item && typeof item === 'object')
+    .map(mapPipelineHistoryItem)
+    .filter((item) => item.jobId)
+
+  return {
+    items,
+    total: pick<number>(data, 'total') ?? items.length,
+    limit: pick<number>(data, 'limit') ?? query.limit ?? 20,
+    offset: pick<number>(data, 'offset') ?? query.offset ?? 0,
+    hasMore: pick<boolean>(data, 'has_more', 'hasMore') ?? false,
+  }
+}
+
 export async function cancelPipeline(
   token: string,
   jobId: string,
@@ -1555,20 +1680,36 @@ export function setCachedRepos(key: string, repos: RepositoryItem[]): void {
   }
 }
 
-export async function fetchReposWithBranches(token: string): Promise<RepositoryItem[]> {
-  const repos = await fetchRepos(token)
-  const enriched: RepositoryItem[] = []
+export async function fetchReposWithBranches(
+  token: string,
+  initialRepos?: RepositoryItem[],
+): Promise<RepositoryItem[]> {
+  const repos = initialRepos ?? await fetchRepos(token)
+  const enriched = new Array<RepositoryItem>(repos.length)
+  let nextIndex = 0
 
-  for (const repo of repos) {
+  async function worker() {
+    while (nextIndex < repos.length) {
+      const index = nextIndex
+      nextIndex += 1
+      const repo = repos[index]
+      if (!repo) continue
+
     const [owner, name] = repo.name.split('/')
     if (!owner || !name) {
-      enriched.push(repo)
+        enriched[index] = repo
       continue
     }
 
-    const branchItems = await fetchBranches(token, owner, name)
+      let branchItems: Array<{ name: string; commitSha: string }> = []
+      try {
+        branchItems = await fetchBranches(token, owner, name)
+      } catch (error) {
+        console.warn(`[api] failed to enrich branches for ${repo.name}:`, error)
+      }
+
     if (branchItems.length === 0) {
-      enriched.push(repo)
+        enriched[index] = repo
       continue
     }
 
@@ -1577,12 +1718,15 @@ export async function fetchReposWithBranches(token: string): Promise<RepositoryI
     const ordered = defaultBranch
       ? [defaultBranch, ...branchNames.filter((b) => b !== defaultBranch)]
       : branchNames
-    enriched.push({
+      enriched[index] = {
       ...repo,
       branches: ordered,
       branchCommitShas: Object.fromEntries(branchItems.map((item) => [item.name, item.commitSha])),
-    })
+      }
+    }
   }
 
+  const workerCount = Math.min(6, repos.length)
+  await Promise.all(Array.from({ length: workerCount }, () => worker()))
   return enriched
 }

@@ -10,6 +10,211 @@ const isDev = !app.isPackaged
 const devServerUrl = 'http://localhost:5173'
 const defaultGithubRepo = 'CapstoneLab/Capstone-FE'
 const appRootDir = path.join(__dirname, '..')
+const authProtocol = 'secupipeline'
+let mainWindow = null
+let authWindow = null
+let pendingAuthCallback = null
+
+function isAuthCallbackUrl(value) {
+  if (typeof value !== 'string') return false
+
+  try {
+    const parsed = new URL(value)
+    return (
+      parsed.protocol === `${authProtocol}:` &&
+      parsed.hostname.toLowerCase() === 'auth' &&
+      parsed.pathname.replace(/\/+$/, '') === '/callback'
+    )
+  } catch {
+    return false
+  }
+}
+
+function findAuthCallbackUrl(argv) {
+  return Array.isArray(argv) ? argv.find((value) => isAuthCallbackUrl(value)) || null : null
+}
+
+function focusMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function receiveAuthCallback(url) {
+  if (!isAuthCallbackUrl(url)) return
+
+  pendingAuthCallback = url
+  focusMainWindow()
+
+  if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isLoading()) {
+    mainWindow.webContents.send('auth:callback', url)
+  }
+}
+
+function registerAuthProtocol() {
+  if (process.defaultApp && process.argv[1]) {
+    return app.setAsDefaultProtocolClient(authProtocol, process.execPath, [path.resolve(process.argv[1])])
+  }
+
+  return app.setAsDefaultProtocolClient(authProtocol)
+}
+
+function isAllowedGithubLoginUrl(value) {
+  try {
+    const candidate = new URL(value)
+    const configuredApi = new URL(
+      process.env.VITE_API_BASE_URL || 'https://112.186.136.153',
+    )
+    const apiBasePath = configuredApi.pathname.replace(/\/+$/, '')
+
+    return (
+      candidate.protocol === 'https:' &&
+      candidate.origin === configuredApi.origin &&
+      candidate.pathname.replace(/\/+$/, '') === `${apiBasePath}/auth/github/login`
+    )
+  } catch {
+    return false
+  }
+}
+
+function isLegacyAuthSuccessUrl(value) {
+  try {
+    const candidate = new URL(value)
+    const configuredApi = new URL(
+      process.env.VITE_API_BASE_URL || 'https://112.186.136.153',
+    )
+    const apiBasePath = configuredApi.pathname.replace(/\/+$/, '')
+
+    return (
+      candidate.protocol === 'https:' &&
+      candidate.origin === configuredApi.origin &&
+      candidate.pathname.replace(/\/+$/, '') === `${apiBasePath}/auth/success`
+    )
+  } catch {
+    return false
+  }
+}
+
+function isJwtLike(value) {
+  return (
+    typeof value === 'string' &&
+    value.length <= 16_384 &&
+    /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value.trim())
+  )
+}
+
+async function openGithubLoginWindow(loginUrl) {
+  if (!isAllowedGithubLoginUrl(loginUrl)) {
+    throw new Error('허용되지 않은 GitHub 로그인 URL입니다.')
+  }
+
+  if (authWindow && !authWindow.isDestroyed()) {
+    authWindow.focus()
+    return
+  }
+
+  authWindow = new BrowserWindow({
+    width: 520,
+    height: 760,
+    minWidth: 420,
+    minHeight: 600,
+    parent: mainWindow || undefined,
+    modal: Boolean(mainWindow),
+    show: false,
+    autoHideMenuBar: true,
+    title: 'GitHub 로그인',
+    backgroundColor: '#1E1E1E',
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      devTools: isDev,
+    },
+  })
+
+  const finishLogin = (event, url) => {
+    if (!isAuthCallbackUrl(url)) return false
+    event?.preventDefault()
+    receiveAuthCallback(url)
+    authWindow?.close()
+    return true
+  }
+
+  authWindow.webContents.on('will-redirect', (event, url) => finishLogin(event, url))
+  authWindow.webContents.on('will-navigate', (event, url) => finishLogin(event, url))
+  authWindow.webContents.on('did-finish-load', async () => {
+    const loginWindow = authWindow
+    if (!loginWindow || loginWindow.isDestroyed()) return
+
+    const currentUrl = loginWindow.webContents.getURL()
+    if (!isLegacyAuthSuccessUrl(currentUrl)) return
+
+    try {
+      const parsed = new URL(currentUrl)
+      let token =
+        parsed.searchParams.get('token') ||
+        parsed.searchParams.get('access_token') ||
+        parsed.searchParams.get('jwt') ||
+        ''
+
+      // Compatibility for the backend's temporary success page, which renders
+      // the JWT in a textarea instead of redirecting to the custom protocol.
+      if (!isJwtLike(token)) {
+        token = await loginWindow.webContents.executeJavaScript(
+          "document.querySelector('textarea')?.value?.trim() || ''",
+          true,
+        )
+      }
+
+      if (!isJwtLike(token)) return
+      receiveAuthCallback(`secupipeline://auth/callback?token=${encodeURIComponent(token.trim())}`)
+      loginWindow.close()
+    } catch {
+      // Leave the temporary success page visible if its format is unknown.
+    }
+  })
+  authWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (isAuthCallbackUrl(url)) {
+      receiveAuthCallback(url)
+      authWindow?.close()
+    } else if (isSafeExternalUrl(url)) {
+      void shell.openExternal(url)
+    }
+    return { action: 'deny' }
+  })
+  authWindow.once('ready-to-show', () => authWindow?.show())
+  authWindow.on('closed', () => {
+    authWindow = null
+    focusMainWindow()
+  })
+  try {
+    await authWindow.loadURL(loginUrl)
+  } catch (error) {
+    authWindow?.close()
+    throw error
+  }
+}
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+
+if (!hasSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', (_event, argv) => {
+    const callbackUrl = findAuthCallbackUrl(argv)
+    if (callbackUrl) receiveAuthCallback(callbackUrl)
+    focusMainWindow()
+  })
+}
+
+// macOS delivers a custom protocol URL through open-url instead of argv.
+app.on('open-url', (event, url) => {
+  event.preventDefault()
+  receiveAuthCallback(url)
+})
 
 function normalizeRepoValue(value) {
   if (typeof value !== 'string') {
@@ -463,6 +668,7 @@ function createWindow() {
       devTools: isDev,
     },
   })
+  mainWindow = win
 
   if (isDev) {
     win.loadURL(devServerUrl)
@@ -496,6 +702,12 @@ function createWindow() {
   win.on('maximize', () => sendMaximizedState(win))
   win.on('unmaximize', () => sendMaximizedState(win))
   win.webContents.on('did-finish-load', () => sendMaximizedState(win))
+  win.webContents.on('did-finish-load', () => {
+    if (pendingAuthCallback) win.webContents.send('auth:callback', pendingAuthCallback)
+  })
+  win.on('closed', () => {
+    if (mainWindow === win) mainWindow = null
+  })
 }
 
 ipcMain.handle('window:minimize', (event) => {
@@ -584,6 +796,14 @@ function clearSavedAuthToken() {
 ipcMain.handle('auth:get-token', () => readSavedAuthToken())
 ipcMain.handle('auth:set-token', (_event, token) => writeSavedAuthToken(token))
 ipcMain.handle('auth:clear-token', () => clearSavedAuthToken())
+ipcMain.handle('auth:open-github-login', async (_event, loginUrl) => {
+  await openGithubLoginWindow(loginUrl)
+  return true
+})
+ipcMain.handle('auth:get-pending-callback', () => pendingAuthCallback)
+ipcMain.handle('auth:ack-callback', (_event, callbackUrl) => {
+  if (pendingAuthCallback === callbackUrl) pendingAuthCallback = null
+})
 
 ipcMain.handle('app:get-info', () => {
   return {
@@ -693,7 +913,11 @@ ipcMain.handle('updater:download-and-install', async (event, payload) => {
 
 app.whenReady().then(() => {
   app.setAppUserModelId('com.secupipeline.desktop')
+  registerAuthProtocol()
   createWindow()
+
+  const initialCallbackUrl = findAuthCallbackUrl(process.argv)
+  if (initialCallbackUrl) receiveAuthCallback(initialCallbackUrl)
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

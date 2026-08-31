@@ -1,4 +1,5 @@
-import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
+import { useEffect } from 'react'
+import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { ApprovalPage } from '@/pages/ApprovalPage'
 import { AuditLogPage } from '@/pages/AuditLogPage'
@@ -13,6 +14,38 @@ import { PipelineProgressPage } from '@/pages/PipelineProgressPage'
 import { RepositoryDetailPage } from '@/pages/RepositoryDetailPage'
 import { useAuth } from '@/contexts/AuthContext'
 import { NativeFrameBar } from '@/components/layout/NativeFrameBar'
+
+function DesktopAuthCallbackBridge() {
+  const navigate = useNavigate()
+
+  useEffect(() => {
+    const desktopAuth = window.desktop?.auth
+    if (!desktopAuth) return
+
+    let active = true
+    const openCallback = (callbackUrl: string) => {
+      if (!active || typeof callbackUrl !== 'string' || !callbackUrl) return
+      navigate('/auth/callback', {
+        replace: true,
+        state: { callbackUrl },
+      })
+    }
+
+    const unsubscribe = desktopAuth.onCallback?.(openCallback)
+    void desktopAuth.getPendingCallback?.().then((callbackUrl) => {
+      if (!active || !callbackUrl) return
+      openCallback(callbackUrl)
+      void desktopAuth.acknowledgeCallback?.(callbackUrl)
+    })
+
+    return () => {
+      active = false
+      unsubscribe?.()
+    }
+  }, [navigate])
+
+  return null
+}
 
 function AuthRedirect({ children }: { children: React.ReactNode }) {
   const { user, isLoading } = useAuth()
@@ -52,6 +85,7 @@ function App() {
   const location = useLocation()
   return (
     <div className="relative h-full overflow-hidden bg-[#1E1E1E] text-gray-50">
+      <DesktopAuthCallbackBridge />
       <NativeFrameBar />
       <div className="mt-9 h-[calc(100%-36px)] overflow-hidden">
         <AnimatePresence mode="wait" initial={false}>
