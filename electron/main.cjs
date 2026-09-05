@@ -645,8 +645,27 @@ function sendMaximizedState(win) {
   win.webContents.send('window:maximized-changed', win.isMaximized())
 }
 
+function appendRendererDiagnostic(event, details = {}) {
+  try {
+    const diagnosticPath = path.join(app.getPath('userData'), 'renderer-events.log')
+    const sanitized = JSON.stringify(details).replace(
+      /[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
+      '[redacted-jwt]',
+    )
+    fs.appendFileSync(
+      diagnosticPath,
+      `${new Date().toISOString()} ${event} ${sanitized}\n`,
+      'utf8',
+    )
+  } catch {
+    // Diagnostics must never interfere with window creation.
+  }
+}
+
 function createWindow() {
   const isMacOS = process.platform === 'darwin'
+  let devLoadRetryTimer = null
+  let devLoadRetryCount = 0
   const win = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -669,6 +688,47 @@ function createWindow() {
     },
   })
   mainWindow = win
+
+  const scheduleDevReload = () => {
+    if (!isDev || win.isDestroyed() || devLoadRetryTimer !== null) return
+    const delay = Math.min(1000 * (2 ** devLoadRetryCount), 10000)
+    devLoadRetryCount += 1
+    devLoadRetryTimer = setTimeout(() => {
+      devLoadRetryTimer = null
+      if (win.isDestroyed()) return
+      win.loadURL(devServerUrl).catch((error) => {
+        appendRendererDiagnostic('dev-reload-failed', { message: error.message })
+      })
+    }, delay)
+  }
+
+  win.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    appendRendererDiagnostic('did-fail-load', { errorCode, errorDescription, validatedURL })
+    if (isMainFrame) scheduleDevReload()
+  })
+  win.webContents.on('render-process-gone', (_event, details) => {
+    appendRendererDiagnostic('render-process-gone', details)
+    scheduleDevReload()
+  })
+  win.webContents.on('unresponsive', () => {
+    appendRendererDiagnostic('unresponsive')
+  })
+  win.webContents.on('console-message', (_event, details) => {
+    if (details.level !== 'error' && details.level !== 'warning') return
+    appendRendererDiagnostic('renderer-console', {
+      level: details.level,
+      message: details.message,
+      sourceId: details.sourceId,
+      lineNumber: details.lineNumber,
+    })
+  })
+  win.webContents.on('did-finish-load', () => {
+    devLoadRetryCount = 0
+    if (devLoadRetryTimer !== null) {
+      clearTimeout(devLoadRetryTimer)
+      devLoadRetryTimer = null
+    }
+  })
 
   if (isDev) {
     win.loadURL(devServerUrl)
@@ -706,6 +766,7 @@ function createWindow() {
     if (pendingAuthCallback) win.webContents.send('auth:callback', pendingAuthCallback)
   })
   win.on('closed', () => {
+    if (devLoadRetryTimer !== null) clearTimeout(devLoadRetryTimer)
     if (mainWindow === win) mainWindow = null
   })
 }

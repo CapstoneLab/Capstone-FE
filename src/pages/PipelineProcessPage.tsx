@@ -3,6 +3,7 @@ import {
   CircleDashed,
   Clock3,
   CodeXml,
+  ExternalLink,
   FlaskConical,
   GitBranch,
   Hammer,
@@ -34,12 +35,16 @@ import { getAuthCacheKey } from '@/contexts/AuthContext'
 import {
   cancelPipeline,
   fetchJobDetail,
+  fetchJobResult,
+  fetchPipelineDeployment,
   fetchPipelineLogs,
+  fetchPipelineSteps,
   setRepoDomainUrl,
   setRepoPipelineInfo,
   type JobDetail,
   type JobStep,
 } from '@/lib/api'
+import { WS_API_BASE_URL } from '@/lib/config'
 
 type LocationState = {
   jobId?: string
@@ -50,8 +55,21 @@ type LocationState = {
 // Poll often enough that each newly appended backend log batch is reflected
 // in the UI without making the desktop app noisy.
 const POLL_INTERVAL_MS = 2500
+const WS_RECONNECT_DELAY_MS = 3000
 const TERMINAL_JOB_STATUSES = new Set(['success', 'failed', 'cancelled'])
 const TERMINAL_STEP_STATUSES = new Set(['success', 'failed', 'cancelled', 'skipped'])
+
+type PipelineLogEvent = {
+  step_name?: unknown
+  stepName?: unknown
+  message?: unknown
+}
+
+type PipelineSocketMessage = {
+  type?: unknown
+  lines?: unknown
+  events?: unknown
+}
 
 const stepIconMap: { match: RegExp; icon: ComponentType<{ className?: string }> }[] = [
   { match: /clone|checkout|git|레포|클론/i, icon: GitBranch },
@@ -93,19 +111,22 @@ function displayStepName(step: JobStep, idx: number) {
   return step.stepName || step.stepType || `단계 ${idx + 1}`
 }
 
-function stepIndexFromLogLine(line: string): number | null {
-  const tag = line.match(/\[([a-zA-Z][a-zA-Z0-9_-]*)(?:\.log)?\]/)?.[1]?.toLowerCase()
-  if (!tag) return null
-  const key = tag.replace(/_/g, '-')
-  if (key.includes('clone') || key.includes('checkout')) return 0
-  if (key.includes('install') || key.includes('deps') || key.includes('dependency')) return 1
-  if (key.includes('lightweight-security') || key.includes('light-security') || key.includes('gitleaks')) return 2
-  if (key.includes('test') || key.includes('jest') || key.includes('lint')) return 3
-  if (key.includes('deep-security') || key.includes('semgrep') || key.includes('sast-deep')) return 4
-  if (key.includes('security-gate') || key.includes('gate') || key.includes('verdict')) return 5
-  if (key.includes('build') || key.includes('compile') || key.includes('bundle')) return 6
-  if (key.includes('deploy') || key.includes('release') || key.includes('publish')) return 7
+function stepIndexFromName(name: string): number | null {
+  const key = name.toLowerCase().replace(/\.log$/i, '').replace(/_/g, '-').trim()
+  if (/clone|checkout|repository|레포|클론/.test(key)) return 0
+  if (/install|deps|dependency|의존성|설치/.test(key)) return 1
+  if (/lightweight-security|light-security|security-light|gitleaks|경량/.test(key)) return 2
+  if (/test|jest|lint|테스트/.test(key)) return 3
+  if (/deep-security|security-deep|semgrep|sast-deep|심화/.test(key)) return 4
+  if (/security-gate|gate|verdict|보안\s*게이트/.test(key)) return 5
+  if (/build|compile|bundle|빌드/.test(key)) return 6
+  if (/deploy|release|publish|배포/.test(key)) return 7
   return null
+}
+
+function stepIndexFromLogLine(line: string): number | null {
+  const tag = line.match(/\[([^\]\r\n]+?)(?:\.log)?\]/)?.[1]
+  return tag ? stepIndexFromName(tag) : null
 }
 
 function stepLogKeysForIndex(idx: number): string[] {
@@ -270,6 +291,10 @@ export function PipelineProcessPage() {
 
   const [job, setJob] = useState<JobDetail | null>(null)
   const [logs, setLogs] = useState<string[]>([])
+  const [deployUrl, setDeployUrl] = useState<string | null>(null)
+  const [logStreamStatus, setLogStreamStatus] = useState<
+    'connecting' | 'live' | 'reconnecting' | 'complete'
+  >('connecting')
   // Elapsed-seconds-since-job-start for each log line, captured the first
   // time we observe it. Lets us render "+12s [build.log] ..." on the line
   // even though the backend's lines are plain strings without timestamps.
@@ -304,6 +329,7 @@ export function PipelineProcessPage() {
   >({})
 
   const logContainerRef = useRef<HTMLDivElement | null>(null)
+  const logsRef = useRef<string[]>([])
   const lastLogCount = useRef(0)
   const startedAtMsRef = useRef<number | null>(null)
   const hasObservedLiveRunRef = useRef(false)
@@ -334,9 +360,10 @@ export function PipelineProcessPage() {
       // Fetch independently so a transient failure in one endpoint does not
       // discard the other's payload (e.g. logs must keep streaming even if
       // job detail blips, and vice versa).
-      const [jobResult, logsResult] = await Promise.allSettled([
+      const [jobResult, logsResult, stepsResult] = await Promise.allSettled([
         fetchJobDetail(token!, jobId),
         fetchPipelineLogs(token!, jobId),
+        fetchPipelineSteps(token!, jobId),
       ])
       if (cancelled) return
 
@@ -356,13 +383,49 @@ export function PipelineProcessPage() {
         console.error('[pipeline-poll] job detail failed:', detailError)
       }
 
+      if (stepsResult.status === 'fulfilled') {
+        const response = stepsResult.value
+        if (response.job?.status) {
+          isTerminal = TERMINAL_JOB_STATUSES.has(response.job.status)
+          if (!isTerminal) hasObservedLiveRunRef.current = true
+        }
+        setJob((previous) => {
+          const base = previous ?? nextJobForTick
+          if (!base) return previous
+          return {
+            ...base,
+            // Do not erase useful job-detail step state when the dedicated
+            // endpoint is briefly empty while callbacks are being persisted.
+            steps: response.steps.length > 0 ? response.steps : base.steps,
+            ...(response.job?.status
+              ? { status: response.job.status as JobDetail['status'] }
+              : {}),
+            ...(response.job?.startedAt ? { startedAt: response.job.startedAt } : {}),
+            ...(response.job?.completedAt ? { completedAt: response.job.completedAt } : {}),
+            ...(typeof response.job?.durationSecs === 'number'
+              ? { durationSecs: response.job.durationSecs }
+              : {}),
+          }
+        })
+      } else {
+        console.error('[pipeline-poll] steps fetch failed:', stepsResult.reason)
+      }
+
       if (logsResult.status === 'fulfilled') {
         const nextLogs = logsResult.value
+        const currentLogs = logsRef.current
+        const isStaleRestSnapshot =
+          nextLogs.length < currentLogs.length &&
+          nextLogs.every((line, index) => currentLogs[index] === line)
+        const effectiveLogs =
+          (nextLogs.length === 0 && currentLogs.length > 0) || isStaleRestSnapshot
+            ? currentLogs
+            : nextLogs
         polledLogCount = nextLogs.length
         polledLogTags = Array.from(
           new Set(
             nextLogs
-              .map((line) => line.match(/\[([a-zA-Z][a-zA-Z0-9_-]*)(?:\.log)?\]/)?.[1])
+              .map((line) => line.match(/\[([^\]\r\n]+?)(?:\.log)?\]/)?.[1])
               .filter((tag): tag is string => Boolean(tag))
               .map((tag) => tag.toLowerCase().replace(/_/g, '-')),
           ),
@@ -371,7 +434,8 @@ export function PipelineProcessPage() {
         // returns [] both for "no logs yet" and for transient errors; in
         // either case keep the lines we already have so failures still
         // show the captured output.
-        setLogs((prev) => (nextLogs.length === 0 && prev.length > 0 ? prev : nextLogs))
+        logsRef.current = effectiveLogs
+        setLogs(effectiveLogs)
 
         // Stamp each NEW line with its elapsed-since-job-start so the user
         // sees real-time "+5s [build.log] ..." in the log panel. We only
@@ -379,18 +443,18 @@ export function PipelineProcessPage() {
         // keep their original timestamp.
         if (nextJobForTick && TERMINAL_JOB_STATUSES.has(nextJobForTick.status)) {
           setLogTimestamps((prev) =>
-            nextLogs.length === 0
+            effectiveLogs.length === 0
               ? prev
-              : buildStableLogTimestamps(nextLogs.length, nextJobForTick.durationSecs),
+              : buildStableLogTimestamps(effectiveLogs.length, nextJobForTick.durationSecs),
           )
         } else {
           const jobStartMs = startedAtMsRef.current
           if (jobStartMs !== null) {
             const elapsed = Math.max(0, Math.round((Date.now() - jobStartMs) / 1000))
             setLogTimestamps((prev) => {
-              if (nextLogs.length === 0) return prev
-              if (nextLogs.length <= prev.length) return prev.slice(0, nextLogs.length)
-              const additions = nextLogs.length - prev.length
+              if (effectiveLogs.length === 0) return prev
+              if (effectiveLogs.length <= prev.length) return prev.slice(0, effectiveLogs.length)
+              const additions = effectiveLogs.length - prev.length
               return [...prev, ...new Array<number>(additions).fill(elapsed)]
             })
           }
@@ -405,6 +469,7 @@ export function PipelineProcessPage() {
           at: new Date().toLocaleTimeString(),
           jobOk: jobResult.status === 'fulfilled',
           logsOk: logsResult.status === 'fulfilled',
+          stepsOk: stepsResult.status === 'fulfilled',
           status: nextJobForTick?.status ?? null,
           logCount: polledLogCount,
           tags: polledLogTags,
@@ -435,6 +500,171 @@ export function PipelineProcessPage() {
     return () => {
       cancelled = true
       if (timer !== null) window.clearTimeout(timer)
+    }
+  }, [jobId, token])
+
+  useEffect(() => {
+    if (!jobId || !token) return
+
+    let disposed = false
+    let completed = false
+    let socket: WebSocket | null = null
+    let reconnectTimer: number | null = null
+
+    const refreshSteps = async () => {
+      try {
+        const response = await fetchPipelineSteps(token, jobId)
+        if (disposed) return
+        setJob((previous) => {
+          if (!previous) return previous
+          return {
+            ...previous,
+            steps: response.steps.length > 0 ? response.steps : previous.steps,
+            ...(response.job?.status
+              ? { status: response.job.status as JobDetail['status'] }
+              : {}),
+            ...(response.job?.repoUrl ? { repoUrl: response.job.repoUrl } : {}),
+            ...(response.job?.branch ? { branch: response.job.branch } : {}),
+            ...(response.job?.startedAt ? { startedAt: response.job.startedAt } : {}),
+            ...(response.job?.completedAt ? { completedAt: response.job.completedAt } : {}),
+            ...(typeof response.job?.durationSecs === 'number'
+              ? { durationSecs: response.job.durationSecs }
+              : {}),
+          }
+        })
+      } catch (refreshError) {
+        console.error('[pipeline-ws] steps refresh failed:', refreshError)
+      }
+    }
+
+    const refreshDeployment = async () => {
+      try {
+        const deployment = await fetchPipelineDeployment(token, jobId)
+        if (!disposed) setDeployUrl(deployment.url)
+      } catch (refreshError) {
+        console.error('[pipeline-ws] deployment refresh failed:', refreshError)
+      }
+    }
+
+    const refreshFinalState = async () => {
+      const [detailResult, resultResponse] = await Promise.allSettled([
+        fetchJobDetail(token, jobId),
+        fetchJobResult(token, jobId),
+      ])
+      if (disposed) return
+      if (detailResult.status === 'fulfilled' && detailResult.value) {
+        setJob(detailResult.value)
+      }
+      if (resultResponse.status === 'rejected') {
+        console.error('[pipeline-ws] result refresh failed:', resultResponse.reason)
+      }
+      await refreshDeployment()
+    }
+
+    const connect = () => {
+      if (disposed || completed) return
+      const url = `${WS_API_BASE_URL}/api/pipelines/${encodeURIComponent(jobId)}/logs/ws`
+      socket = new WebSocket(url)
+
+      socket.onopen = () => {
+        setLogStreamStatus('live')
+        socket?.send(JSON.stringify({ type: 'authenticate', token }))
+      }
+
+      socket.onmessage = (event) => {
+        let message: PipelineSocketMessage
+        try {
+          message = JSON.parse(String(event.data)) as PipelineSocketMessage
+        } catch (parseError) {
+          console.error('[pipeline-ws] invalid message:', parseError)
+          return
+        }
+
+        if (message.type === 'log_snapshot' && Array.isArray(message.lines)) {
+          const snapshot = message.lines.filter((line): line is string => typeof line === 'string')
+          logsRef.current = snapshot
+          setLogs(snapshot)
+          const elapsed = startedAtMsRef.current === null
+            ? 0
+            : Math.max(0, Math.round((Date.now() - startedAtMsRef.current) / 1000))
+          setLogTimestamps((previous) => {
+            if (previous.length >= snapshot.length) return previous.slice(0, snapshot.length)
+            return [...previous, ...new Array(snapshot.length - previous.length).fill(elapsed)]
+          })
+          return
+        }
+
+        if (message.type === 'log_batch' && Array.isArray(message.events)) {
+          const incoming = (message.events as PipelineLogEvent[])
+            .filter((item) => typeof item?.message === 'string')
+            .flatMap((item) => {
+              const stepName =
+                typeof item.step_name === 'string' && item.step_name
+                  ? item.step_name
+                  : typeof item.stepName === 'string' && item.stepName
+                    ? item.stepName
+                    : 'pipeline'
+              return (item.message as string)
+                .split(/\r?\n/)
+                .map((line) => `[${stepName}.log] ${line}`)
+            })
+          if (incoming.length === 0) return
+          const elapsed = startedAtMsRef.current === null
+            ? 0
+            : Math.max(0, Math.round((Date.now() - startedAtMsRef.current) / 1000))
+          const previousLength = logsRef.current.length
+          const nextLogs = [...logsRef.current, ...incoming]
+          logsRef.current = nextLogs
+          setLogs(nextLogs)
+          setLogTimestamps((previous) => [
+            ...previous.slice(0, previousLength),
+            ...new Array<number>(incoming.length).fill(elapsed),
+          ])
+          return
+        }
+
+        if (message.type === 'step_complete') {
+          void refreshSteps()
+          return
+        }
+
+        if (message.type === 'pipeline_complete') {
+          completed = true
+          setLogStreamStatus('complete')
+          void refreshFinalState()
+        }
+      }
+
+      socket.onerror = () => {
+        // onclose owns reconnect scheduling, avoiding two simultaneous timers.
+        console.error('[pipeline-ws] connection failed:', url)
+        socket?.close()
+      }
+
+      socket.onclose = (event) => {
+        if (!disposed && !completed) {
+          console.warn('[pipeline-ws] disconnected:', {
+            code: event.code,
+            reason: event.reason || 'handshake/connection failure',
+          })
+        }
+        socket = null
+        if (!disposed && !completed) {
+          setLogStreamStatus('reconnecting')
+          reconnectTimer = window.setTimeout(connect, WS_RECONNECT_DELAY_MS)
+        }
+      }
+    }
+
+    // Job/log/step hydration is handled by the polling effect above.
+    void refreshDeployment()
+    void fetchJobResult(token, jobId).catch(() => undefined)
+    connect()
+
+    return () => {
+      disposed = true
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
+      socket?.close()
     }
   }, [jobId, token])
 
@@ -519,16 +749,16 @@ export function PipelineProcessPage() {
     //   name:             — at start
     //   === name ===      — at start
     const tagPatterns: RegExp[] = [
-      /\[([a-zA-Z][a-zA-Z0-9_-]{1,40})(?:\.log)?\]/,
-      /^([a-zA-Z][a-zA-Z0-9_-]{1,40})\s*:\s/,
-      /^={2,}\s*([a-zA-Z][a-zA-Z0-9_-]{1,40})\s*={2,}/,
+      /\[([^\]\r\n]{1,80}?)(?:\.log)?\]/,
+      /^([^:\r\n]{1,80})\s*:\s/,
+      /^={2,}\s*([^=\r\n]{1,80}?)\s*={2,}/,
     ]
     allLogEntries.forEach((entry) => {
       let key = '__general__'
       for (const pat of tagPatterns) {
         const m = entry.line.match(pat)
         if (m && m[1]) {
-          key = m[1].toLowerCase().replace(/_/g, '-')
+          key = m[1].toLowerCase().replace(/\.log$/i, '').replace(/_/g, '-').trim()
           break
         }
       }
@@ -688,29 +918,25 @@ export function PipelineProcessPage() {
     const taggedIndexes = logs
       .map(stepIndexFromLogLine)
       .filter((idx): idx is number => idx !== null)
-    const completedLogIndexes = new Set(taggedIndexes)
-    let completedPrefixCount = 0
-    while (completedLogIndexes.has(completedPrefixCount)) {
-      completedPrefixCount += 1
-    }
-    const runningIdx =
-      !isTerminal && jobStatus === 'running'
-        ? Math.min(completedPrefixCount, PLACEHOLDER_STEPS.length - 1)
-        : null
+    const observedLogIndexes = new Set(taggedIndexes)
+    const latestLogIdx = taggedIndexes.length > 0 ? taggedIndexes[taggedIndexes.length - 1] : null
 
     const statusFromLogs = (idx: number, backendStatus: JobStep['status']): JobStep['status'] => {
-      if (completedLogIndexes.has(idx)) {
-        return 'success'
-      }
-      if (runningIdx === idx) {
+      // Backend step state is authoritative. Log-derived state fills only the
+      // gap between a new step's first streamed line and the next steps poll.
+      if (TERMINAL_STEP_STATUSES.has(backendStatus)) return backendStatus
+      if (backendStatus === 'running') {
+        if (latestLogIdx !== null && latestLogIdx > idx) return 'success'
         return 'running'
       }
       if (isTerminal) {
-        if (jobStatus === 'failed' && idx === completedPrefixCount) return 'failed'
-        if (backendStatus === 'success' || backendStatus === 'failed' || backendStatus === 'skipped') {
-          return backendStatus
-        }
+        if (latestLogIdx === idx && jobStatus === 'failed') return 'failed'
+        if (observedLogIndexes.has(idx)) return 'success'
         return backendStatus
+      }
+      if (latestLogIdx !== null) {
+        if (idx === latestLogIdx) return 'running'
+        if (idx < latestLogIdx && observedLogIndexes.has(idx)) return 'success'
       }
       return 'pending'
     }
@@ -828,6 +1054,17 @@ export function PipelineProcessPage() {
   }, [revealedCount, logs.length])
 
   const runningDurationFor = (idx: number): number => {
+    const step = steps[idx]
+    if (step?.startedAt) {
+      const backendStartMs = Date.parse(step.startedAt)
+      if (!Number.isNaN(backendStartMs)) {
+        return Math.max(0, Math.round((Date.now() - backendStartMs) / 1000))
+      }
+    }
+    const observedStartMs = stepLifecycle[lifecycleKeyFor(idx)]?.observedStartMs
+    if (observedStartMs !== undefined) {
+      return Math.max(0, Math.round((Date.now() - observedStartMs) / 1000))
+    }
     if (idx <= 0) return Math.max(0, elapsedSec)
     const previousStepEnd = stepLogKeysForIndex(idx - 1)
       .flatMap((logKey) => stepLogsMap.get(logKey) ?? [])
@@ -858,8 +1095,8 @@ export function PipelineProcessPage() {
     )
     const logDuration = logDurationFor(step, idx, capSecs)
 
-    if (storedDuration !== null) return storedDuration
     if (backendDuration !== null) return backendDuration
+    if (storedDuration !== null) return storedDuration
     if (lifecycleDuration !== null) return lifecycleDuration
     if (liveDuration !== null) return liveDuration
     if (logDuration !== null) return logDuration
@@ -891,36 +1128,10 @@ export function PipelineProcessPage() {
     (s, idx) => displayedStatusFor(idx, s.status) === 'success',
   ).length
 
-  const displayedStepDurations = (() => {
-    const raw = steps.map((step, idx) => rawDisplayedDurationFor(step, idx))
-    const totalCap = job?.durationSecs && job.durationSecs > 0 ? job.durationSecs : elapsedSec
-    if (totalCap <= 0) return raw
-
-    const cappedIndexes = steps
-      .map((step, idx) => ({ idx, status: displayedStatusFor(idx, step.status), duration: raw[idx] ?? 0 }))
-      .filter(({ status, duration }) => TERMINAL_STEP_STATUSES.has(status) && duration > 0)
-
-    const sum = cappedIndexes.reduce((acc, item) => acc + item.duration, 0)
-    if (sum <= totalCap) return raw
-
-    const next = [...raw]
-    const scale = totalCap / sum
-    cappedIndexes.forEach(({ idx, duration }) => {
-      next[idx] = Math.max(1, Math.floor(duration * scale))
-    })
-
-    let scaledSum = cappedIndexes.reduce((acc, { idx }) => acc + (next[idx] ?? 0), 0)
-    while (scaledSum > totalCap) {
-      const target = cappedIndexes
-        .filter(({ idx }) => (next[idx] ?? 0) > 1)
-        .sort((a, b) => (next[b.idx] ?? 0) - (next[a.idx] ?? 0))[0]
-      if (!target) break
-      next[target.idx] = (next[target.idx] ?? 1) - 1
-      scaledSum -= 1
-    }
-
-    return next
-  })()
+  // Keep completed durations exactly aligned with the backend. Older UI code
+  // proportionally rescaled step durations to fit the job total, which made
+  // correctly reported backend timings appear different on screen.
+  const displayedStepDurations = steps.map((step, idx) => rawDisplayedDurationFor(step, idx))
 
   // When the deploy step finishes successfully, scan its logs for an
   // http(s) URL and persist it as this repo's deployment domain. The
@@ -954,6 +1165,7 @@ export function PipelineProcessPage() {
     if (!found) return
     if (lastDomainExtractedRef.current === found) return
     lastDomainExtractedRef.current = found
+    setDeployUrl((previous) => previous ?? found)
     setRepoDomainUrl(cacheKey, repoName, found)
     // findLogsForStep is intentionally not in deps — its closures are
     // covered by `steps`/`stepLifecycle`/`logs` which already trigger re-runs.
@@ -1347,7 +1559,9 @@ export function PipelineProcessPage() {
                   style={{ backgroundColor: jobBadge.dotColor }}
                 />
                 <p className="text-[14px] text-[#D1D5DB]">
-                  {isTerminal
+                  {jobStatus === 'running' && !isTerminal
+                    ? `백엔드 단계 정보 대기 중 · ${formatDuration(elapsedSec)}`
+                    : isTerminal
                     ? `파이프라인 ${jobBadge.label} · 총 ${formatDuration(elapsedSec)}`
                     : `${jobBadge.label} · ${formatDuration(elapsedSec)}`}
                 </p>
@@ -1523,7 +1737,39 @@ export function PipelineProcessPage() {
             <AccordionTrigger className="py-0 hover:no-underline">
               <div className="flex w-full items-center justify-between pr-3">
                 <p className="text-[16px] font-semibold text-white">실시간 전체 로그</p>
-                <p className="text-[12px] text-[#6B7280]">{logs.length} 줄</p>
+                <div className="flex items-center gap-3 text-[12px]">
+                  <span
+                    className={`inline-flex items-center gap-1.5 ${
+                      isTerminal || logStreamStatus === 'complete'
+                        ? 'text-[#6B7280]'
+                        : logStreamStatus === 'live'
+                          ? 'text-[#34D399]'
+                          : 'text-[#F59E0B]'
+                    }`}
+                  >
+                    <span
+                      className={`h-2 w-2 rounded-full ${
+                        logStreamStatus === 'live' && !isTerminal ? 'animate-pulse' : ''
+                      }`}
+                      style={{
+                        backgroundColor:
+                          isTerminal || logStreamStatus === 'complete'
+                            ? '#6B7280'
+                            : logStreamStatus === 'live'
+                              ? '#34D399'
+                              : '#F59E0B',
+                      }}
+                    />
+                    {isTerminal || logStreamStatus === 'complete'
+                      ? '수집 완료'
+                      : logStreamStatus === 'live'
+                        ? '실시간 연결됨'
+                        : logStreamStatus === 'reconnecting'
+                          ? '실시간 연결 실패 · REST 폴링 중'
+                          : '연결 중'}
+                  </span>
+                  <span className="text-[#6B7280]">{logs.length} 줄</span>
+                </div>
               </div>
             </AccordionTrigger>
             <AccordionContent className="pt-3">
@@ -1549,6 +1795,14 @@ export function PipelineProcessPage() {
         </Accordion>
 
         <div className="flex justify-end gap-2 pt-1">
+          {deployUrl ? (
+            <Button asChild variant="outline" className="shadow-none">
+              <a href={deployUrl} target="_blank" rel="noopener noreferrer">
+                <ExternalLink className="mr-1.5 h-4 w-4" />
+                배포된 서비스 열기
+              </a>
+            </Button>
+          ) : null}
           {!isTerminal ? (
             <Button
               onClick={() => setIsCancelDialogOpen(true)}

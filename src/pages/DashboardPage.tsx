@@ -610,17 +610,25 @@ export function DashboardPage() {
   const totalPipelines = pipelines.length
   const successCount = pipelines.filter((item) => item.status === 'success').length
   const successRate = totalPipelines === 0 ? 0 : Math.round((successCount / totalPipelines) * 100)
+  const scoredPipelines = pipelines.filter(
+    (item) => item.status === 'success' || item.status === 'failed',
+  )
   const avgScore =
-    totalPipelines === 0
+    scoredPipelines.length === 0
       ? 0
-      : Math.round(pipelines.reduce((sum, item) => sum + item.score, 0) / totalPipelines)
+      : Math.round(
+          scoredPipelines.reduce((sum, item) => sum + item.score, 0) / scoredPipelines.length,
+        )
   const avgDuration =
     totalPipelines === 0
       ? 0
       : Math.round(pipelines.reduce((sum, item) => sum + item.durationSec, 0) / totalPipelines)
 
   const chartPipelines = useMemo(
-    () => [...pipelines].reverse().slice(-20),
+    () => [...pipelines]
+      .filter((item) => item.status === 'success' || item.status === 'failed')
+      .reverse()
+      .slice(-20),
     [pipelines],
   )
 
@@ -974,7 +982,7 @@ export function DashboardPage() {
                             {run.status === 'running' ? t('dashboard.running') : t('dashboard.queued')}
                           </Badge>
                         ) : null}
-                        {run.verdict ? (
+                        {run.status !== 'cancelled' && run.verdict ? (
                           <Badge
                             className={`px-2 py-0.5 text-[11px] ${verdictMeta[run.verdict].className}`}
                             title={run.verdictReason ?? undefined}
@@ -1063,6 +1071,10 @@ export function DashboardPage() {
                             )}
                           </div>
                         </div>
+                      ) : run.status === 'cancelled' ? (
+                        <p className="text-[12px] text-[#9CA3AF]">
+                          {t('dashboard.cancelledNoScore')}
+                        </p>
                       ) : (
                         <div>
                           <div className="mb-2 flex items-center justify-between text-sm">

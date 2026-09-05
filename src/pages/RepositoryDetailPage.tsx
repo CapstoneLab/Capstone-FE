@@ -1,7 +1,7 @@
 import dayjs from 'dayjs'
 import 'dayjs/locale/ko'
 import relativeTime from 'dayjs/plugin/relativeTime'
-import { ArrowUpRight, CheckCircle2, CircleEllipsis, GitBranch, Globe, XCircle } from 'lucide-react'
+import { ArrowUpRight, Check, CheckCircle2, CircleEllipsis, Copy, GitBranch, Globe, XCircle } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
@@ -19,6 +19,7 @@ import {
   fetchGithubRepoExtras,
   fetchJobsByIds,
   fetchLatestCommit,
+  fetchPipelineDeployment,
   fetchReposWithBranches,
   getCachedRepos,
   getRepoDomainUrl,
@@ -72,6 +73,23 @@ function parseOwnerRepo(fullName: string): { owner: string; repo: string } | nul
   return { owner, repo }
 }
 
+async function copyToClipboard(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value)
+    return
+  }
+
+  const textarea = document.createElement('textarea')
+  textarea.value = value
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+  const copied = document.execCommand('copy')
+  textarea.remove()
+  if (!copied) throw new Error('Clipboard copy failed')
+}
+
 export function RepositoryDetailPage() {
   const { state } = useLocation()
   const { repoId: paramRepoId = '' } = useParams()
@@ -97,13 +115,14 @@ export function RepositoryDetailPage() {
   const [githubBranches, setGithubBranches] = useState<string[] | null>(null)
   const [githubPushedAt, setGithubPushedAt] = useState<string | null>(null)
   const [repoError, setRepoError] = useState<string | null>(null)
-  // User-provided deployment domain — the backend has no source for this,
-  // so we let the user save it per-repo in localStorage and edit inline.
-  // Domain is keyed by repo full_name (e.g. "owner/repo") so that the
-  // pipeline page — which only has the repo URL/name, not the GitHub
-  // numeric id — can write the auto-extracted deploy URL to the same slot.
-  const [domainDraft, setDomainDraft] = useState<string>('')
-  const [isEditingDomain, setIsEditingDomain] = useState(false)
+  // Deployment URL sources are resolved automatically: backend deployment,
+  // the pipeline's cached URL, then GitHub's configured repository homepage.
+  const [githubHomepageUrl, setGithubHomepageUrl] = useState<string | null>(null)
+  const [deploymentLookup, setDeploymentLookup] = useState<{
+    repoName: string
+    url: string | null
+  } | null>(null)
+  const [isDomainCopied, setIsDomainCopied] = useState(false)
 
   useEffect(() => {
     dayjs.locale(locale)
@@ -218,6 +237,7 @@ export function RepositoryDetailPage() {
         if (cancelled) return
         if (extras.branches.length > 0) setGithubBranches(extras.branches)
         if (extras.pushedAt) setGithubPushedAt(extras.pushedAt)
+        setGithubHomepageUrl(extras.homepageUrl)
       })
       .catch(() => {})
 
@@ -225,6 +245,27 @@ export function RepositoryDetailPage() {
       cancelled = true
     }
   }, [token, repo])
+
+  // Prefer the deployment recorded by the backend for the latest pipeline.
+  // GitHub's public repository homepage is used only as a final fallback.
+  useEffect(() => {
+    if (!token || !repo || !latestJob?.jobId) return
+
+    let cancelled = false
+    fetchPipelineDeployment(token, latestJob.jobId)
+      .then((deployment) => {
+        if (cancelled) return
+        setDeploymentLookup({ repoName: repo.name, url: deployment.url })
+        if (deployment.url) setRepoDomainUrl(cacheKey, repo.name, deployment.url)
+      })
+      .catch(() => {
+        if (!cancelled) setDeploymentLookup({ repoName: repo.name, url: null })
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [token, latestJob?.jobId, repo, cacheKey])
 
   // Use considerVerdict=false here: the "파이프라인 최근 상태" badge reflects
   // whether the pipeline EXECUTED successfully, not whether the security
@@ -317,7 +358,10 @@ export function RepositoryDetailPage() {
   // numeric id as legacy migration for users who saved before this fix.
   const savedDomain =
     getRepoDomainUrl(cacheKey, repo.name) || getRepoDomainUrl(cacheKey, repo.id)
-  const domainUrl = savedDomain || repo.domainUrl?.trim() || ''
+  const backendDeploymentUrl =
+    deploymentLookup?.repoName === repo.name ? deploymentLookup.url : null
+  const domainUrl =
+    backendDeploymentUrl || savedDomain || repo.domainUrl?.trim() || githubHomepageUrl || ''
   const description = repo.description?.trim() || t('repo.noDescription')
   const branch =
     pipelineInfo?.branch?.trim() ||
@@ -326,13 +370,15 @@ export function RepositoryDetailPage() {
     repo.branches[0] ||
     '-'
 
-  const handleDomainSave = () => {
-    setRepoDomainUrl(cacheKey, repo.name, domainDraft)
-    setIsEditingDomain(false)
-  }
-  const handleDomainCancel = () => {
-    setDomainDraft(savedDomain)
-    setIsEditingDomain(false)
+  const handleDomainCopy = async () => {
+    if (!domainUrl) return
+    try {
+      await copyToClipboard(domainUrl)
+      setIsDomainCopied(true)
+      window.setTimeout(() => setIsDomainCopied(false), 1500)
+    } catch {
+      setIsDomainCopied(false)
+    }
   }
 
   return (
@@ -368,61 +414,37 @@ export function RepositoryDetailPage() {
           <Card className="border-[#404040] bg-[#262626] p-4">
             <div className="flex items-center justify-between gap-2">
               <p className="text-[16px] font-semibold text-white">{t('repo.domainTitle')}</p>
-              {!isEditingDomain ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setDomainDraft(savedDomain)
-                    setIsEditingDomain(true)
-                  }}
-                  className="rounded-md border border-[#3A3A3A] bg-[#1E1E1E] px-2 py-0.5 text-[11px] text-[#9CA3AF] hover:border-[#6B7280] hover:text-[#D1D5DB]"
-                >
-                  {savedDomain ? t('repo.edit') : t('repo.add')}
-                </button>
-              ) : null}
+              <button
+                type="button"
+                onClick={handleDomainCopy}
+                disabled={!domainUrl}
+                className="inline-flex items-center gap-1 rounded-md border border-[#3A3A3A] bg-[#1E1E1E] px-2 py-0.5 text-[11px] text-[#9CA3AF] hover:border-[#6B7280] hover:text-[#D1D5DB] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {isDomainCopied ? (
+                  <Check className="h-3 w-3 text-[#34D399]" />
+                ) : (
+                  <Copy className="h-3 w-3" />
+                )}
+                {isDomainCopied ? t('repo.copied') : t('repo.copy')}
+              </button>
             </div>
             <div className="mt-3 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
-              {isEditingDomain ? (
-                <div className="flex flex-col gap-2">
-                  <div className="flex items-center gap-2">
-                    <Globe className="h-4 w-4 shrink-0 text-[#34D399]" />
-                    <input
-                      type="text"
-                      value={domainDraft}
-                      onChange={(e) => setDomainDraft(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') handleDomainSave()
-                        if (e.key === 'Escape') handleDomainCancel()
-                      }}
-                      placeholder={t('repo.domainPlaceholder')}
-                      autoFocus
-                      className="flex-1 rounded-md border border-[#3A3A3A] bg-[#0F0F0F] px-2 py-1 text-[14px] text-[#D1D5DB] outline-none focus:border-[#34D399]"
-                    />
-                  </div>
-                  <div className="flex justify-end gap-2">
-                    <button
-                      type="button"
-                      onClick={handleDomainCancel}
-                      className="rounded-md border border-[#3A3A3A] px-2 py-0.5 text-[11px] text-[#9CA3AF] hover:text-[#D1D5DB]"
-                    >
-                      {t('dashboard.cancel')}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleDomainSave}
-                      className="rounded-md border border-[#3ECF8E] bg-[#065F46]/30 px-2 py-0.5 text-[11px] text-[#A7F3D0] hover:bg-[#065F46]/50"
-                    >
-                      {t('repo.save')}
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <p className="inline-flex items-center gap-2 text-[14px] text-[#D1D5DB]">
-                  <Globe className="h-4 w-4 text-[#34D399]" />
-                  {domainUrl || t('repo.domainEmpty')}
-                </p>
-              )}
-              <p className="mt-2 text-[12px] text-[#6B7280]">{t('repo.domainHelp')}</p>
+              <div className="flex items-center gap-2 text-[14px] text-[#D1D5DB]">
+                <Globe className="h-4 w-4 shrink-0 text-[#34D399]" />
+                {domainUrl ? (
+                  <Link
+                    to={domainUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex min-w-0 items-center gap-1 break-all text-[#34D399] underline-offset-4 hover:underline"
+                  >
+                    {domainUrl}
+                    <ArrowUpRight className="h-3.5 w-3.5 shrink-0" />
+                  </Link>
+                ) : (
+                  <span className="text-[#9CA3AF]">{t('repo.domainEmpty')}</span>
+                )}
+              </div>
             </div>
           </Card>
 

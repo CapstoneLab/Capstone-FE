@@ -421,6 +421,8 @@ export type GitHubRepoExtras = {
   /** Repo's last push timestamp (ISO) — the accurate "푸시 시각". */
   pushedAt: string | null
   defaultBranch: string | null
+  /** Public deployment/homepage URL configured on the GitHub repository. */
+  homepageUrl: string | null
 }
 
 // Fetch a public repo's branch list + push metadata directly from GitHub,
@@ -433,7 +435,12 @@ export async function fetchGithubRepoExtras(
   owner: string,
   repo: string,
 ): Promise<GitHubRepoExtras> {
-  const empty: GitHubRepoExtras = { branches: [], pushedAt: null, defaultBranch: null }
+  const empty: GitHubRepoExtras = {
+    branches: [],
+    pushedAt: null,
+    defaultBranch: null,
+    homepageUrl: null,
+  }
   if (!owner || !repo) return empty
 
   const o = encodeURIComponent(owner)
@@ -459,17 +466,29 @@ export async function fetchGithubRepoExtras(
 
   let pushedAt: string | null = null
   let defaultBranch: string | null = null
+  let homepageUrl: string | null = null
   if (metaRes.status === 'fulfilled' && metaRes.value.ok) {
     try {
       const data = (await metaRes.value.json()) as UnknownRecord
       pushedAt = pick<string>(data, 'pushed_at', 'pushedAt') ?? null
       defaultBranch = pick<string>(data, 'default_branch', 'defaultBranch') ?? null
+      const homepage = pick<string>(data, 'homepage')?.trim()
+      if (homepage) {
+        try {
+          const parsed = new URL(homepage)
+          if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+            homepageUrl = parsed.href
+          }
+        } catch {
+          // Ignore malformed repository homepage values.
+        }
+      }
     } catch {
       // keep nulls
     }
   }
 
-  return { branches, pushedAt, defaultBranch }
+  return { branches, pushedAt, defaultBranch, homepageUrl }
 }
 
 const REPO_PIPELINE_INFO_PREFIX = 'secupipeline:repo-pipeline-info:'
@@ -1499,6 +1518,39 @@ export async function fetchPipelineLogs(
   const data = (await res.json()) as UnknownRecord
   const lines = pick<unknown[]>(data, 'lines')
   return Array.isArray(lines) ? (lines as string[]) : []
+}
+
+export type PipelineDeployment = {
+  url: string | null
+}
+
+export async function fetchPipelineDeployment(
+  token: string,
+  jobId: string,
+): Promise<PipelineDeployment> {
+  const res = await fetch(
+    `${API_BASE}/api/pipelines/${encodeURIComponent(jobId)}/deployment`,
+    { headers: authHeaders(token) },
+  )
+
+  if (!res.ok) {
+    notifyIfUnauthorized(res.status)
+    // Deployment is optional and may not exist until the deploy step finishes.
+    if (res.status === 404) return { url: null }
+    throw new Error(`Failed to fetch pipeline deployment (${res.status})`)
+  }
+
+  const data = (await res.json()) as UnknownRecord
+  const deployment = pick<UnknownRecord>(data, 'deployment')
+  const url = deployment ? pick<string>(deployment, 'url') : pick<string>(data, 'url')
+
+  if (typeof url !== 'string' || !url.trim()) return { url: null }
+  try {
+    const parsed = new URL(url.trim())
+    return { url: parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : null }
+  } catch {
+    return { url: null }
+  }
 }
 
 export type PipelineStepsResponse = {

@@ -28,6 +28,7 @@ export default defineConfig(({ mode }) => {
       '/api-proxy': {
         target: apiOrigin,
         changeOrigin: true,
+        ws: true,
         rewrite: (path) => path.replace(/^\/api-proxy/, apiPath),
       },
     },
