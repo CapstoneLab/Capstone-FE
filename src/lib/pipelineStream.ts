@@ -1,5 +1,8 @@
+import type { JobStep } from './api'
+
 export type StreamMessage = {
   type?: string
+  step?: Record<string, unknown>
   seq?: number
   job_status?: string
   engine_heartbeat_at?: string
@@ -32,4 +35,34 @@ export function reduceStreamLogs(state: StreamLogs, message: StreamMessage): Str
     }
   }
   return { cursor: seq ?? state.cursor, lines: [...state.lines, ...lines], times: [...state.times, ...times] }
+}
+
+
+/** Use the persisted stage event immediately; REST is only a recovery path. */
+export function stepFromStream(message: StreamMessage): JobStep | null {
+  if (!message.type?.startsWith('stage_') && !['step_started', 'step_complete'].includes(message.type ?? '')) return null
+  const step = message.step
+  if (!step || typeof step.step_id !== 'string' || typeof step.step_name !== 'string'
+    || typeof step.step_type !== 'string' || !['pending', 'running', 'success', 'failed', 'skipped', 'cancelled'].includes(String(step.status))) return null
+  return {
+    stepId: step.step_id, stepName: step.step_name, stepType: step.step_type,
+    status: step.status as JobStep['status'],
+    errorMessage: typeof step.error_message === 'string' ? step.error_message : null,
+    startedAt: typeof step.started_at === 'string' ? step.started_at : null,
+    endedAt: typeof step.ended_at === 'string' ? step.ended_at : null,
+    durationSecs: typeof step.duration_secs === 'number' ? step.duration_secs : null,
+  }
+}
+
+export function mergeStreamStep(steps: JobStep[], incoming: JobStep): JobStep[] {
+  const index = steps.findIndex((step) => step.stepId === incoming.stepId || step.stepName === incoming.stepName)
+  if (index < 0) return [...steps, incoming]
+  const current = steps[index]
+  // A replayed start cannot undo a completed stage.
+  if (['success', 'failed', 'skipped', 'cancelled'].includes(current.status) && incoming.status !== current.status) return steps
+  return steps.map((step, i) => i === index ? { ...incoming,
+    startedAt: incoming.startedAt ?? step.startedAt,
+    endedAt: incoming.endedAt ?? step.endedAt,
+    durationSecs: incoming.durationSecs ?? step.durationSecs,
+  } : step)
 }

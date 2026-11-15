@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { reduceStreamLogs, type StreamLogs } from './pipelineStream'
+import { stepFromStream, mergeStreamStep, reduceStreamLogs, type StreamLogs } from './pipelineStream'
 
 const empty: StreamLogs = { cursor: null, lines: [], times: [] }
 describe('durable pipeline stream', () => {
@@ -29,5 +29,26 @@ describe('durable pipeline stream', () => {
     const reconciled = reduceStreamLogs(partial, { type: 'log_snapshot', seq: 9, lines: ['[test.log] first', '[test.log] missing', '[test.log] done'] })
     expect(reconciled.lines).toHaveLength(3)
     expect(reduceStreamLogs(reconciled, { type: 'log_batch', seq: 8, events: [{ message: 'missing' }] })).toBe(reconciled)
+  })
+})
+
+
+describe('immediate stage updates', () => {
+  const raw = { step_id: 'step-test', step_name: 'test', step_type: 'test', status: 'running', started_at: '2026-11-15T00:00:00Z' }
+  it('uses event state without a REST request and preserves timing on completion', () => {
+    const started = stepFromStream({ type: 'stage_started', step: raw })!
+    const completed = stepFromStream({ type: 'stage_completed', step: { ...raw, status: 'success', ended_at: '2026-11-15T00:00:01Z' } })!
+    const steps = mergeStreamStep([started], completed)
+    expect(steps).toHaveLength(1)
+    expect(steps[0].status).toBe('success')
+    expect(steps[0].endedAt).toBe('2026-11-15T00:00:01Z')
+    expect(mergeStreamStep(steps, started)).toBe(steps)
+    expect(mergeStreamStep(steps, completed)).toHaveLength(1)
+  })
+  it('falls back for old or incomplete payloads and accepts cancellation', () => {
+    expect(stepFromStream({ type: 'step_complete' })).toBeNull()
+    expect(stepFromStream({ type: 'log_batch', step: raw })).toBeNull()
+    expect(stepFromStream({ type: 'stage_started', step: { ...raw, status: 'invalid' } })).toBeNull()
+    expect(stepFromStream({ type: 'stage_cancelled', step: { ...raw, status: 'cancelled' } })?.status).toBe('cancelled')
   })
 })

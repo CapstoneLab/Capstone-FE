@@ -1,4 +1,4 @@
-import { reduceStreamLogs, type StreamLogs, type StreamMessage } from '@/lib/pipelineStream'
+import { stepFromStream, mergeStreamStep, reduceStreamLogs, type StreamLogs, type StreamMessage } from '@/lib/pipelineStream'
 import {
   CheckCircle2,
   CircleDashed,
@@ -502,7 +502,7 @@ function PipelineProcessContent() {
       setIsInitialLoading(false)
 
       if (!isTerminal) {
-        timer = window.setTimeout(tick, document.hidden ? 10000 : POLL_INTERVAL_MS)
+        timer = window.setTimeout(tick, document.hidden || streamLiveRef.current ? 10000 : POLL_INTERVAL_MS)
       }
     }
 
@@ -535,11 +535,13 @@ function PipelineProcessContent() {
     }
 
     let stepsRequest = 0
+    let stageRevision = 0
     const refreshSteps = async () => {
       const request = ++stepsRequest
+      const revision = stageRevision
       try {
         const response = await fetchPipelineSteps(token, jobId)
-        if (disposed || request !== stepsRequest) return
+        if (disposed || request !== stepsRequest || revision !== stageRevision) return
         setJob((previous) => {
           if (!previous) return previous
           return {
@@ -660,7 +662,17 @@ function PipelineProcessContent() {
           return
         }
         if (message.type?.startsWith('stage_') || message.type === 'step_started' || message.type === 'step_complete') {
-          void refreshSteps()
+          const incoming = stepFromStream(message)
+          if (incoming) {
+            stageRevision += 1
+            setJob((previous) => previous ? {
+              ...previous,
+              latestStepName: incoming.stepName,
+              steps: mergeStreamStep(previous.steps, incoming),
+            } : previous)
+          } else {
+            void refreshSteps()
+          }
           return
         }
         if (['pipeline_complete', 'pipeline_completed', 'pipeline_failed', 'pipeline_cancelled'].includes(message.type ?? '')) {
@@ -1014,84 +1026,23 @@ function PipelineProcessContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiSteps, stepLogsMap, logs, isTerminal, jobStatus])
 
-  // Sequential reveal queue. The backend often batches 3–4 step completions
-  // into a single poll, so without throttling we'd see them all flip from
-  // "pending → success" simultaneously with the same timestamp (which is
-  // why the user was seeing "0s / 1s" timings). We instead reveal one
-  // completed step at a time, ~900ms apart, so the user sees a natural
-  // one-by-one progression with each step's clock visible.
-  //
-  // Initial value of `null` means "we haven't observed any state yet" —
-  // on first observation we snap revealedCount to whatever's already
-  // complete (so users navigating to a finished pipeline see everything
-  // immediately, not animated from scratch).
-  // Shorter than the original 900ms so the visual reveal keeps up with
-  // fast pipelines — otherwise reveal lags behind the backend and the user
-  // sees logs only after the queue finishes animating.
   const isHistorySnapshot = isTerminal && !hasObservedLiveRunRef.current && apiSteps.length > 0
-
-  const REVEAL_INTERVAL_MS = 1100
-  const [revealedCount, setRevealedCount] = useState<number | null>(null)
-  // Wall-clock time each step transitioned to "displayed complete" — used
-  // to derive a believable displayed duration when the backend's data is
-  // unreliable.
-  const [, setStepRevealTimes] = useState<Record<number, number>>({})
-  // logs.length captured at the moment each step revealed as complete.
-  // Lets the accordion of step N show logs that arrived between step (N-1)
-  // reveal and step N reveal as belonging to step N. Tag matching still
-  // takes precedence — this is the fallback for untagged logs.
+  const revealedCount = steps.filter((step) => TERMINAL_STEP_STATUSES.has(step.status)).length
   const [stepRevealLogCounts, setStepRevealLogCounts] = useState<Record<number, number>>({})
 
-  // First observation: snap reveal to current completed count, no animation.
+  // Capture available untagged logs without delaying already-persisted states.
   useEffect(() => {
-    if (revealedCount !== null) return
-    if (steps.length === 0) return
-    if (isHistorySnapshot) {
-      setRevealedCount(steps.length)
-      setStepRevealTimes({})
-      return
-    }
-    setRevealedCount(0)
-    // Intentionally only runs once we know steps — depend on steps but
-    // re-check with the guard above.
-  }, [steps, revealedCount, isHistorySnapshot])
-
-  // Advance reveal toward the actual completion count, one step per tick.
-  useEffect(() => {
-    if (revealedCount === null) return
-    if (isHistorySnapshot) return
-    const actualCompleted = steps.filter((s) =>
-      TERMINAL_STEP_STATUSES.has(s.status),
-    ).length
-    if (revealedCount >= actualCompleted) return
-    const id = window.setTimeout(() => {
-      setRevealedCount((prev) => {
-        if (prev === null) return prev
-        const next = Math.min(prev + 1, actualCompleted)
-        setStepRevealTimes((map) => ({ ...map, [next - 1]: Date.now() }))
-        return next
+    setStepRevealLogCounts((previous) => {
+      let next = previous
+      steps.forEach((step, index) => {
+        if (TERMINAL_STEP_STATUSES.has(step.status) && previous[index] === undefined) {
+          if (next === previous) next = { ...previous }
+          next[index] = logs.length
+        }
       })
-    }, REVEAL_INTERVAL_MS)
-    return () => window.clearTimeout(id)
-  }, [revealedCount, steps, isHistorySnapshot])
-
-  // Capture logs.length at the moment of each reveal so the per-step
-  // accordion can show the logs that arrived between the previous reveal
-  // and this one. This effect can re-fire on log polls but the guard
-  // ensures we only WRITE once per revealedCount value (no-op otherwise).
-  //
-  // CRITICAL: this is a SEPARATE effect from reveal-advance so logs.length
-  // never appears in the advance effect's deps — that would cancel the
-  // 900ms setTimeout on every poll and freeze the reveal queue.
-  useEffect(() => {
-    if (revealedCount === null || revealedCount === 0) return
-    const justRevealed = revealedCount - 1
-    setStepRevealLogCounts((prev) =>
-      prev[justRevealed] !== undefined
-        ? prev
-        : { ...prev, [justRevealed]: logs.length },
-    )
-  }, [revealedCount, logs.length])
+      return next
+    })
+  }, [steps, logs.length])
 
   const runningDurationFor = (idx: number): number => {
     const step = steps[idx]
