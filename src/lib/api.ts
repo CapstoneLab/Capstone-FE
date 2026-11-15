@@ -110,7 +110,7 @@ function mapRepo(raw: UnknownRecord): RepositoryItem {
     repositoryUrl: pick<string>(raw, 'clone_url', 'cloneUrl') ?? htmlUrl,
     htmlUrl,
     ownerLogin: pick<string>(raw, 'owner_login', 'ownerLogin') ?? fullName.split('/')[0] ?? '',
-    domainUrl: '',
+    domainUrl: normalizeWebUrl(pick<string>(raw, 'homepage') ?? ''),
     pipelineStatus: 'pending',
     source: {
       branch: defaultBranch ?? '',
@@ -207,6 +207,9 @@ export type JobStep = {
 }
 
 export type JobDetail = {
+  engineHeartbeatAt?: string | null
+  errorMessage?: string | null
+  latestStepName?: string | null
   jobId: string
   repoUrl: string
   repoName: string
@@ -306,6 +309,9 @@ function mapJobDetail(raw: UnknownRecord): JobDetail {
   const repoUrl = pick<string>(job, 'repo_url', 'repoUrl') ?? ''
 
   return {
+    engineHeartbeatAt: pick<string>(job, 'engine_heartbeat_at', 'engineHeartbeatAt') ?? null,
+    errorMessage: pick<string>(job, 'error_message', 'errorMessage') ?? null,
+    latestStepName: pick<string>(job, 'latest_step_name', 'latestStepName') ?? null,
     jobId: pick<string>(job, 'job_id', 'jobId') ?? '',
     repoUrl,
     repoName: repoNameFromUrl(repoUrl),
@@ -434,6 +440,7 @@ export type GitHubRepoExtras = {
 export async function fetchGithubRepoExtras(
   owner: string,
   repo: string,
+  token?: string,
 ): Promise<GitHubRepoExtras> {
   const empty: GitHubRepoExtras = {
     branches: [],
@@ -445,17 +452,19 @@ export async function fetchGithubRepoExtras(
 
   const o = encodeURIComponent(owner)
   const r = encodeURIComponent(repo)
-  const headers = { Accept: 'application/vnd.github+json' }
+  const headers = token ? authHeaders(token) : { Accept: 'application/vnd.github+json' }
+  const base = token ? `${API_BASE}/api/repos/${o}/${r}` : `https://api.github.com/repos/${o}/${r}`
 
   const [branchesRes, metaRes] = await Promise.allSettled([
-    fetch(`https://api.github.com/repos/${o}/${r}/branches?per_page=100`, { headers }),
-    fetch(`https://api.github.com/repos/${o}/${r}`, { headers }),
+    fetch(`${base}/branches?per_page=100`, { headers }),
+    fetch(base, { headers }),
   ])
 
   let branches: string[] = []
   if (branchesRes.status === 'fulfilled' && branchesRes.value.ok) {
     try {
-      const data = (await branchesRes.value.json()) as UnknownRecord[]
+      const payload = await branchesRes.value.json()
+      const data = (Array.isArray(payload) ? payload : payload.branches) as UnknownRecord[]
       branches = Array.isArray(data)
         ? data.map((b) => pick<string>(b, 'name') ?? '').filter(Boolean)
         : []
@@ -537,6 +546,57 @@ export function setRepoPipelineInfo(
   } catch {
     // ignore storage errors
   }
+}
+
+/** Accept web URLs only; bare hostnames use HTTPS. */
+export function normalizeWebUrl(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed || /\s/.test(trimmed)) return ''
+  try {
+    const candidate = trimmed.startsWith('//') ? `https:${trimmed}`
+      : /^[a-z][a-z\d+.-]*:/i.test(trimmed) ? trimmed : `https://${trimmed}`
+    const url = new URL(candidate)
+    if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password) return ''
+    return url.href
+  } catch { return '' }
+}
+
+const REPO_EXTERNAL_URL_PREFIX = 'secupipeline:repo-external-url:'
+
+export function getRepoExternalUrl(cacheKey: string, repoName: string): string {
+  try {
+    return normalizeWebUrl(localStorage.getItem(`${REPO_EXTERNAL_URL_PREFIX}${cacheKey}:${repoName}`) ?? '')
+  } catch { return '' }
+}
+
+export function setRepoExternalUrl(cacheKey: string, repoName: string, value: string): void {
+  const key = `${REPO_EXTERNAL_URL_PREFIX}${cacheKey}:${repoName}`
+  const url = normalizeWebUrl(value)
+  if (value.trim() && !url) throw new Error('Invalid web URL')
+  if (url) localStorage.setItem(key, url)
+  else localStorage.removeItem(key)
+}
+
+export type RepoDeploymentSettings = { externalUrl: string; homepage: string; configured: boolean }
+
+export async function fetchRepoDeploymentSettings(token: string, owner: string, repo: string): Promise<RepoDeploymentSettings> {
+  const res = await fetch(`${API_BASE}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/deployment-settings`, { headers: authHeaders(token) })
+  if (res.status === 401) throw new AuthExpiredError('')
+  if (!res.ok) throw new Error(`Deployment settings lookup failed (${res.status})`)
+  const data = await res.json()
+  return { externalUrl: normalizeWebUrl(data.external_url ?? ''), homepage: normalizeWebUrl(data.homepage ?? ''), configured: data.configured === true }
+}
+
+export async function saveRepoDeploymentSettings(token: string, owner: string, repo: string, value: string): Promise<string> {
+  const url = normalizeWebUrl(value)
+  if (value.trim() && !url) throw new Error('Invalid web URL')
+  const res = await fetch(`${API_BASE}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/deployment-settings`, {
+    method: 'PUT', headers: authHeaders(token, true), body: JSON.stringify({ external_url: url || null }),
+  })
+  if (res.status === 401) throw new AuthExpiredError('')
+  if (!res.ok) throw new Error(`Deployment settings save failed (${res.status})`)
+  const data = await res.json()
+  return normalizeWebUrl(data.external_url ?? '')
 }
 
 const REPO_DOMAIN_PREFIX = 'secupipeline:repo-domain:'
@@ -1434,6 +1494,28 @@ export async function fetchPipelineHistory(
   }
 }
 
+// The history endpoint uses substring matching, so verify the full repository name.
+export async function fetchLatestRepoHistory(
+  token: string, repo: string, status?: JobStatus,
+): Promise<PipelineHistoryItem | null> {
+  let offset = 0
+  while (true) {
+    const page = await fetchPipelineHistory(token, { repo, status, limit: 100, offset })
+    const match = page.items.find((item) => repoNameFromUrl(item.repoUrl).toLowerCase() === repo.toLowerCase())
+    if (match) return match
+    if (!page.hasMore || page.items.length === 0) return null
+    offset += page.limit
+  }
+}
+
+export function historyJobDetail(item: PipelineHistoryItem): JobDetail {
+  return mapJobDetail({ job: {
+    job_id: item.jobId, repo_url: item.repoUrl, branch: item.branch,
+    status: item.status, created_at: item.createdAt, started_at: item.startedAt,
+    completed_at: item.completedAt, trigger_source: item.triggerSource, latest_step_name: item.latestStepName,
+  } })
+}
+
 export async function cancelPipeline(
   token: string,
   jobId: string,
@@ -1542,6 +1624,8 @@ export async function fetchPipelineDeployment(
 
   const data = (await res.json()) as UnknownRecord
   const deployment = pick<UnknownRecord>(data, 'deployment')
+  const deploymentStatus = deployment ? pick<string>(deployment, 'status') : undefined
+  if (deploymentStatus && deploymentStatus !== 'success') return { url: null }
   const url = deployment ? pick<string>(deployment, 'url') : pick<string>(data, 'url')
 
   if (typeof url !== 'string' || !url.trim()) return { url: null }

@@ -1,7 +1,7 @@
 import dayjs from 'dayjs'
 import 'dayjs/locale/ko'
 import relativeTime from 'dayjs/plugin/relativeTime'
-import { ArrowUpRight, Check, CheckCircle2, CircleEllipsis, Copy, GitBranch, Globe, XCircle } from 'lucide-react'
+import { ArrowUpRight, Check, CheckCircle2, CircleEllipsis, Copy, GitBranch, Globe, LoaderCircle, XCircle } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
@@ -22,11 +22,17 @@ import {
   fetchPipelineDeployment,
   fetchReposWithBranches,
   getCachedRepos,
-  getRepoDomainUrl,
+  getRepoExternalUrl,
+  normalizeWebUrl,
+  fetchLatestRepoHistory,
+  fetchJobDetail,
+  historyJobDetail,
   getRepoPipelineInfo,
   getTrackedJobIds,
   setCachedRepos,
-  setRepoDomainUrl,
+  setRepoExternalUrl,
+  fetchRepoDeploymentSettings,
+  saveRepoDeploymentSettings,
   type GitHubCommitInfo,
   type JobDetail,
   type JobStatus,
@@ -44,6 +50,9 @@ const pipelineStatusMeta = {
     className: 'border-[#F87171] bg-[#7F1D1D] text-[#FCA5A5]',
     icon: XCircle,
   },
+  running: { className: 'border-blue-400 bg-blue-950 text-blue-200', icon: LoaderCircle },
+  queued: { className: 'border-amber-400 bg-amber-950 text-amber-200', icon: CircleEllipsis },
+  cancelled: { className: 'border-gray-400 bg-gray-800 text-gray-200', icon: XCircle },
   pending: {
     className: 'border-[#F59E0B] bg-[#78350F] text-[#FCD34D]',
     icon: CircleEllipsis,
@@ -53,19 +62,10 @@ const pipelineStatusMeta = {
 type PipelineStatusKey = keyof typeof pipelineStatusMeta
 
 function jobStatusToPipelineStatus(status: JobStatus): PipelineStatusKey {
-  if (status === 'success') return 'success'
-  if (status === 'failed' || status === 'cancelled') return 'failed'
-  return 'pending'
+  return status in pipelineStatusMeta ? status : 'pending'
 }
 
-// Sort by createdAt — that's when the user *requested* the run, which is
-// the most stable "latest" signal. Completed/started timestamps can disagree
-// (long-running failed job finishing after a quick success started later).
-function jobTimestampMs(job: JobDetail): number {
-  const candidate = job.createdAt ?? job.startedAt ?? job.completedAt ?? ''
-  const parsed = Date.parse(candidate)
-  return Number.isNaN(parsed) ? 0 : parsed
-}
+const pipelineStages = ['clone', 'install', 'security-light', 'test', 'security-deep', 'security-gate', 'build', 'deploy']
 
 function parseOwnerRepo(fullName: string): { owner: string; repo: string } | null {
   const [owner, repo] = fullName.split('/')
@@ -92,6 +92,13 @@ async function copyToClipboard(value: string): Promise<void> {
 
 export function RepositoryDetailPage() {
   const { state } = useLocation()
+  const { repoId } = useParams()
+  const { token } = useAuth()
+  return <RepositoryDetailContent key={`${token}:${(state as { repoId?: string } | null)?.repoId ?? repoId}`} />
+}
+
+function RepositoryDetailContent() {
+  const { state } = useLocation()
   const { repoId: paramRepoId = '' } = useParams()
   const { token, user, logout } = useAuth()
   const { locale, t } = useLanguage()
@@ -115,14 +122,22 @@ export function RepositoryDetailPage() {
   const [githubBranches, setGithubBranches] = useState<string[] | null>(null)
   const [githubPushedAt, setGithubPushedAt] = useState<string | null>(null)
   const [repoError, setRepoError] = useState<string | null>(null)
-  // Deployment URL sources are resolved automatically: backend deployment,
-  // the pipeline's cached URL, then GitHub's configured repository homepage.
+  // Service deployments and user-configured external URLs remain separate.
   const [githubHomepageUrl, setGithubHomepageUrl] = useState<string | null>(null)
   const [deploymentLookup, setDeploymentLookup] = useState<{
     repoName: string
     url: string | null
+    jobId: string
   } | null>(null)
-  const [isDomainCopied, setIsDomainCopied] = useState(false)
+  const [copiedRow, setCopiedRow] = useState<string | null>(null)
+  const [serverExternalUrl, setServerExternalUrl] = useState<string | null>(null)
+  const [settingsReady, setSettingsReady] = useState(false)
+  const [settingsLoadError, setSettingsLoadError] = useState(false)
+  const [savingExternal, setSavingExternal] = useState(false)
+  const [editingExternal, setEditingExternal] = useState(false)
+  const [externalDraft, setExternalDraft] = useState('')
+  const [externalError, setExternalError] = useState(false)
+  const [pipelineError, setPipelineError] = useState(false)
 
   useEffect(() => {
     dayjs.locale(locale)
@@ -169,42 +184,102 @@ export function RepositoryDetailPage() {
     }
   }, [token, resolvedRepoId, cacheKey, repo, logout, navigate])
 
-  // Find this repo's most recent tracked pipeline run, if any.
   useEffect(() => {
-    if (!token || !repo) {
-      setLatestJob(null)
-      return
-    }
-
-    const trackedIds = getTrackedJobIds(cacheKey)
-    if (trackedIds.length === 0) {
-      setLatestJob(null)
-      return
-    }
-
+    if (!token || !repo) return
+    const parsed = parseOwnerRepo(repo.name)
+    if (!parsed) return
     let cancelled = false
+    fetchRepoDeploymentSettings(token, parsed.owner, parsed.repo).then(async (settings) => {
+      if (cancelled) return
+      // Migrate the old device preference only when the server has no record.
+      // A cleared server setting must not resurrect an older local value.
+      const localUrl = getRepoExternalUrl(cacheKey, repo.name)
+      const externalUrl = !settings.configured && localUrl
+        ? await saveRepoDeploymentSettings(token, parsed.owner, parsed.repo, localUrl)
+        : settings.externalUrl
+      if (cancelled) return
+      setServerExternalUrl(externalUrl)
+      setGithubHomepageUrl(settings.homepage)
+      setSettingsReady(true)
+      setSettingsLoadError(false)
+    }).catch((error: unknown) => {
+      if (cancelled) return
+      if (error instanceof AuthExpiredError) { logout(); navigate('/auth', { replace: true }); return }
+      setSettingsLoadError(true)
+    })
+    return () => { cancelled = true }
+  }, [token, repo, cacheKey, logout, navigate])
 
-    fetchJobsByIds(token, trackedIds)
-      .then((jobs) => {
+  // Poll the server history, including webhook runs created on other devices.
+  useEffect(() => {
+    setLatestJob(null)
+    setDeploymentLookup(null)
+    setPipelineError(false)
+    if (!token || !repo) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const refresh = async () => {
+      let job: JobDetail | null = null
+      let retry = false
+      try {
+        let latest
+        try {
+          latest = await fetchLatestRepoHistory(token, repo.name)
+        } catch (error) {
+          if (error instanceof AuthExpiredError) throw error
+          // Local IDs are only a fallback when the history request fails.
+          retry = true
+          const jobs = await fetchJobsByIds(token, getTrackedJobIds(cacheKey))
+          job = jobs.filter((item) => item.repoName.toLowerCase() === repo.name.toLowerCase())
+            .sort((a, b) => (Date.parse(b.createdAt ?? b.startedAt ?? '') || 0) - (Date.parse(a.createdAt ?? a.startedAt ?? '') || 0))[0] ?? null
+          if (!job) throw error
+        }
+        if (latest) {
+          job = historyJobDetail(latest)
+          try {
+            const detail = await fetchJobDetail(token, latest.jobId)
+            if (detail) job = detail
+            else retry = true
+          }
+          catch (error) {
+            if (error instanceof AuthExpiredError) throw error
+            retry = true
+          }
+        }
         if (cancelled) return
-        const repoJobs = jobs.filter((job) => job.repoName === repo.name)
-        if (repoJobs.length === 0) {
-          setLatestJob(null)
+        setLatestJob(job)
+        setPipelineError(retry)
+        if (!job) setDeploymentLookup(null)
+        if (job) {
+          let url = (await fetchPipelineDeployment(token, job.jobId)).url
+          let deploymentJobId = job.jobId
+          if (!url) {
+            const successful = await fetchLatestRepoHistory(token, repo.name, 'success')
+            if (successful && successful.jobId !== job.jobId) {
+              url = (await fetchPipelineDeployment(token, successful.jobId)).url
+              deploymentJobId = successful.jobId
+            }
+          }
+          if (!cancelled) setDeploymentLookup({ repoName: repo.name, url, jobId: deploymentJobId })
+        }
+      } catch (error) {
+        if (cancelled) return
+        if (error instanceof AuthExpiredError) {
+          logout()
+          navigate('/auth', { replace: true })
           return
         }
-        const sorted = [...repoJobs].sort(
-          (a, b) => jobTimestampMs(b) - jobTimestampMs(a),
-        )
-        setLatestJob(sorted[0] ?? null)
-      })
-      .catch(() => {
-        // pipeline status is best-effort — keep silent on transient errors
-      })
-
-    return () => {
-      cancelled = true
+        retry = true
+        setPipelineError(true)
+      } finally {
+        if (!cancelled && (retry || job?.status === 'running' || job?.status === 'queued')) {
+          timer = setTimeout(refresh, 5000)
+        }
+      }
     }
-  }, [token, cacheKey, repo])
+    void refresh()
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [token, cacheKey, repo, logout, navigate])
 
   // Best-effort fetch of the latest commit on the repo's default branch.
   // The backend's documented surface doesn't include a commits endpoint, so
@@ -232,7 +307,7 @@ export function RepositoryDetailPage() {
       })
 
     // Refresh branch list + push time straight from GitHub (public repos).
-    fetchGithubRepoExtras(parsed.owner, parsed.repo)
+    fetchGithubRepoExtras(parsed.owner, parsed.repo, token)
       .then((extras) => {
         if (cancelled) return
         if (extras.branches.length > 0) setGithubBranches(extras.branches)
@@ -246,27 +321,6 @@ export function RepositoryDetailPage() {
     }
   }, [token, repo])
 
-  // Prefer the deployment recorded by the backend for the latest pipeline.
-  // GitHub's public repository homepage is used only as a final fallback.
-  useEffect(() => {
-    if (!token || !repo || !latestJob?.jobId) return
-
-    let cancelled = false
-    fetchPipelineDeployment(token, latestJob.jobId)
-      .then((deployment) => {
-        if (cancelled) return
-        setDeploymentLookup({ repoName: repo.name, url: deployment.url })
-        if (deployment.url) setRepoDomainUrl(cacheKey, repo.name, deployment.url)
-      })
-      .catch(() => {
-        if (!cancelled) setDeploymentLookup({ repoName: repo.name, url: null })
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [token, latestJob?.jobId, repo, cacheKey])
-
   // Use considerVerdict=false here: the "파이프라인 최근 상태" badge reflects
   // whether the pipeline EXECUTED successfully, not whether the security
   // scan exceeded its threshold. The verdict is a separate concern surfaced
@@ -276,8 +330,8 @@ export function RepositoryDetailPage() {
       return jobStatusToPipelineStatus(
         deriveJobStatus(latestJob, { considerVerdict: false }),
       )
-    return repo?.pipelineStatus ?? 'pending'
-  }, [latestJob, repo])
+    return 'pending'
+  }, [latestJob])
 
   if (isRepoLoading) {
     return (
@@ -354,14 +408,16 @@ export function RepositoryDetailPage() {
       ? dayjs(pushedAtRaw).format('YYYY-MM-DD HH:mm')
       : pushedAtRaw
     : '-'
-  // Try full_name first (the key the pipeline page writes to), then the
-  // numeric id as legacy migration for users who saved before this fix.
-  const savedDomain =
-    getRepoDomainUrl(cacheKey, repo.name) || getRepoDomainUrl(cacheKey, repo.id)
-  const backendDeploymentUrl =
-    deploymentLookup?.repoName === repo.name ? deploymentLookup.url : null
-  const domainUrl =
-    backendDeploymentUrl || savedDomain || repo.domainUrl?.trim() || githubHomepageUrl || ''
+  const domainUrl = deploymentLookup?.repoName === repo.name ? deploymentLookup.url ?? '' : ''
+  // Separate from the legacy cache that was also written by pipeline deployments.
+  const savedExternalUrl = serverExternalUrl ?? getRepoExternalUrl(cacheKey, repo.name)
+  const externalUrl = savedExternalUrl || normalizeWebUrl(repo.domainUrl || githubHomepageUrl || '')
+  const duplicateUrl = !!externalUrl && externalUrl === domainUrl
+  const stageStates = pipelineStages.map((type) => latestJob?.steps.find((step) =>
+    step.stepType === type || step.stepName === type ||
+    ({ 'security-light': 'lightweight-security', 'security-deep': 'deep-security', 'security-gate': 'security_gate' } as Record<string, string>)[type] === step.stepName))
+  const failedStage = stageStates.findIndex((step) => step?.status === 'failed')
+  const failureReason = (failedStage >= 0 ? stageStates[failedStage]?.errorMessage : null) || latestJob?.errorMessage
   const description = repo.description?.trim() || t('repo.noDescription')
   const branch =
     pipelineInfo?.branch?.trim() ||
@@ -370,15 +426,31 @@ export function RepositoryDetailPage() {
     repo.branches[0] ||
     '-'
 
-  const handleDomainCopy = async () => {
-    if (!domainUrl) return
+  const handleDomainCopy = async (row: string, value: string) => {
     try {
-      await copyToClipboard(domainUrl)
-      setIsDomainCopied(true)
-      window.setTimeout(() => setIsDomainCopied(false), 1500)
-    } catch {
-      setIsDomainCopied(false)
-    }
+      await copyToClipboard(value)
+      setCopiedRow(row)
+      window.setTimeout(() => setCopiedRow(null), 1500)
+    } catch { setCopiedRow(null) }
+  }
+
+  const saveExternal = async () => {
+    const parsed = parseOwnerRepo(repo.name)
+    if (!token || !parsed || savingExternal) return
+    setSavingExternal(true)
+    try {
+      const url = await saveRepoDeploymentSettings(token, parsed.owner, parsed.repo, externalDraft)
+      setServerExternalUrl(url)
+      setSettingsReady(true)
+      setSettingsLoadError(false)
+      // Best-effort cache; server persistence determines whether saving succeeded.
+      try { setRepoExternalUrl(cacheKey, repo.name, url) } catch { /* storage may be disabled */ }
+      setEditingExternal(false)
+      setExternalError(false)
+    } catch (error) {
+      if (error instanceof AuthExpiredError) { logout(); navigate('/auth', { replace: true }); return }
+      setExternalError(true)
+    } finally { setSavingExternal(false) }
   }
 
   return (
@@ -412,53 +484,74 @@ export function RepositoryDetailPage() {
 
         <div className="grid gap-4 md:grid-cols-2">
           <Card className="border-[#404040] bg-[#262626] p-4">
-            <div className="flex items-center justify-between gap-2">
-              <p className="text-[16px] font-semibold text-white">{t('repo.domainTitle')}</p>
-              <button
-                type="button"
-                onClick={handleDomainCopy}
-                disabled={!domainUrl}
-                className="inline-flex items-center gap-1 rounded-md border border-[#3A3A3A] bg-[#1E1E1E] px-2 py-0.5 text-[11px] text-[#9CA3AF] hover:border-[#6B7280] hover:text-[#D1D5DB] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                {isDomainCopied ? (
-                  <Check className="h-3 w-3 text-[#34D399]" />
-                ) : (
-                  <Copy className="h-3 w-3" />
-                )}
-                {isDomainCopied ? t('repo.copied') : t('repo.copy')}
-              </button>
-            </div>
-            <div className="mt-3 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
-              <div className="flex items-center gap-2 text-[14px] text-[#D1D5DB]">
-                <Globe className="h-4 w-4 shrink-0 text-[#34D399]" />
-                {domainUrl ? (
-                  <Link
-                    to={domainUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex min-w-0 items-center gap-1 break-all text-[#34D399] underline-offset-4 hover:underline"
-                  >
-                    {domainUrl}
-                    <ArrowUpRight className="h-3.5 w-3.5 shrink-0" />
-                  </Link>
-                ) : (
-                  <span className="text-[#9CA3AF]">{t('repo.domainEmpty')}</span>
-                )}
+            <p className="text-[16px] font-semibold text-white">{t('repo.domainTitle')}</p>
+            {[
+              { id: 'service', label: t('repo.serviceDeployment'), url: domainUrl },
+              { id: 'external', label: t('repo.externalDeployment'), url: duplicateUrl ? '' : externalUrl },
+            ].map((row) => (
+              <div key={row.id} className="mt-3 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
+                <div className="flex items-center justify-between gap-2 text-sm text-gray-300">
+                  <span>{row.label}</span>
+                  <div className="flex gap-2">
+                    {row.id === 'external' && <button type="button" disabled={!settingsReady && !settingsLoadError} onClick={() => {
+                      setExternalDraft(savedExternalUrl || externalUrl)
+                      setExternalError(false)
+                      setEditingExternal(true)
+                    }}>{t(externalUrl ? 'repo.edit' : 'repo.add')}</button>}
+                    {row.url && <button type="button" aria-label={`${row.label} ${t('repo.copy')}`} onClick={() => void handleDomainCopy(row.id, row.url)}>
+                      {copiedRow === row.id ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+                    </button>}
+                  </div>
+                </div>
+                <div className="mt-2 flex items-center gap-2 text-sm">
+                  <Globe className="h-4 w-4 shrink-0 text-[#34D399]" />
+                  {row.url ? <a href={row.url} target="_blank" rel="noopener noreferrer" className="break-all text-[#34D399] hover:underline">{row.url}</a>
+                    : <span className="text-gray-400">{t(row.id === 'external' && duplicateUrl ? 'repo.sameDeployment' : 'repo.domainEmpty')}</span>}
+                </div>
+                {row.id === 'service' && row.url && <Link className="mt-2 block break-all text-xs text-gray-400 hover:underline" to="/pipeline/progress" state={{ jobId: deploymentLookup?.jobId }}>
+                  {t('repo.deployedBy', { id: deploymentLookup?.jobId ?? '' })}
+                </Link>}
+                {row.id === 'external' && settingsLoadError && <p role="alert" className="mt-2 text-xs text-amber-300">{t('repo.settingsLoadFailed')}</p>}
+                {row.id === 'external' && editingExternal && <form className="mt-3 space-y-2" onSubmit={(event) => { event.preventDefault(); void saveExternal() }}>
+                  <input aria-label={t('repo.externalDeployment')} className="w-full rounded border border-gray-600 bg-[#262626] p-2 text-white" value={externalDraft} onChange={(event) => setExternalDraft(event.target.value)} placeholder={t('repo.domainPlaceholder')} />
+                  <p className="text-xs text-gray-400">{t('repo.externalHint')}</p>
+                  {externalError && <p role="alert" className="text-sm text-red-300">{t('repo.invalidUrl')}</p>}
+                  <Button type="submit" disabled={savingExternal}>{t('repo.save')}</Button>
+                  <Button type="button" variant="outline" onClick={() => setEditingExternal(false)}>{t('repo.cancel')}</Button>
+                </form>}
               </div>
-            </div>
+            ))}
           </Card>
 
           <Card className="border-[#404040] bg-[#262626] p-4">
             <p className="text-[16px] font-semibold text-white">{t('repo.pipelineRecentStatus')}</p>
             <div className="mt-3 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
               <Badge className={`inline-flex items-center gap-1.5 ${status.className}`}>
-                <StatusIcon className="h-3.5 w-3.5" /> {t(`repo.status.${pipelineStatusKey}`)}
+                <StatusIcon className={`h-3.5 w-3.5 ${pipelineStatusKey === 'running' ? 'animate-spin' : ''}`} /> {t(`repo.status.${pipelineStatusKey}`)}
               </Badge>
               <p className="mt-2 text-[12px] text-[#9CA3AF]">
                 {latestJob
                   ? t('repo.latestBranchStatus', { branch: latestJob.branch || '-' })
                   : t('repo.noPipelineRuns')}
               </p>
+              {pipelineError && <p role="alert" className="mt-2 text-sm text-amber-300">{t('repo.pipelineLoadFailed')}</p>}
+              {latestJob && <>
+                <ol aria-label={t('repo.pipelineProgress')} className="mt-3 grid grid-cols-4 gap-2">
+                  {pipelineStages.map((type, index) => {
+                    const stepStatus = stageStates[index]?.status ?? 'pending'
+                    return <li key={type} className="text-xs text-gray-300" title={t(`repo.stageStatus.${stepStatus}`)}>
+                      <div className={`mb-1 h-1.5 rounded ${stepStatus === 'failed' ? 'bg-red-400' : stepStatus === 'success' ? 'bg-emerald-400' : stepStatus === 'running' ? 'animate-pulse bg-blue-400' : 'bg-gray-600'}`} />
+                      {index + 1}. {t(`repo.stage.${type}`)}
+                    </li>
+                  })}
+                </ol>
+                {failedStage >= 0 && <div role="alert" className="mt-3 text-sm text-red-300">
+                  <p>{t('repo.failedStage', { number: failedStage + 1, stage: t(`repo.stage.${pipelineStages[failedStage]}`) })}</p>
+
+                </div>}
+                {pipelineStatusKey === 'failed' && <p className="mt-2 whitespace-pre-wrap break-words text-sm text-red-300">{failureReason || t('repo.failureNotReported')}</p>}
+                <Link className="mt-3 inline-block text-sm text-emerald-300 hover:underline" to="/pipeline/progress" state={{ jobId: latestJob.jobId }}>{t('repo.viewDetails')}</Link>
+              </>}
             </div>
           </Card>
         </div>

@@ -1,3 +1,4 @@
+import { reduceStreamLogs, type StreamLogs, type StreamMessage } from '@/lib/pipelineStream'
 import {
   CheckCircle2,
   CircleDashed,
@@ -58,18 +59,6 @@ const POLL_INTERVAL_MS = 2500
 const WS_RECONNECT_DELAY_MS = 3000
 const TERMINAL_JOB_STATUSES = new Set(['success', 'failed', 'cancelled'])
 const TERMINAL_STEP_STATUSES = new Set(['success', 'failed', 'cancelled', 'skipped'])
-
-type PipelineLogEvent = {
-  step_name?: unknown
-  stepName?: unknown
-  message?: unknown
-}
-
-type PipelineSocketMessage = {
-  type?: unknown
-  lines?: unknown
-  events?: unknown
-}
 
 const stepIconMap: { match: RegExp; icon: ComponentType<{ className?: string }> }[] = [
   { match: /clone|checkout|git|레포|클론/i, icon: GitBranch },
@@ -282,6 +271,13 @@ function jobStatusBadge(status: string): { label: string; dotColor: string } {
 }
 
 export function PipelineProcessPage() {
+  const { state } = useLocation()
+  const { token, user } = useAuth()
+  const jobId = (state as LocationState | null)?.jobId ?? ''
+  return <PipelineProcessContent key={`${getAuthCacheKey(token, user)}:${jobId}`} />
+}
+
+function PipelineProcessContent() {
   const navigate = useNavigate()
   const { token, user } = useAuth()
   const { state } = useLocation()
@@ -292,6 +288,11 @@ export function PipelineProcessPage() {
   const [job, setJob] = useState<JobDetail | null>(null)
   const [logs, setLogs] = useState<string[]>([])
   const [deployUrl, setDeployUrl] = useState<string | null>(null)
+  const streamLiveRef = useRef(false)
+  const streamRevisionRef = useRef(0)
+  const [lastLogAt, setLastLogAt] = useState<number | null>(null)
+  const [lastEngineAt, setLastEngineAt] = useState<number | null>(null)
+  const [activityNow, setActivityNow] = useState(Date.now())
   const [logStreamStatus, setLogStreamStatus] = useState<
     'connecting' | 'live' | 'reconnecting' | 'complete'
   >('connecting')
@@ -340,6 +341,11 @@ export function PipelineProcessPage() {
   const lastLiveStepDurationRef = useRef<Record<string, number>>({})
 
   useEffect(() => {
+    const timer = window.setInterval(() => setActivityNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
     setStoredStepDurations(readStepDurationCache(jobId))
   }, [jobId])
 
@@ -353,6 +359,7 @@ export function PipelineProcessPage() {
     let timer: number | null = null
 
     async function tick() {
+      const streamRevision = streamRevisionRef.current
       let isTerminal = false
       let nextJobForTick: JobDetail | null = null
       let polledLogCount: number | null = null
@@ -372,7 +379,11 @@ export function PipelineProcessPage() {
         const nextJob = jobResult.value
         if (nextJob) {
           nextJobForTick = nextJob
-          setJob(nextJob)
+          setJob((previous) => streamRevision === streamRevisionRef.current ? nextJob : previous ?? nextJob)
+          if (nextJob.engineHeartbeatAt) {
+            const heartbeatAt = Date.parse(nextJob.engineHeartbeatAt)
+            if (Number.isFinite(heartbeatAt)) setLastEngineAt((previous) => Math.max(previous ?? 0, heartbeatAt))
+          }
           isTerminal = TERMINAL_JOB_STATUSES.has(nextJob.status)
           if (!isTerminal) {
             hasObservedLiveRunRef.current = true
@@ -383,7 +394,7 @@ export function PipelineProcessPage() {
         console.error('[pipeline-poll] job detail failed:', detailError)
       }
 
-      if (stepsResult.status === 'fulfilled') {
+      if (stepsResult.status === 'fulfilled' && streamRevision === streamRevisionRef.current) {
         const response = stepsResult.value
         if (response.job?.status) {
           isTerminal = TERMINAL_JOB_STATUSES.has(response.job.status)
@@ -408,10 +419,10 @@ export function PipelineProcessPage() {
           }
         })
       } else {
-        console.error('[pipeline-poll] steps fetch failed:', stepsResult.reason)
+        if (stepsResult.status === 'rejected') console.error('[pipeline-poll] steps fetch failed:', stepsResult.reason)
       }
 
-      if (logsResult.status === 'fulfilled') {
+      if (logsResult.status === 'fulfilled' && !streamLiveRef.current && streamRevision === streamRevisionRef.current) {
         const nextLogs = logsResult.value
         const currentLogs = logsRef.current
         const isStaleRestSnapshot =
@@ -460,7 +471,7 @@ export function PipelineProcessPage() {
           }
         }
       } else {
-        console.error('[pipeline-poll] logs fetch failed:', logsResult.reason)
+        if (logsResult.status === 'rejected') console.error('[pipeline-poll] logs fetch failed:', logsResult.reason)
       }
 
       if (import.meta.env.DEV) {
@@ -510,11 +521,25 @@ export function PipelineProcessPage() {
     let completed = false
     let socket: WebSocket | null = null
     let reconnectTimer: number | null = null
+    let healthTimer: number | null = null
+    let lastResponse = Date.now()
+    let stream: StreamLogs = { cursor: null, lines: [], times: [] }
+    let synced = false
+    streamLiveRef.current = false
 
+    const displayStream = () => {
+      logsRef.current = stream.lines
+      setLogs(stream.lines)
+      setLogTimestamps(stream.times.map((time) => time !== null && startedAtMsRef.current !== null
+        ? Math.max(0, Math.round((time - startedAtMsRef.current) / 1000)) : 0))
+    }
+
+    let stepsRequest = 0
     const refreshSteps = async () => {
+      const request = ++stepsRequest
       try {
         const response = await fetchPipelineSteps(token, jobId)
-        if (disposed) return
+        if (disposed || request !== stepsRequest) return
         setJob((previous) => {
           if (!previous) return previous
           return {
@@ -558,77 +583,87 @@ export function PipelineProcessPage() {
       if (resultResponse.status === 'rejected') {
         console.error('[pipeline-ws] result refresh failed:', resultResponse.reason)
       }
+      try {
+        const finalLogs = await fetchPipelineLogs(token, jobId)
+        if (!disposed && finalLogs.length > 0) {
+          logsRef.current = finalLogs
+          setLogs(finalLogs)
+        }
+      } catch { /* retain streamed logs */ }
       await refreshDeployment()
     }
 
     const connect = () => {
       if (disposed || completed) return
       const url = `${WS_API_BASE_URL}/api/pipelines/${encodeURIComponent(jobId)}/logs/ws`
+      synced = false
+      streamLiveRef.current = false
       socket = new WebSocket(url)
 
       socket.onopen = () => {
-        setLogStreamStatus('live')
-        socket?.send(JSON.stringify({ type: 'authenticate', token }))
+        setLogStreamStatus('connecting')
+        lastResponse = Date.now()
+        socket?.send(JSON.stringify({ type: 'authenticate', token, ...(stream.cursor !== null ? { after_seq: stream.cursor } : {}) }))
+        healthTimer = window.setInterval(() => {
+          if (Date.now() - lastResponse > 30000) { socket?.close(); return }
+          if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'ping' }))
+        }, 10000)
       }
 
       socket.onmessage = (event) => {
-        let message: PipelineSocketMessage
+        let message: StreamMessage
         try {
-          message = JSON.parse(String(event.data)) as PipelineSocketMessage
+          message = JSON.parse(String(event.data)) as StreamMessage
         } catch (parseError) {
           console.error('[pipeline-ws] invalid message:', parseError)
           return
         }
 
-        if (message.type === 'log_snapshot' && Array.isArray(message.lines)) {
-          const snapshot = message.lines.filter((line): line is string => typeof line === 'string')
-          logsRef.current = snapshot
-          setLogs(snapshot)
-          const elapsed = startedAtMsRef.current === null
-            ? 0
-            : Math.max(0, Math.round((Date.now() - startedAtMsRef.current) / 1000))
-          setLogTimestamps((previous) => {
-            if (previous.length >= snapshot.length) return previous.slice(0, snapshot.length)
-            return [...previous, ...new Array(snapshot.length - previous.length).fill(elapsed)]
-          })
-          return
-        }
-
-        if (message.type === 'log_batch' && Array.isArray(message.events)) {
-          const incoming = (message.events as PipelineLogEvent[])
-            .filter((item) => typeof item?.message === 'string')
-            .flatMap((item) => {
-              const stepName =
-                typeof item.step_name === 'string' && item.step_name
-                  ? item.step_name
-                  : typeof item.stepName === 'string' && item.stepName
-                    ? item.stepName
-                    : 'pipeline'
-              return (item.message as string)
-                .split(/\r?\n/)
-                .map((line) => `[${stepName}.log] ${line}`)
-            })
-          if (incoming.length === 0) return
-          const elapsed = startedAtMsRef.current === null
-            ? 0
-            : Math.max(0, Math.round((Date.now() - startedAtMsRef.current) / 1000))
-          const previousLength = logsRef.current.length
-          const nextLogs = [...logsRef.current, ...incoming]
-          logsRef.current = nextLogs
-          setLogs(nextLogs)
-          setLogTimestamps((previous) => [
-            ...previous.slice(0, previousLength),
-            ...new Array<number>(incoming.length).fill(elapsed),
-          ])
-          return
-        }
-
-        if (message.type === 'step_complete') {
+        lastResponse = Date.now()
+        if (message.type === 'pong') return
+        if (message.type === 'sync_complete') {
+          synced = true
+          streamLiveRef.current = true
+          streamRevisionRef.current += 1
+          setLogStreamStatus(completed ? 'complete' : 'live')
+          if (!completed) displayStream()
           void refreshSteps()
           return
         }
-
-        if (message.type === 'pipeline_complete') {
+        const previous = stream
+        stream = reduceStreamLogs(stream, message)
+        if (stream === previous) return
+        streamRevisionRef.current += 1
+        if (message.type === 'engine_heartbeat') {
+          const timestamp = Date.parse(message.timestamp ?? '')
+          if (Number.isFinite(timestamp)) setLastEngineAt((old) => Math.max(old ?? 0, timestamp))
+        }
+        if (message.type === 'log_snapshot') {
+          const heartbeatAt = Date.parse(message.engine_heartbeat_at ?? '')
+          const logAt = Date.parse(message.last_log_at ?? '')
+          if (Number.isFinite(heartbeatAt)) setLastEngineAt((old) => Math.max(old ?? 0, heartbeatAt))
+          if (Number.isFinite(logAt)) setLastLogAt((old) => Math.max(old ?? 0, logAt))
+          void refreshSteps()
+          if (TERMINAL_JOB_STATUSES.has(message.job_status ?? '')) {
+            completed = true
+            displayStream()
+            setLogStreamStatus('complete')
+            void refreshFinalState()
+          }
+        }
+        if (message.type === 'log_snapshot' || message.type === 'log_batch') {
+          if (message.type === 'log_batch' && stream.lines.length > previous.lines.length) {
+            const newest = stream.times.slice(previous.times.length).filter((time): time is number => time !== null)
+            if (newest.length) setLastLogAt((old) => Math.max(old ?? 0, ...newest))
+          }
+          if (synced) displayStream()
+          return
+        }
+        if (message.type?.startsWith('stage_') || message.type === 'step_started' || message.type === 'step_complete') {
+          void refreshSteps()
+          return
+        }
+        if (['pipeline_complete', 'pipeline_completed', 'pipeline_failed', 'pipeline_cancelled'].includes(message.type ?? '')) {
           completed = true
           setLogStreamStatus('complete')
           void refreshFinalState()
@@ -642,6 +677,9 @@ export function PipelineProcessPage() {
       }
 
       socket.onclose = (event) => {
+        streamLiveRef.current = false
+        if (healthTimer !== null) window.clearInterval(healthTimer)
+        healthTimer = null
         if (!disposed && !completed) {
           console.warn('[pipeline-ws] disconnected:', {
             code: event.code,
@@ -664,6 +702,8 @@ export function PipelineProcessPage() {
     return () => {
       disposed = true
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
+      if (healthTimer !== null) window.clearInterval(healthTimer)
+      streamLiveRef.current = false
       socket?.close()
     }
   }, [jobId, token])
@@ -1773,6 +1813,12 @@ export function PipelineProcessPage() {
               </div>
             </AccordionTrigger>
             <AccordionContent className="pt-3">
+              <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-[#9CA3AF]" role="status">
+                <span>마지막 로그 갱신: {lastLogAt === null ? '아직 수신하지 않음' : `${Math.max(0, Math.floor((activityNow - lastLogAt) / 1000))}초 전`}</span>
+                {!isTerminal && <span>엔진 응답: {lastEngineAt === null ? '확인 중' : `${Math.max(0, Math.floor((activityNow - lastEngineAt) / 1000))}초 전`}
+                  {lastEngineAt !== null && activityNow - lastEngineAt > 30000 ? ' · 응답 지연' : ''}</span>}
+                {!isTerminal && lastEngineAt !== null && activityNow - lastEngineAt < 30000 && (lastLogAt === null || activityNow - lastLogAt > 10000) && <span>엔진 동작 중 · 로그 출력 대기</span>}
+              </div>
               <div
                 ref={logContainerRef}
                 className="max-h-96 overflow-y-auto rounded-md border border-[#404040] bg-[#0F0F0F] p-3 text-xs text-[#D1D5DB]"
