@@ -58,3 +58,12 @@ it('does not revert a running clone to a stale queued response', () => {
   const running = job()
   expect(preserveTerminal(running, job({status:'queued', startedAt:null, steps:[]}))).toBe(running)
 })
+
+it('explicit resume reopens a failed run without repeating completed stages', () => {
+  const failed=job({status:'failed',completedAt:at(20),steps:[stage('clone',0,10,'success'),stage('security_gate',10,20,'failed'),stage('build',20,20,'skipped')]})
+  const resumed=applyJobEvent(failed,{type:'pipeline_resumed'})
+  expect(resumed.status).toBe('running')
+  expect(resumed.completedAt).toBeNull()
+  expect(resumed.startedAt).toBe(start)
+  expect(resumed.steps.map(s=>s.status)).toEqual(['success','success','pending'])
+})

@@ -23,7 +23,7 @@ import {
 } from '@/lib/api'
 import { approvalSeverities, type GateCounts } from '@/lib/deploymentGate'
 import { useQueryClient } from '@tanstack/react-query'
-import { invalidateJob } from '@/hooks/useJobQueries'
+import { invalidateJob, jobKeys } from '@/hooks/useJobQueries'
 
 type Props = {
   open: boolean
@@ -95,6 +95,14 @@ export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, bran
     try {
       if (action === 'approve') {
         const res = await approveJob(token, jobId, reason, undefined, name)
+        if (res.resumed || res.followupJobId === jobId) {
+          // A completed execution snapshot must not close the resumed channel.
+          await queryClient.cancelQueries({ queryKey: jobKeys.run(jobId) })
+          queryClient.removeQueries({ queryKey: jobKeys.run(jobId) })
+          onOpenChange(false)
+          navigate('/pipeline/progress', { state: { jobId, repoName, branch, resumed: true } })
+          return
+        }
         void invalidateJob(queryClient, jobId)
         setOutcome({
           kind: 'approved',

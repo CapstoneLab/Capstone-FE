@@ -102,6 +102,7 @@ const EVENT_STEP_STATUS: Record<string, JobStep['status']> = {
 
 const EVENT_JOB_STATUS: Record<string, JobDetail['status']> = {
   pipeline_started: 'running',
+  pipeline_resumed: 'running',
   pipeline_failed: 'failed',
   pipeline_cancelled: 'cancelled',
   pipeline_canceled: 'cancelled',

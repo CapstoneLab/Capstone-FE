@@ -23,6 +23,12 @@ export function preserveTerminal(previous: JobDetail | null, incoming: JobDetail
 
 export function applyJobEvent(job: JobDetail, message: Record<string, unknown>): JobDetail {
   const type = String(message.type ?? '')
+  if (type === 'pipeline_resumed') {
+    return { ...job, status: 'running', completedAt: null, durationSecs: 0,
+      steps: job.steps.map(step => ['build','deploy'].includes(step.stepName)
+        ? { ...step, status: 'pending', startedAt: null, endedAt: null, durationSecs: null, errorMessage: null }
+        : step.stepName === 'security_gate' ? { ...step, status: 'success' } : step) }
+  }
   const statuses: Record<string, JobDetail['status']> = { pipeline_started: 'running', pipeline_failed: 'failed',
     pipeline_cancelled: 'cancelled', pipeline_canceled: 'cancelled', pipeline_completed: 'success' }
   const implied = statuses[type]

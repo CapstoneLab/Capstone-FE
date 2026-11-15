@@ -1312,6 +1312,8 @@ export class ApprovalForbiddenError extends Error {
 
 export type ApprovalResponse = {
   status: string
+  resumed?: boolean
+  resumeFromStage?: string | null
   /** Backend auto-enqueues a follow-up job on approve — track via this id. */
   followupJobId: string | null
   /** CWEs accepted under approval (echoed back). Connects to B-5. */
@@ -1354,6 +1356,8 @@ async function postApproval(
   const ack = pick<unknown[]>(data, 'acknowledged_cwes', 'acknowledgedCwes')
   return {
     status: pick<string>(data, 'status') ?? 'ok',
+    resumed: pick<boolean>(data, 'resumed') === true,
+    resumeFromStage: pick<string>(data, 'resume_from_stage') ?? null,
     followupJobId: pick<string>(data, 'followup_job_id', 'followupJobId') ?? null,
     acknowledgedCwes: Array.isArray(ack) ? (ack as string[]) : [],
     message: pick<string>(data, 'message') ?? '',
