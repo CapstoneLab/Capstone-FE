@@ -397,6 +397,12 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
       if (type === 'log_snapshot') {
         noteActivity('lastEngineAt', parseTime(message.engine_heartbeat_at))
         noteActivity('lastLogAt', parseTime(message.last_log_at))
+        if (typeof message.job_status === 'string') {
+          const snapshot = { ...message, status: message.job_status }
+          if (isTerminalJobStatus(message.job_status)) terminalEventRef.current = snapshot
+          setJob(previous => previous ? applyJobEvent(previous, snapshot) : previous)
+          if (isTerminalJobStatus(message.job_status)) finish()
+        }
       }
 
       if (type === 'log_snapshot' && Array.isArray(message.lines)) {
