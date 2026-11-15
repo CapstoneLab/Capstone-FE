@@ -132,6 +132,7 @@ export type ExecutionSnapshot = {
 /** Same merge the live page does: steps endpoint wins over job detail. */
 export function mergeJobWithSteps(base: JobDetail, steps: PipelineStepsResponse | null): JobDetail {
   if (!steps) return base
+  if (isTerminalJobStatus(base.status) && steps.job && !isTerminalJobStatus(steps.job.status)) return base
   const summary = steps.job
   return {
     ...base,

@@ -143,7 +143,7 @@ export type StageView = {
  *     succeeded.
  * While the job is live, the backend's per-step status is shown verbatim.
  */
-export function buildStageViews(steps: JobStep[], jobStatus: JobStatus | string): StageView[] {
+export function buildStageViews(steps: JobStep[], jobStatus: JobStatus | string, completedAt?: string | null): StageView[] {
   const slots: (JobStep | null)[] = PIPELINE_STAGES.map(() => null)
   const unmatched: { step: JobStep; position: number }[] = []
 
@@ -186,7 +186,7 @@ export function buildStageViews(steps: JobStep[], jobStatus: JobStatus | string)
       backendStatus,
       stepId: step?.stepId || null,
       startedAt: step?.startedAt ?? null,
-      endedAt: step?.endedAt ?? null,
+      endedAt: step?.endedAt ?? (terminal && backendStatus === 'running' ? completedAt ?? null : null),
       durationSecs: step?.durationSecs ?? null,
       errorMessage: step?.errorMessage ?? null,
     }
@@ -202,26 +202,24 @@ function parseTime(value: string | null | undefined): number | null {
 /**
  * Real execution duration of a stage in seconds, or null when the backend
  * has not reported enough to know it. A running stage ticks from its
- * backend `started_at` (or, failing that, from when this client first saw
- * it running — an observation, not an estimate).
+ * backend `started_at`, using the synchronized server clock.
  */
 export function stageDurationSecs(
   stage: Pick<StageView, 'status' | 'startedAt' | 'endedAt' | 'durationSecs'>,
   nowMs: number,
-  observedStartMs?: number | null,
 ): number | null {
   const start = parseTime(stage.startedAt)
   if (stage.status === 'running') {
-    const from = start ?? observedStartMs ?? null
-    return from === null ? null : Math.max(0, Math.round((nowMs - from) / 1000))
+    const from = start
+    return from === null ? null : Math.max(0, Math.floor((nowMs - from) / 1000))
   }
   if (stage.status === 'pending') return null
   const end = parseTime(stage.endedAt)
   if (start !== null && end !== null && end >= start) {
-    return Math.round((end - start) / 1000)
+    return Math.floor((end - start) / 1000)
   }
   if (typeof stage.durationSecs === 'number' && stage.durationSecs > 0) {
-    return Math.round(stage.durationSecs)
+    return Math.floor(stage.durationSecs)
   }
   if (stage.durationSecs === 0 && (stage.status === 'success' || stage.status === 'failed')) {
     return 0

@@ -47,6 +47,8 @@ import {
 import { useAuth } from '@/contexts/AuthContext'
 import { getAuthCacheKey } from '@/contexts/AuthContext'
 import { useLanguage } from '@/contexts/LanguageContext'
+import { useServerNow } from '@/hooks/useServerNow'
+import { executionTiming } from '@/lib/executionTiming'
 import { usePipelineExecution, type ConnectionState } from '@/hooks/usePipelineExecution'
 import { useQueryClient } from '@tanstack/react-query'
 import { prefetchJobResult } from '@/hooks/useJobQueries'
@@ -152,17 +154,6 @@ function toMs(value: string | null): number | null {
   if (!value) return null
   const ms = Date.parse(value)
   return Number.isNaN(ms) ? null : ms
-}
-
-/** Re-renders every second while `active`, for live elapsed timers. */
-function useNow(active: boolean): number {
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (!active) return
-    const id = window.setInterval(() => setNow(Date.now()), 1000)
-    return () => window.clearInterval(id)
-  }, [active])
-  return now
 }
 
 function StageStatusIcon({ status, animate, className = 'h-6 w-6' }: {
@@ -292,13 +283,11 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
 
   const logContainerRef = useRef<HTMLDivElement | null>(null)
   const followRef = useRef(true)
-  // When this client first saw a stage running — used only if the backend
-  // has not reported that stage's started_at yet.
-  const observedStartRef = useRef<Record<number, number>>({})
-
   const jobStatus = job?.status ?? 'queued'
   const isTerminal = isTerminalJobStatus(jobStatus)
-  const now = useNow(!isTerminal)
+  const serverNow = useServerNow(executionTiming(job, null).ticking)
+  const now = serverNow ?? 0
+  const timing = executionTiming(job, serverNow)
 
   // Once the run finishes, fetch its result in the background so "보안 결과"
   // opens instantly from the query cache.
@@ -307,23 +296,15 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
     if (isTerminal) prefetchJobResult(queryClient, token, jobId)
   }, [isTerminal, queryClient, token, jobId])
 
-  const stages = useMemo(() => buildStageViews(job?.steps ?? [], jobStatus), [job?.steps, jobStatus])
+  const stages = useMemo(() => buildStageViews(job?.steps ?? [], jobStatus, job?.completedAt), [job?.steps, jobStatus, job?.completedAt])
   const progress = summarizeProgress(stages)
   const tone = executionTone(jobStatus)
   const toneColor = TONE_COLOR[tone]
   const currentStage = progress.currentIndex >= 0 ? stages[progress.currentIndex] : null
   const failedStage = stages.find((stage) => stage.status === 'failed') ?? null
 
-  useEffect(() => {
-    for (const stage of stages) {
-      if (stage.status === 'running' && observedStartRef.current[stage.index] === undefined) {
-        observedStartRef.current[stage.index] = Date.now()
-      }
-    }
-  }, [stages])
-
   const stageDuration = (stage: StageView) =>
-    stageDurationSecs(stage, now, observedStartRef.current[stage.index])
+    stage.status === 'running' && serverNow === null ? null : stageDurationSecs(stage, now)
 
   const resolvedLogs: ResolvedLogEntry[] = useMemo(
     () => logs.map((entry) => ({ ...entry, resolvedStage: resolveLogStage(entry, stages, now) })),
@@ -360,17 +341,7 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
   const commitSha = job?.commitSha || locationState.commitSha || cloneCommit?.sha || ''
   const commitLink = commitUrl(job?.repoUrl ?? '', commitSha)
 
-  const totalElapsed = useMemo(() => {
-    if (!job) return null
-    const start = job.startedAt ? Date.parse(job.startedAt) : Number.NaN
-    if (isTerminal) {
-      if (job.durationSecs > 0) return job.durationSecs
-      const end = job.completedAt ? Date.parse(job.completedAt) : Number.NaN
-      return !Number.isNaN(start) && !Number.isNaN(end) ? Math.max(0, (end - start) / 1000) : null
-    }
-    if (Number.isNaN(start)) return null
-    return Math.max(0, (now - start) / 1000)
-  }, [job, isTerminal, now])
+  const totalElapsed = timing.total
 
   const triggerLabel = (source: string, by: string): string => {
     const base = isWebhookTrigger(source)
@@ -600,6 +571,11 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
                   {repoName ? ` · ${repoName}` : ''}
                   {commitSha ? ` @ ${shortSha(commitSha)}` : ''}
                 </p>
+                {timing.total !== null ? (
+                  <p className="mt-1 text-[13px] text-[#A1A1A1]">
+                    {t('run.timing.breakdown', { stages: labels.duration(timing.stages), waiting: labels.duration(timing.waiting) })}
+                  </p>
+                ) : null}
                 {failedStage ? (
                   <p className="mt-2 text-[13px] text-[#FCA5A5]">
                     {t('run.failedAt', {

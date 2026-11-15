@@ -10,6 +10,7 @@ import {
   type JobDetail,
   type JobStep,
 } from '@/lib/api'
+import { applyJobEvent, preserveTerminal } from '@/lib/executionTiming'
 import { WS_API_BASE_URL } from '@/lib/config'
 import {
   appendLogEvents,
@@ -95,6 +96,8 @@ const EVENT_STEP_STATUS: Record<string, JobStep['status']> = {
   step_failed: 'failed',
   stage_skipped: 'skipped',
   step_skipped: 'skipped',
+  stage_cancelled: 'cancelled',
+  step_cancelled: 'cancelled',
 }
 
 const EVENT_JOB_STATUS: Record<string, JobDetail['status']> = {
@@ -212,6 +215,7 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
   const logsRef = useRef<LogEntry[]>(cached?.logs ?? [])
   const liveRef = useRef(false)
   const terminalRef = useRef(!!cached)
+  const terminalEventRef = useRef<UnknownRecord | null>(null)
   const resyncRef = useRef<() => Promise<void>>(async () => undefined)
   // Closes the real-time channel once REST learns the run has finished.
   const closeStreamRef = useRef<() => void>(() => undefined)
@@ -257,7 +261,7 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
       const detailJob = detail.status === 'fulfilled' ? detail.value : null
       const stepsResponse = steps.status === 'fulfilled' ? steps.value : null
       noteActivity('lastEngineAt', parseTime(detailJob?.engineHeartbeatAt))
-      const status = stepsResponse?.job?.status || detailJob?.status
+      const status = detailJob && isTerminalJobStatus(detailJob.status) ? detailJob.status : stepsResponse?.job?.status || detailJob?.status
       if (status && !isTerminalJobStatus(status)) observedLive = true
 
       setJob((previous) => {
@@ -265,7 +269,8 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
         if (!base) return previous
         // Keeps known steps when the steps endpoint is momentarily empty
         // while the backend is still persisting a callback.
-        return mergeJobWithSteps(base, stepsResponse)
+        const merged = mergeJobWithSteps(base, stepsResponse)
+        return preserveTerminal(previous, terminalEventRef.current ? applyJobEvent(merged, terminalEventRef.current) : merged)
       })
 
       if (lines.status === 'fulfilled') {
@@ -416,7 +421,7 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
         if (patch) {
           if (!patch.status && EVENT_STEP_STATUS[type]) patch.status = EVENT_STEP_STATUS[type]
           setJob((previous) =>
-            previous ? { ...previous, steps: applyStepPatch(previous.steps, patch) } : previous,
+            previous ? preserveTerminal(previous, { ...previous, startedAt: str(message, 'pipeline_started_at') ?? previous.startedAt, steps: applyStepPatch(previous.steps, patch) }) : previous,
           )
         }
         // A partial event is only a hint — fetch the persisted step state.
@@ -425,17 +430,14 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
         return
       }
 
-      if (Object.hasOwn(EVENT_JOB_STATUS, type)) {
-        const status = EVENT_JOB_STATUS[type]
-        setJob((previous) => (previous ? { ...previous, status } : previous))
+      if (Object.hasOwn(EVENT_JOB_STATUS, type) || type === 'pipeline_complete' || type === 'pipeline_completed') {
+        const status = typeof message.status === 'string' ? message.status : EVENT_JOB_STATUS[type] ?? (type === 'pipeline_completed' ? 'success' : '')
+        if (isTerminalJobStatus(status)) terminalEventRef.current = { ...message, status }
+        setJob((previous) => previous ? applyJobEvent(previous, { ...message, status }) : previous)
         if (isTerminalJobStatus(status)) finish()
         else scheduleStepRefresh()
-        return
       }
 
-      if (type === 'pipeline_complete' || type === 'pipeline_completed') {
-        finish()
-      }
     }
 
     const connect = () => {
@@ -513,8 +515,18 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
 
   const cancel = useCallback(async () => {
     if (!token || !jobId) return
-    await cancelPipeline(token, jobId)
-    // Show the backend-confirmed state, not an optimistic one.
+    const result = await cancelPipeline(token, jobId)
+    if (result.status === 'cancelled') {
+      terminalRef.current = true
+      liveRef.current = false
+      setConnection('closed')
+      const event = { type: 'pipeline_cancelled', status: 'cancelled',
+        completed_at: result.completedAt, started_at: result.startedAt, duration_secs: result.durationSecs }
+      terminalEventRef.current = event
+      setJob(previous => previous ? applyJobEvent(previous, event) : previous)
+      closeStreamRef.current()
+    }
+    // Fetch final steps; a delayed running snapshot cannot undo cancellation.
     await resyncRef.current()
   }, [jobId, token])
 

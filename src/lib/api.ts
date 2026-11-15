@@ -1644,6 +1644,9 @@ export async function startPipeline(
 }
 
 export type CancelPipelineResponse = {
+  startedAt: string | null
+  completedAt: string | null
+  durationSecs: number | null
   jobId: string
   status: string
   killed: boolean
@@ -1829,6 +1832,9 @@ export async function cancelPipeline(
 
   const data = (await res.json()) as UnknownRecord
   return {
+    startedAt: pick<string>(data, "started_at") ?? null,
+    completedAt: pick<string>(data, "completed_at", "ended_at") ?? null,
+    durationSecs: pick<number>(data, "duration_secs") ?? null,
     jobId: pick<string>(data, 'job_id', 'jobId') ?? jobId,
     status: pick<string>(data, 'status') ?? 'cancelled',
     killed: pick<boolean>(data, 'killed') ?? false,
