@@ -1011,6 +1011,8 @@ export type JobVerdictDetail = {
 }
 
 export type JobResult = {
+  approvalEligible?: boolean
+  approvalReason?: string | null
   jobId: string
   repoUrl: string
   repoName: string
@@ -1238,6 +1240,8 @@ function mapJobResult(raw: UnknownRecord): JobResult {
   const paginationRaw = (pick<UnknownRecord>(raw, 'pagination') ?? {}) as UnknownRecord
 
   return {
+    approvalEligible: pick<boolean>(raw, "approval_eligible") === true,
+    approvalReason: pick<string>(raw, "approval_reason") ?? null,
     jobId: pick<string>(raw, 'job_id', 'jobId') ?? '',
     repoUrl,
     repoName: repoNameFromUrl(repoUrl),

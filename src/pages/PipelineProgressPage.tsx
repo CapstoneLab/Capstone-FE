@@ -38,7 +38,7 @@ import { securityCheckCatalog } from '@/data/securityCatalog'
 import { ResultDownloadDialog } from '@/components/ResultDownloadDialog'
 import type { ReportData } from '@/lib/reportExport'
 import { localizeFinding } from '@/lib/findingI18n'
-import { GATE_RULES, matchGateRule, stricterVerdict } from '@/lib/deploymentGate'
+import { GATE_RULES, matchGateRule } from '@/lib/deploymentGate'
 import { DeployApprovalDialog } from '@/components/DeployApprovalDialog'
 
 ChartJS.register(ArcElement, Tooltip, Legend)
@@ -351,8 +351,8 @@ export function PipelineProgressPage() {
   const scoreLabel = vd?.scoreLabel || (score != null ? `${score}/100` : null)
   const displayScoreColor = vd?.gaugeColor ?? '#9CA3AF'
 
-  // Effective verdict — backend verdict (rich model, else legacy), tightened by
-  // the count-based gate policy. The count rule can only make it stricter.
+  // Deployment/approval state comes from the server. Counts remain explanatory
+  // and must not create a retrospective approval for an already deployed run.
   const backendVerdict: VerdictKind | null =
     vd?.verdict ?? legacyToVerdictKind(result?.verdict ?? detail?.verdict ?? null, jobStatus)
   const gateRule = matchGateRule(counts)
@@ -362,13 +362,13 @@ export function PipelineProgressPage() {
   // button with it — exactly when approval was needed.
   const hasScanData = !!vd || totalCount > 0 || (result?.findings.length ?? 0) > 0
   const effectiveVerdict: VerdictKind | null =
-    hasScanData || !isResultPending ? stricterVerdict(backendVerdict, gateRule.verdict) : backendVerdict
+    backendVerdict ?? (hasScanData || !isResultPending ? gateRule.verdict : null)
 
   // Pop the approval dialog once when the run lands on "승인 필요" and nothing
   // has been accepted yet (acknowledged CWEs mean it was already approved).
   if (
     !approvalAutoOpened &&
-    effectiveVerdict === 'block_pending_approval' &&
+    effectiveVerdict === 'block_pending_approval' && result?.approvalEligible === true &&
     (vd?.acknowledgedCwes.length ?? 0) === 0
   ) {
     setApprovalAutoOpened(true)
@@ -896,7 +896,7 @@ export function PipelineProgressPage() {
                   ) : null}
                 </div>
                 {/* Approval path exists only for block_pending_approval. block hides it. */}
-                {effectiveVerdict === 'block_pending_approval' ? (
+                {effectiveVerdict === 'block_pending_approval' && result?.approvalEligible === true ? (
                   <Button
                     type="button"
                     onClick={() => setApprovalOpen(true)}
@@ -1155,7 +1155,7 @@ export function PipelineProgressPage() {
         data={reportData}
       />
       <DeployApprovalDialog
-        open={approvalOpen}
+        open={approvalOpen && result?.approvalEligible === true}
         onOpenChange={setApprovalOpen}
         jobId={jobId}
         repoName={repoName}

@@ -248,7 +248,7 @@ export function ApprovalPage() {
   }
 
   // Only block_pending_approval enters the approval flow.
-  if (verdict !== 'block_pending_approval') {
+  if (verdict !== 'block_pending_approval' || result?.approvalEligible !== true) {
     return (
       <MainLayout>
         <section className="w-full space-y-4">
