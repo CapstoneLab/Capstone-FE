@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { getCachedExecution, mergeJobWithSteps, saveExecution } from '@/hooks/useJobQueries'
+import { getCachedExecution, jobKeys, mergeJobWithSteps, saveExecution } from '@/hooks/useJobQueries'
 import { markStartPhase } from '@/lib/startTiming'
 import {
   cancelPipeline,
@@ -167,6 +167,23 @@ export function keepTerminal(previous: JobDetail | null, next: JobDetail): JobDe
   return { ...next, status: previous.status, completedAt: next.completedAt ?? previous.completedAt }
 }
 
+/** Job state right after approval resumed it: running again, and every stage
+ *  after the security gate back to pending. */
+export function reopenAfterGate(job: JobDetail): JobDetail {
+  const gateIndex = 5
+  return {
+    ...job,
+    status: 'running',
+    completedAt: null,
+    steps: job.steps.map((step) => {
+      const index = stageIndexForStep(step)
+      return index !== null && index > gateIndex
+        ? { ...step, status: 'pending', startedAt: null, endedAt: null, durationSecs: null, errorMessage: null }
+        : step
+    }),
+  }
+}
+
 /** A stage event that carries the complete persisted step needs no REST refresh. */
 function isCompleteStep(patch: Partial<JobStep> | null): boolean {
   return !!patch?.stepId && !!patch.stepName && !!patch.stepType && !!patch.status
@@ -208,6 +225,8 @@ export type PipelineExecution = {
   cancel: () => Promise<void>
   /** Re-fetches job, steps and logs from the REST API. */
   resync: () => Promise<void>
+  /** Re-open the job as live after the backend resumed it (approval). */
+  resume: () => void
 }
 
 export function usePipelineExecution(jobId: string, token: string | null): PipelineExecution {
@@ -215,7 +234,10 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
   // A finished run that was already viewed (or prefetched from the history
   // list) renders straight from the query cache — no REST round trips, no
   // WebSocket. Read once: the hook is mounted under key={jobId}.
-  const [cached] = useState(() => (jobId ? getCachedExecution(queryClient, jobId) : null))
+  const [cached, setCached] = useState(() => (jobId ? getCachedExecution(queryClient, jobId) : null))
+  // Bumped by resume(): restarts REST polling and the real-time channel for a
+  // job the backend continues after approval.
+  const [generation, setGeneration] = useState(0)
 
   const [job, setJob] = useState<JobDetail | null>(cached?.job ?? null)
   const [logs, setLogs] = useState<LogEntry[]>(cached?.logs ?? [])
@@ -280,6 +302,7 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
   useEffect(() => {
     if (!jobId || !token) return
     if (cached) return // finished run served from cache
+    void generation // restart after resume()
 
     let disposed = false
     let timer: number | null = null
@@ -394,7 +417,7 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
       if (timer !== null) window.clearTimeout(timer)
       resyncRef.current = async () => undefined
     }
-  }, [jobId, token, commitLogs, cached, noteActivity, toLocal])
+  }, [jobId, token, commitLogs, cached, noteActivity, toLocal, generation])
 
   // Start-latency phases (only recorded for runs started from this device).
   const hasJob = !!job
@@ -438,6 +461,7 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
   useEffect(() => {
     if (!jobId || !token) return
     if (cached) return // finished run — nothing to stream
+    void generation // restart after resume()
 
     let disposed = false
     let socket: WebSocket | null = null
@@ -619,7 +643,7 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
       stopHealth()
       socket?.close()
     }
-  }, [jobId, token, commitLogs, cached, noteActivity, noteServerClock, toLocal])
+  }, [jobId, token, commitLogs, cached, noteActivity, noteServerClock, toLocal, generation])
 
   const cancel = useCallback(async () => {
     if (!token || !jobId) return
@@ -640,5 +664,20 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
 
   const resync = useCallback(() => resyncRef.current(), [])
 
-  return { job, logs, activity, clockOffsetMs, connection, error, deployUrl, setDeployUrl, cancel, resync }
+  // Approval continued THIS job from where the gate stopped it: reopen it as a
+  // live run. The stages after the gate go back to pending (they were only
+  // "skipped" because of the stop), the terminal guards are lifted, the cached
+  // finished snapshot is dropped, and polling + the WebSocket start again.
+  const resume = useCallback(() => {
+    terminalRef.current = false
+    terminalEventRef.current = null
+    liveRef.current = false
+    queryClient.removeQueries({ queryKey: jobKeys.execution(jobId) })
+    setCached(null)
+    setJob((previous) => (previous ? reopenAfterGate(previous) : previous))
+    setConnection('connecting')
+    setGeneration((value) => value + 1)
+  }, [queryClient, jobId])
+
+  return { job, logs, activity, clockOffsetMs, connection, error, deployUrl, setDeployUrl, cancel, resync, resume }
 }

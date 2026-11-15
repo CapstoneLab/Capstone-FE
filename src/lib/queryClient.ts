@@ -37,7 +37,8 @@ export const persistOptions: Omit<PersistQueryClientOptions, 'queryClient'> | nu
       persister,
       maxAge: 24 * 60 * 60_000,
       // Bump when cached data shapes change so stale shapes are discarded.
-      buster: 'v1',
+      // v2: drops results cached as final before the server finished them.
+      buster: 'v2',
       dehydrateOptions: {
         shouldDehydrateQuery: (query) =>
           query.state.status === 'success' &&

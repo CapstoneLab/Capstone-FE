@@ -52,9 +52,10 @@ import { executionTiming } from '@/lib/executionTiming'
 import { usePipelineExecution, type ConnectionState } from '@/hooks/usePipelineExecution'
 import { useQueryClient } from '@tanstack/react-query'
 import { prefetchJobResult, useJobResultQuery } from '@/hooks/useJobQueries'
+import { resultLagsGate } from '@/lib/deploymentGate'
 import { DeployApprovalDialog } from '@/components/DeployApprovalDialog'
 import { parseGateMessage } from '@/lib/gateMessage'
-import type { SecuritySeverity, VerdictKind } from '@/lib/api'
+import type { JobResult, SecuritySeverity, VerdictKind } from '@/lib/api'
 import { getStartTiming, startTimingDurations } from '@/lib/startTiming'
 import { getPendingStart } from '@/lib/pendingStart'
 
@@ -401,7 +402,7 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
     [t, locale],
   )
 
-  const { job, logs, activity, connection, error, deployUrl, setDeployUrl, cancel } =
+  const { job, logs, activity, connection, error, deployUrl, setDeployUrl, cancel, resume } =
     usePipelineExecution(jobId, token)
 
   const [isCancelling, setIsCancelling] = useState(false)
@@ -623,7 +624,19 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
   })()
 
   // Scan result of the finished run (cached; prefetched when the run ended).
-  const runResult = useJobResultQuery(token, isTerminal ? jobId : '')
+  // While the stored result still lags the gate record, re-poll it.
+  const gateRecord = reportedGateVerdict
+    ? { verdict: reportedGateVerdict, counts: gateCounts, reasons: gateSummary?.reasons ?? [], score: null }
+    : null
+  const lagsGate = (data: JobResult | null | undefined) =>
+    resultLagsGate(gateRecord, {
+      verdict: data?.verdictDetail?.verdict ?? null,
+      counts: data?.verdictDetail?.counts ?? null,
+    })
+  const runResult = useJobResultQuery(token, isTerminal ? jobId : '', {
+    refetchInterval: (data) => (lagsGate(data) ? 5_000 : false),
+  })
+  const resultLagging = runResult.isFetched && lagsGate(runResult.data)
   const runVd = runResult.data?.verdictDetail ?? null
   const resultCounts: Record<SecuritySeverity, number> | null = useMemo(() => {
     const data = runResult.data
@@ -643,8 +656,15 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
   const alreadyApproved = (runVd?.acknowledgedCwes.length ?? 0) > 0
   const pendingVerdict =
     runVd?.verdict === 'block_pending_approval' || reportedGateVerdict === 'block_pending_approval'
+  // The server decides (approval_eligible). While its result still lags the
+  // gate step, the gate's BLOCK_PENDING_APPROVAL stands unless the server
+  // already gave a reason why this run cannot be approved.
   const awaitingApproval =
-    isTerminal && !alreadyApproved && pendingVerdict && runResult.data?.approvalEligible === true
+    isTerminal &&
+    !alreadyApproved &&
+    pendingVerdict &&
+    (runResult.data?.approvalEligible === true ||
+      (resultLagging && reportedGateVerdict === 'block_pending_approval' && !runResult.data?.approvalReason))
   // Shown when the server says this run cannot be approved (e.g. already deployed).
   const approvalBlockedReason =
     isTerminal && pendingVerdict && runResult.data && runResult.data.approvalEligible !== true
@@ -1232,6 +1252,8 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
           counts={approvalCounts}
           findings={approvalFindings}
           reasons={approvalReasons}
+          // Backend continued this job after approval: keep watching it here.
+          onResumed={resume}
         />
       ) : null}
     </MainLayout>

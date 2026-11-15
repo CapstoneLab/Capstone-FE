@@ -1346,13 +1346,16 @@ export class ApprovalHttpError extends Error {
 
 export type ApprovalResponse = {
   status: string
-  resumed?: boolean
-  resumeFromStage?: string | null
   /** Backend auto-enqueues a follow-up job on approve — track via this id. */
   followupJobId: string | null
   /** CWEs accepted under approval (echoed back). Connects to B-5. */
   acknowledgedCwes: string[]
   message: string
+  /** True when the backend continues the SAME job from where the gate stopped
+   *  it (build → deploy) instead of starting a new follow-up job. */
+  resumed: boolean
+  /** Stage the resumed job continues from, e.g. "build". */
+  resumeFromStage: string | null
 }
 
 async function postApproval(
@@ -1386,13 +1389,17 @@ async function postApproval(
 
   const data = (await res.json().catch(() => ({}))) as UnknownRecord
   const ack = pick<unknown[]>(data, 'acknowledged_cwes', 'acknowledgedCwes')
+  const followupJobId = pick<string>(data, 'followup_job_id', 'followupJobId') ?? null
+  const resumeFromStage = pick<string>(data, 'resume_from_stage', 'resumeFromStage') ?? null
   return {
     status: pick<string>(data, 'status') ?? 'ok',
-    resumed: pick<boolean>(data, 'resumed') === true,
-    resumeFromStage: pick<string>(data, 'resume_from_stage') ?? null,
-    followupJobId: pick<string>(data, 'followup_job_id', 'followupJobId') ?? null,
+    followupJobId,
     acknowledgedCwes: Array.isArray(ack) ? (ack as string[]) : [],
     message: pick<string>(data, 'message') ?? '',
+    // Same job continues: explicit flag, a resume stage, or the "follow-up" being this job.
+    resumed:
+      pick<boolean>(data, 'resumed') === true || !!resumeFromStage || followupJobId === jobId,
+    resumeFromStage,
   }
 }
 

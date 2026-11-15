@@ -72,3 +72,39 @@ export function approvalSeverities(counts: GateCounts): SecuritySeverity[] {
   if (counts.medium >= 2) out.push('medium')
   return out
 }
+
+// ── Gate verdict from the job's own steps ─────────────────────────────────
+// The security-gate step reports e.g. "verdict=BLOCK_PENDING_APPROVAL … high=1".
+// That record exists as soon as the step fails, while the separate result
+// endpoint can still be empty for a while after the run ends (it then reads
+// "pass, 0 findings"). Pages use this to tell a lagging result from a real pass.
+
+export type StepGateVerdict = {
+  verdict: VerdictKind | null
+  counts: GateCounts | null
+  reasons: string[]
+  score: number | null
+}
+
+export function verdictFromGateText(raw: string | null | undefined): VerdictKind | null {
+  const v = (raw ?? '').toLowerCase()
+  if (v.includes('pending') || v.includes('approval')) return 'block_pending_approval'
+  if (v === 'block' || v === 'blocked') return 'block'
+  if (v === 'warn' || v === 'warning') return 'warn'
+  if (v === 'pass' || v === 'passed') return 'pass'
+  return null
+}
+
+/** True when the gate step says the run is blocked but the result does not
+ *  (yet) show it — the result was read before the server finished storing it. */
+export function resultLagsGate(
+  gate: StepGateVerdict | null,
+  result: { verdict: VerdictKind | null; counts: GateCounts | null } | null,
+): boolean {
+  if (!gate || (gate.verdict !== 'block' && gate.verdict !== 'block_pending_approval')) return false
+  if (!result) return true
+  const total = result.counts
+    ? result.counts.critical + result.counts.high + result.counts.medium + result.counts.low
+    : 0
+  return result.verdict === 'pass' || result.verdict === 'warn' || result.verdict === null || total === 0
+}

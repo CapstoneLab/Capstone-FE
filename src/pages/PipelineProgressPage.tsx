@@ -38,7 +38,8 @@ import { useSecurityCatalog } from '@/hooks/useSecurityCatalog'
 import { ResultDownloadDialog } from '@/components/ResultDownloadDialog'
 import type { ReportData } from '@/lib/reportExport'
 import { localizeFinding } from '@/lib/findingI18n'
-import { GATE_RULES, matchGateRule } from '@/lib/deploymentGate'
+import { GATE_RULES, matchGateRule, resultLagsGate } from '@/lib/deploymentGate'
+import { gateVerdictFromSteps } from '@/lib/gateMessage'
 import { DeployApprovalDialog } from '@/components/DeployApprovalDialog'
 
 ChartJS.register(ArcElement, Tooltip, Legend)
@@ -245,7 +246,22 @@ export function PipelineProgressPage() {
   // Cached via TanStack Query — revisiting a finished run renders instantly,
   // and hovering a run in the history list prefetches it.
   const detailQuery = useJobDetailQuery(token, jobId)
-  const resultQuery = useJobResultQuery(token, jobId)
+  // The job's own security-gate step record ("verdict=BLOCK_PENDING_APPROVAL
+  // … high=1"). Right after a run ends the result endpoint can still be empty
+  // ("pass, 0 findings"); while it lags the gate, re-poll it and show the gate.
+  const stepGate = useMemo(
+    () => (detailQuery.data ? gateVerdictFromSteps(detailQuery.data.steps) : null),
+    [detailQuery.data],
+  )
+  const lagsGate = (data: JobResult | null | undefined) =>
+    resultLagsGate(stepGate, {
+      verdict: data?.verdictDetail?.verdict ?? null,
+      counts: data?.verdictDetail?.counts ?? null,
+    })
+  const resultQuery = useJobResultQuery(token, jobId, {
+    refetchInterval: (data) => (lagsGate(data) ? 5_000 : false),
+  })
+  const resultLagging = !!resultQuery.data || resultQuery.isFetched ? lagsGate(resultQuery.data) : false
   const detail: JobDetail | null = detailQuery.data ?? null
   // "더 보기" pages are appended locally on top of the cached first page.
   const [extraFindings, setExtraFindings] = useState<SecurityFinding[]>([])
@@ -322,6 +338,8 @@ export function PipelineProgressPage() {
   const counts: Record<SecuritySeverity, number> = useMemo(() => {
     const sumOf = (c: Record<SecuritySeverity, number>) =>
       c.critical + c.high + c.medium + c.low
+    // Result not stored yet: the gate step's counts are the truth for now.
+    if (resultLagging && stepGate?.counts) return stepGate.counts
     if (vd?.counts && sumOf(vd.counts) > 0) return vd.counts
     const inScope = (result?.findings ?? []).filter((f) => f.inScope)
     if (inScope.length > 0) {
@@ -338,7 +356,7 @@ export function PipelineProgressPage() {
       result?.severitySummary ??
       detail?.severityCounts ?? { critical: 0, high: 0, medium: 0, low: 0 }
     )
-  }, [vd, result, detail])
+  }, [vd, result, detail, resultLagging, stepGate])
   const totalCount = useMemo(
     () => severityOrder.reduce((sum, { key }) => sum + (counts[key] ?? 0), 0),
     [counts],
@@ -348,7 +366,7 @@ export function PipelineProgressPage() {
   // null, or a suspiciously perfect 100 while in-scope findings exist (empty-
   // derived — the same defect that zeroed the counts), is recomputed from the
   // same counts the chart shows so the gauge actually reflects the deduction.
-  const score = rawScore
+  const score = resultLagging && stepGate?.score != null ? stepGate.score : rawScore
   const scoreLabel = vd?.scoreLabel || (score != null ? `${score}/100` : null)
   const displayScoreColor = vd?.gaugeColor ?? '#9CA3AF'
 
@@ -362,8 +380,14 @@ export function PipelineProgressPage() {
   // "not pending" here used to hide the verdict banner — and the approval
   // button with it — exactly when approval was needed.
   const hasScanData = !!vd || totalCount > 0 || (result?.findings.length ?? 0) > 0
-  const effectiveVerdict: VerdictKind | null =
-    backendVerdict ?? (hasScanData || !isResultPending ? gateRule.verdict : null)
+  const effectiveVerdict: VerdictKind | null = resultLagging
+    ? stepGate?.verdict ?? backendVerdict
+    : backendVerdict ?? (hasScanData || !isResultPending ? gateRule.verdict : null)
+  // The server decides eligibility; while its result lags the gate record,
+  // the gate's "승인 필요" stands unless the server already gave a reason not to.
+  const canApprove =
+    result?.approvalEligible === true ||
+    (resultLagging && stepGate?.verdict === 'block_pending_approval' && !result?.approvalReason)
 
   // No auto-popup here: the approval request lives on the pipeline page where
   // the run stopped at the gate. This page only offers the "승인 검토" button.
@@ -836,6 +860,13 @@ export function PipelineProgressPage() {
           </div>
         </div>
 
+        {resultLagging ? (
+          <div className="flex items-center gap-2 rounded-xl border border-[#D97706] bg-[#78350F]/30 p-3 text-[13px] text-[#FDE68A]">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            {t('result.lagging')}
+          </div>
+        ) : null}
+
         {/* B-4: commit mismatch warning */}
         {vd?.commitMismatch ? (
           <div className="rounded-xl border border-[#D97706] bg-[#78350F]/30 p-3">
@@ -889,7 +920,7 @@ export function PipelineProgressPage() {
                   ) : null}
                 </div>
                 {/* Approval path exists only for block_pending_approval. block hides it. */}
-                {effectiveVerdict === 'block_pending_approval' && result?.approvalEligible === true ? (
+                {effectiveVerdict === 'block_pending_approval' && canApprove ? (
                   <Button
                     type="button"
                     onClick={() => setApprovalOpen(true)}
@@ -1148,7 +1179,7 @@ export function PipelineProgressPage() {
         data={reportData}
       />
       <DeployApprovalDialog
-        open={approvalOpen && result?.approvalEligible === true}
+        open={approvalOpen && canApprove}
         onOpenChange={setApprovalOpen}
         jobId={jobId}
         repoName={repoName}

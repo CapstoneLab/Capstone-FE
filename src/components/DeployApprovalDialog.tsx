@@ -37,10 +37,13 @@ type Props = {
   reasons?: string[]
   /** The backend gate let the run through and it was already deployed. */
   deployedWithoutApproval?: boolean
+  /** Called when the backend continues THIS job after approval (no new job):
+   *  the pipeline page reopens it live instead of navigating away. */
+  onResumed?: () => void
 }
 
 type Outcome =
-  | { kind: 'approved'; deployJobId: string; isFollowup: boolean; message: string }
+  | { kind: 'approved'; deployJobId: string; isFollowup: boolean; resumed: boolean; message: string }
   | { kind: 'rejected' }
 
 const severityLabel: Record<SecuritySeverity, string> = {
@@ -59,7 +62,7 @@ const severityColor: Record<SecuritySeverity, string> = {
 const POLL_MS = 5000
 const POLL_LIMIT_MS = 15 * 60 * 1000
 
-export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, branch, counts, findings, reasons = [], deployedWithoutApproval = false }: Props) {
+export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, branch, counts, findings, reasons = [], deployedWithoutApproval = false, onResumed }: Props) {
   const navigate = useNavigate()
   const { token, user } = useAuth()
   const queryClient = useQueryClient()
@@ -113,10 +116,17 @@ export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, bran
           return
         }
         void invalidateJob(queryClient, jobId)
+        if (res.resumed && onResumed) {
+          // Same job continues from the gate (build → deploy) on this page.
+          onResumed()
+          onOpenChange(false)
+          return
+        }
         setOutcome({
           kind: 'approved',
-          deployJobId: res.followupJobId || jobId,
-          isFollowup: !!res.followupJobId,
+          deployJobId: res.resumed ? jobId : res.followupJobId || jobId,
+          isFollowup: !res.resumed && !!res.followupJobId,
+          resumed: res.resumed,
           message: res.message,
         })
       } else {
@@ -207,7 +217,9 @@ export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, bran
                 <Rocket className="h-4 w-4 text-[#34D399]" /> 배포 확인
               </p>
               <p className="mt-1 text-[12px] text-[#9CA3AF]">
-                {outcome.isFollowup
+                {outcome.resumed
+                  ? '승인된 실행이 멈춘 지점(빌드)부터 이어서 배포를 진행합니다.'
+                  : outcome.isFollowup
                   ? `승인 후 배포 작업이 시작되었습니다. (Job ${deployJobId!.slice(0, 8)})`
                   : '백엔드가 후속 배포 작업 ID를 주지 않아 현재 작업의 배포 상태를 확인합니다.'}
               </p>

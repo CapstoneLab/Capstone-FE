@@ -68,6 +68,8 @@ export function ApprovalPage() {
             followupJobId: approval.followupJobId,
             acknowledgedCwes: approval.acknowledgedCwes,
             message: approval.reason ?? '',
+            resumed: approval.followupJobId === jobId,
+            resumeFromStage: null,
           })
         } else if (approval?.status === 'rejected') {
           setRejected(true)

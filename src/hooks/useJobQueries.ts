@@ -40,10 +40,19 @@ function stepsStaleTime(steps: PipelineStepsResponse | null | undefined): number
 
 // A result is final once a verdict is in and it is not waiting on approval;
 // an approval-pending result can still change (approve/reject), so keep it short.
+// A result read right after the run ended can be incomplete (the server is
+// still storing the scan), and caching that forever showed "통과, 0건" for a
+// run the gate had blocked. So a result is only final once it has a verdict,
+// a completed_at, and is older than RESULT_SETTLE_MS; before that it is
+// re-read on every visit after a short stale time.
+const RESULT_SETTLE_MS = 10 * 60_000
+
 function resultStaleTime(result: JobResult | null | undefined): number {
   if (!result) return LIVE_STALE_MS
   const vd = result.verdictDetail
-  if (vd?.overallStatus === 'pending' || vd?.verdict === 'block_pending_approval') return 15_000
+  if (!vd || vd.overallStatus === 'pending' || vd.verdict === 'block_pending_approval') return 15_000
+  const completed = result.completedAt ? Date.parse(result.completedAt) : Number.NaN
+  if (!Number.isFinite(completed) || Date.now() - completed < RESULT_SETTLE_MS) return 15_000
   return Infinity
 }
 
@@ -80,10 +89,20 @@ export function useJobDetailQuery(token: string | null, jobId: string) {
   })
 }
 
-export function useJobResultQuery(token: string | null, jobId: string) {
+export function useJobResultQuery(
+  token: string | null,
+  jobId: string,
+  options: { refetchInterval?: number | false | ((data: JobResult | null | undefined) => number | false) } = {},
+) {
+  const interval = options.refetchInterval
   return useQuery({
     ...resultQueryOptions(token ?? '', jobId),
     enabled: !!token && !!jobId,
+    // Re-poll while the result is known to lag the job (see resultLagsGate).
+    refetchInterval:
+      typeof interval === 'function'
+        ? (query: { state: { data: JobResult | null | undefined } }) => interval(query.state.data)
+        : (interval ?? false),
   })
 }
 

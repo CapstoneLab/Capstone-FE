@@ -1,3 +1,4 @@
+import { verdictFromGateText, type StepGateVerdict } from '@/lib/deploymentGate'
 // Parses the security-gate summary line the backend puts in the gate step's
 // `error_message`, e.g.
 //   verdict=BLOCK 6.0/100 (전체 검사 기준) env=production critical=4 high=2
@@ -64,5 +65,20 @@ export function parseGateMessage(message: string | null | undefined): GateSummar
       ? { critical: critical ?? 0, high: high ?? 0, medium: medium ?? 0, low: low ?? 0 }
       : null,
     reasons,
+  }
+}
+
+/** Gate verdict carried by the job's security-gate step, if it reported one. */
+export function gateVerdictFromSteps(
+  steps: { stepType: string; stepName: string; errorMessage: string | null }[],
+): StepGateVerdict | null {
+  const gateStep = steps.find((step) => /gate/i.test(`${step.stepType} ${step.stepName}`) && step.errorMessage)
+  const summary = gateStep ? parseGateMessage(gateStep.errorMessage) : null
+  if (!summary) return null
+  return {
+    verdict: verdictFromGateText(summary.verdict),
+    counts: summary.counts,
+    reasons: summary.reasons,
+    score: summary.score,
   }
 }

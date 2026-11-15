@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { approvalSeverities, matchGateRule, stricterVerdict } from './deploymentGate'
+import { approvalSeverities, matchGateRule, resultLagsGate, stricterVerdict } from './deploymentGate'
 
 const c = (critical: number, high: number, medium: number, low: number) => ({ critical, high, medium, low })
 
@@ -37,5 +37,23 @@ describe('approvalSeverities', () => {
     expect(approvalSeverities(c(0, 0, 3, 0))).toEqual(['medium'])
     expect(approvalSeverities(c(0, 1, 2, 0))).toEqual(['high', 'medium'])
     expect(approvalSeverities(c(0, 0, 1, 0))).toEqual([])
+  })
+})
+
+describe('resultLagsGate (result read before the server stored it)', () => {
+  const gate = { verdict: 'block_pending_approval' as const, counts: c(0, 1, 0, 0), reasons: [], score: 95 }
+
+  it('flags an empty "pass" result for a run the gate blocked', () => {
+    expect(resultLagsGate(gate, { verdict: 'pass', counts: c(0, 0, 0, 0) })).toBe(true)
+    expect(resultLagsGate(gate, null)).toBe(true)
+  })
+
+  it('accepts a result that already shows the block', () => {
+    expect(resultLagsGate(gate, { verdict: 'block_pending_approval', counts: c(0, 1, 0, 0) })).toBe(false)
+  })
+
+  it('never flags runs the gate did not block', () => {
+    expect(resultLagsGate({ ...gate, verdict: 'pass' }, { verdict: 'pass', counts: c(0, 0, 0, 0) })).toBe(false)
+    expect(resultLagsGate(null, { verdict: 'pass', counts: null })).toBe(false)
   })
 })

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { JobDetail, JobStep } from '@/lib/api'
-import { applyStepPatch, keepTerminal } from './usePipelineExecution'
+import { applyStepPatch, keepTerminal, reopenAfterGate } from './usePipelineExecution'
 
 function job(status: JobDetail['status'], completedAt: string | null = null): JobDetail {
   return {
@@ -40,5 +40,30 @@ describe('applyStepPatch', () => {
   it('applies a normal transition', () => {
     const [patched] = applyStepPatch([step('running')], { stepId: 's1', status: 'failed' })
     expect(patched.status).toBe('failed')
+  })
+})
+
+describe('reopenAfterGate (approval resumes the same job)', () => {
+  const gateStopped: JobDetail = {
+    ...job('failed', '2026-11-16T01:23:30Z'),
+    steps: [
+      { ...step('success'), stepId: 'g', stepName: 'security-gate', stepType: 'security-gate', status: 'failed' },
+      { ...step('skipped'), stepId: 'b', stepName: 'build', stepType: 'build', endedAt: '2026-11-16T01:23:28Z' },
+      { ...step('skipped'), stepId: 'd', stepName: 'deploy', stepType: 'deploy', endedAt: '2026-11-16T01:23:30Z' },
+    ],
+  }
+
+  it('makes the job live again with build/deploy pending', () => {
+    const reopened = reopenAfterGate(gateStopped)
+    expect(reopened.status).toBe('running')
+    expect(reopened.completedAt).toBeNull()
+    expect(reopened.steps.map((s) => s.status)).toEqual(['failed', 'pending', 'pending'])
+    expect(reopened.steps[1].endedAt).toBeNull()
+  })
+
+  it('lets the resumed build start (no longer blocked by the finished-stage guard)', () => {
+    const reopened = reopenAfterGate(gateStopped)
+    const [, build] = applyStepPatch(reopened.steps, { stepId: 'b', status: 'running' })
+    expect(build.status).toBe('running')
   })
 })
