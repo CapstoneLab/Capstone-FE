@@ -588,7 +588,7 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
               <div>
                 <p className="text-[20px] font-bold" style={{ color: toneColor }}>
                   {jobStatus === 'success'
-                    ? t('run.summary.success')
+                    ? (progress.skipped > 0 ? t('run.summary.successWithSkipped') : t('run.summary.success'))
                     : jobStatus === 'failed'
                       ? t('run.summary.failed')
                       : t('run.summary.cancelled')}

@@ -231,7 +231,7 @@ export function stageDurationSecs(
 
 export type ExecutionProgress = {
   total: number
-  /** Stages that finished successfully. Pending/skipped never count. */
+  /** All terminal stages, including skipped/failed/cancelled; distinct from success. */
   completed: number
   failed: number
   skipped: number
@@ -244,7 +244,7 @@ export type ExecutionProgress = {
 
 export function summarizeProgress(stages: StageView[]): ExecutionProgress {
   const count = (status: StageStatus) => stages.filter((stage) => stage.status === status).length
-  const completed = count('success')
+  const completed = stages.filter((stage) => TERMINAL_STAGE.has(stage.status)).length
   const total = stages.length || TOTAL_STAGES
   return {
     total,

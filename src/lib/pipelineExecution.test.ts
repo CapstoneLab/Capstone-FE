@@ -96,7 +96,7 @@ describe('stage mapping', () => {
       })
       expect(stages[failedIndex].errorMessage).toBe('boom')
       const progress = summarizeProgress(stages)
-      expect(progress.completed).toBe(failedIndex)
+      expect(progress.completed).toBe(8)
       expect(progress.failed).toBe(1)
       expect(progress.currentIndex).toBe(-1)
     },
@@ -105,7 +105,7 @@ describe('stage mapping', () => {
   it('cancellation mid-run marks the running stage cancelled and the rest skipped', () => {
     const stages = buildStageViews([step(0, 'success'), step(1, 'running')], 'cancelled')
     expect(stages.slice(0, 3).map((stage) => stage.status)).toEqual(['success', 'cancelled', 'skipped'])
-    expect(summarizeProgress(stages).completed).toBe(1)
+    expect(summarizeProgress(stages).completed).toBe(8)
   })
 
   it('accepts a backend that reports cancelled steps itself', () => {
@@ -118,9 +118,9 @@ describe('stage mapping', () => {
     expect(summarizeProgress(stages)).toMatchObject({ completed: 8, total: 8, percent: 100 })
   })
 
-  it('never counts pending or skipped stages as completed', () => {
+  it('counts skipped as complete but leaves pending incomplete', () => {
     const stages = buildStageViews([step(0, 'success'), step(1, 'skipped')], 'running')
-    expect(summarizeProgress(stages)).toMatchObject({ completed: 1, skipped: 1, percent: 13 })
+    expect(summarizeProgress(stages)).toMatchObject({ completed: 2, skipped: 1, percent: 25 })
   })
 })
 
@@ -233,4 +233,10 @@ describe('log stage resolution and filtering', () => {
     expect(filterLogEntries(entries, { stage: 'all', levels: new Set(['ERROR'] as const) })).toHaveLength(1)
     expect(filterLogEntries(entries, { stage: 'all', levels: all, query: 'OK' })).toHaveLength(1)
   })
+})
+
+
+it('seven successful stages plus a skipped test finish at 8/8', () => {
+  const stages = buildStageViews(PIPELINE_STAGES.map((_, i) => step(i, i === 3 ? 'skipped' : 'success')), 'success')
+  expect(summarizeProgress(stages)).toMatchObject({completed: 8, total: 8, skipped: 1, failed: 0, percent: 100})
 })
