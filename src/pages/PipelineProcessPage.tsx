@@ -633,8 +633,14 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
       verdict: data?.verdictDetail?.verdict ?? null,
       counts: data?.verdictDetail?.counts ?? null,
     })
-  const runResult = useJobResultQuery(token, isTerminal ? jobId : '', {
-    refetchInterval: (data) => (lagsGate(data) ? 5_000 : false),
+  // The gate step itself says "BLOCK_PENDING_APPROVAL": the run is stopped
+  // for approval from this moment — do not wait for build/deploy to be marked
+  // skipped and the job to finish before offering approval.
+  const gateStopped = reportedGateVerdict === 'block_pending_approval'
+  // Fetch the result as soon as the gate stopped the run (or the run ended),
+  // and re-poll quickly while the server is still storing it.
+  const runResult = useJobResultQuery(token, isTerminal || gateStopped ? jobId : '', {
+    refetchInterval: (data) => (lagsGate(data) ? 1_500 : false),
   })
   const resultLagging = runResult.isFetched && lagsGate(runResult.data)
   const runVd = runResult.data?.verdictDetail ?? null
@@ -659,17 +665,21 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
   // The server decides (approval_eligible). While its result still lags the
   // gate step, the gate's BLOCK_PENDING_APPROVAL stands unless the server
   // already gave a reason why this run cannot be approved.
+  //
+  // Fast path: the gate step stopping the run is enough to open approval right
+  // away (the result request runs in parallel); the approve call is validated
+  // by the server anyway. Only an explicit server reason (approval_reason,
+  // e.g. already deployed) keeps it closed.
+  const serverRefused = runResult.data?.approvalEligible !== true && !!runResult.data?.approvalReason
   const awaitingApproval =
-    isTerminal &&
     !alreadyApproved &&
-    pendingVerdict &&
-    (runResult.data?.approvalEligible === true ||
-      (resultLagging && reportedGateVerdict === 'block_pending_approval' && !runResult.data?.approvalReason))
+    !serverRefused &&
+    (gateStopped ||
+      (isTerminal &&
+        pendingVerdict &&
+        (runResult.data?.approvalEligible === true || resultLagging)))
   // Shown when the server says this run cannot be approved (e.g. already deployed).
-  const approvalBlockedReason =
-    isTerminal && pendingVerdict && runResult.data && runResult.data.approvalEligible !== true
-      ? runResult.data.approvalReason
-      : null
+  const approvalBlockedReason = pendingVerdict && serverRefused ? runResult.data?.approvalReason ?? null : null
 
   const [approvalOpen, setApprovalOpen] = useState(false)
   // Open the approval dialog right here, once, when this run needs approval —

@@ -108,20 +108,21 @@ export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, bran
         // Creates the pending approval first when the backend has none yet.
         const res = await decideApproval(token, jobId, 'approve', reason, name)
         if (res.resumed || res.resumeFromStage || res.followupJobId === jobId) {
-          // A completed execution snapshot must not close the resumed channel.
+          // The same job continues from the gate (build → deploy). Drop its
+          // finished-run caches so nothing restores the stopped state.
           await queryClient.cancelQueries({ queryKey: jobKeys.run(jobId) })
           queryClient.removeQueries({ queryKey: jobKeys.run(jobId) })
           onOpenChange(false)
-          navigate('/pipeline/progress', { state: { jobId, repoName, branch, resumed: true } })
+          if (onResumed) {
+            // Already on this job's pipeline page: reopen it live in place.
+            // (Navigating to the same route would not remount the page.)
+            onResumed()
+          } else {
+            navigate('/pipeline/progress', { state: { jobId, repoName, branch, resumed: true } })
+          }
           return
         }
         void invalidateJob(queryClient, jobId)
-        if (res.resumed && onResumed) {
-          // Same job continues from the gate (build → deploy) on this page.
-          onResumed()
-          onOpenChange(false)
-          return
-        }
         setOutcome({
           kind: 'approved',
           deployJobId: res.resumed ? jobId : res.followupJobId || jobId,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { getCachedExecution, jobKeys, mergeJobWithSteps, saveExecution } from '@/hooks/useJobQueries'
 import { markStartPhase } from '@/lib/startTiming'
@@ -184,6 +184,25 @@ export function reopenAfterGate(job: JobDetail): JobDetail {
   }
 }
 
+/** True once the backend exposes an actual build/deploy attempt after resume. */
+export function hasResumedStageStarted(steps: JobStep[]): boolean {
+  return steps.some((step) => {
+    const index = stageIndexForStep(step)
+    return index !== null && index > 5 &&
+      ['running', 'success', 'failed', 'cancelled'].includes(step.status) &&
+      !!(step.startedAt || step.endedAt)
+  })
+}
+
+export function hasResumedExecutionFinished(steps: JobStep[]): boolean {
+  return steps.some((step) => {
+    const index = stageIndexForStep(step)
+    if (index === 6) return ['failed', 'cancelled'].includes(step.status) && !!(step.startedAt || step.endedAt)
+    if (index === 7) return ['success', 'failed', 'cancelled'].includes(step.status) && !!(step.startedAt || step.endedAt)
+    return false
+  })
+}
+
 /** A stage event that carries the complete persisted step needs no REST refresh. */
 function isCompleteStep(patch: Partial<JobStep> | null): boolean {
   return !!patch?.stepId && !!patch.stepName && !!patch.stepType && !!patch.status
@@ -240,6 +259,10 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
   const [generation, setGeneration] = useState(0)
 
   const [job, setJob] = useState<JobDetail | null>(cached?.job ?? null)
+  const jobRef = useRef(job)
+  useLayoutEffect(() => {
+    jobRef.current = job
+  }, [job])
   const [logs, setLogs] = useState<LogEntry[]>(cached?.logs ?? [])
   const [connection, setConnection] = useState<ConnectionState>(cached ? 'closed' : 'connecting')
   const [error, setError] = useState<string | null>(null)
@@ -285,6 +308,8 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
   const logsRef = useRef<LogEntry[]>(cached?.logs ?? [])
   const liveRef = useRef(false)
   const terminalRef = useRef(!!cached)
+  // A successful same-job approval may briefly precede REST/WS status updates.
+  const resumePendingRef = useRef(false)
   const terminalEventRef = useRef<UnknownRecord | null>(null)
   const resyncRef = useRef<() => Promise<void>>(async () => undefined)
   // Closes the real-time channel once REST learns the run has finished.
@@ -331,17 +356,29 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
       const applyJob = () => {
         if (disposed) return
         // A terminal job detail wins over a lagging "running" steps summary.
-        const status =
+        const regularStatus =
           detailJob && isTerminalJobStatus(detailJob.status)
             ? detailJob.status
             : stepsResponse?.job?.status || detailJob?.status
+        const continuationFinished = hasResumedExecutionFinished(stepsResponse?.steps ?? [])
+        const continuationProgress = hasResumedStageStarted(stepsResponse?.steps ?? [])
+        const continuationActive = continuationProgress && !continuationFinished
+        if (resumePendingRef.current && (regularStatus === 'running' || continuationFinished)) {
+          resumePendingRef.current = false
+        }
+        const status = resumePendingRef.current && continuationActive ? 'running' : regularStatus
         if (status && !isTerminalJobStatus(status)) observedLive = true
         setJob((previous) => {
           const base = detailJob ?? previous
           if (!base) return previous
           // Keeps known steps when the steps endpoint is momentarily empty
           // while the backend is still persisting a callback.
-          const merged = mergeJobWithSteps(base, stepsResponse)
+          const merged = resumePendingRef.current && continuationActive
+            ? { ...base, status: 'running' as const, completedAt: null, steps: stepsResponse?.steps ?? base.steps }
+            : mergeJobWithSteps(base, stepsResponse)
+          // Approval can return before the backend's terminal snapshot is
+          // replaced. Keep the optimistic reopened state until continuation.
+          if (resumePendingRef.current && status && isTerminalJobStatus(status)) return previous
           return preserveTerminal(
             previous,
             terminalEventRef.current ? applyJobEvent(merged, terminalEventRef.current) : merged,
@@ -372,11 +409,24 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
       const [detail, steps, lines] = await Promise.allSettled([detailRequest, stepsRequest, linesRequest])
       if (disposed) return
       const detailStatus = detail.status === 'fulfilled' ? detail.value?.status : undefined
-      const status =
+      const reportedStatus =
         detailStatus && isTerminalJobStatus(detailStatus)
           ? detailStatus
           : (steps.status === 'fulfilled' ? steps.value?.job?.status : undefined) || detailStatus
+      const resumedExecutionFinished = steps.status === 'fulfilled' && hasResumedExecutionFinished(steps.value.steps)
+      const resumedStageVisible = steps.status === 'fulfilled' && hasResumedStageStarted(steps.value.steps)
+      const status = resumePendingRef.current && resumedStageVisible && !resumedExecutionFinished
+        ? 'running'
+        : reportedStatus
       syncCount += 1
+
+      if (resumePendingRef.current && (reportedStatus === 'running' || resumedExecutionFinished)) {
+        resumePendingRef.current = false
+      }
+      if (resumePendingRef.current && reportedStatus && isTerminalJobStatus(reportedStatus) && !resumedExecutionFinished) {
+        setError(null)
+        return
+      }
 
       if (detail.status === 'rejected' && lines.status === 'rejected') {
         // The page shows a translated message; this raw detail is diagnostic.
@@ -519,9 +569,15 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
         noteActivity('lastLogAt', toLocal(parseTime(message.last_log_at)))
         if (typeof message.job_status === 'string') {
           const snapshot = { ...message, status: message.job_status }
-          if (isTerminalJobStatus(message.job_status)) terminalEventRef.current = snapshot
-          setJob(previous => previous ? applyJobEvent(previous, snapshot) : previous)
-          if (isTerminalJobStatus(message.job_status)) finish()
+          const staleTerminal = isTerminalJobStatus(message.job_status) && resumePendingRef.current &&
+            !hasResumedExecutionFinished(jobRef.current?.steps ?? [])
+          if (staleTerminal) {
+            scheduleStepRefresh()
+          } else {
+            if (isTerminalJobStatus(message.job_status)) terminalEventRef.current = snapshot
+            setJob(previous => previous ? applyJobEvent(previous, snapshot) : previous)
+            if (isTerminalJobStatus(message.job_status)) finish()
+          }
         }
       }
 
@@ -546,6 +602,13 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
       if (Object.hasOwn(EVENT_STEP_STATUS, type) || type === 'step_complete' || type === 'stage_progress') {
         const patch = stepPatchFromEvent(message)
         if (patch) {
+          const patchIndex = patch.stepName && patch.stepType
+            ? stageIndexForStep({ stepName: patch.stepName, stepType: patch.stepType })
+            : null
+          const finishedContinuationStep =
+            (patchIndex === 6 && ['failed', 'cancelled'].includes(patch.status ?? '')) ||
+            (patchIndex === 7 && ['success', 'failed', 'cancelled'].includes(patch.status ?? ''))
+          if (finishedContinuationStep && (patch.startedAt || patch.endedAt)) resumePendingRef.current = false
           // Stage events are pushed the moment the server stamps them, so
           // their started_at/ended_at anchor this client to the server clock.
           const receivedAt = Date.now()
@@ -558,12 +621,20 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
         }
         // A partial event is only a hint — fetch the persisted step state.
         // A complete persisted step is applied as-is, without a REST round trip.
-        if (!isCompleteStep(patch)) scheduleStepRefresh()
+        // A failed stage without its reason (the gate's "verdict=…" text) is
+        // fetched right away: approval opens from that text.
+        if (!isCompleteStep(patch) || (patch?.status === 'failed' && !patch.errorMessage)) scheduleStepRefresh()
         return
       }
 
       if (Object.hasOwn(EVENT_JOB_STATUS, type) || type === 'pipeline_complete' || type === 'pipeline_completed') {
         const status = typeof message.status === 'string' ? message.status : EVENT_JOB_STATUS[type] ?? (type === 'pipeline_completed' ? 'success' : '')
+        if (status === 'running') resumePendingRef.current = false
+        if (isTerminalJobStatus(status) && resumePendingRef.current &&
+            !hasResumedExecutionFinished(jobRef.current?.steps ?? [])) {
+          scheduleStepRefresh()
+          return
+        }
         if (isTerminalJobStatus(status)) terminalEventRef.current = { ...message, status }
         setJob((previous) => previous ? applyJobEvent(previous, { ...message, status }) : previous)
         if (isTerminalJobStatus(status)) finish()
@@ -669,6 +740,7 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
   // "skipped" because of the stop), the terminal guards are lifted, the cached
   // finished snapshot is dropped, and polling + the WebSocket start again.
   const resume = useCallback(() => {
+    resumePendingRef.current = true
     terminalRef.current = false
     terminalEventRef.current = null
     liveRef.current = false
