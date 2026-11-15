@@ -53,3 +53,8 @@ describe('server execution timing', () => {
     expect(preserveTerminal(current,job()).startedAt).toBe(at(3))
   })
 })
+
+it('does not revert a running clone to a stale queued response', () => {
+  const running = job()
+  expect(preserveTerminal(running, job({status:'queued', startedAt:null, steps:[]}))).toBe(running)
+})

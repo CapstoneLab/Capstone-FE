@@ -252,7 +252,11 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
 
     const sync = async () => {
       const [detail, steps, lines] = await Promise.allSettled([
-        fetchJobDetail(token, jobId),
+        fetchJobDetail(token, jobId).then(detail => {
+          // Render the first server state without waiting for the log snapshot.
+          if (!disposed && detail) setJob(previous => previous ?? detail)
+          return detail
+        }),
         fetchPipelineSteps(token, jobId),
         fetchPipelineLogs(token, jobId),
       ])
@@ -427,7 +431,7 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
         if (patch) {
           if (!patch.status && EVENT_STEP_STATUS[type]) patch.status = EVENT_STEP_STATUS[type]
           setJob((previous) =>
-            previous ? preserveTerminal(previous, { ...previous, startedAt: str(message, 'pipeline_started_at') ?? previous.startedAt, steps: applyStepPatch(previous.steps, patch) }) : previous,
+            previous ? preserveTerminal(previous, { ...previous, status: patch.status === 'running' ? 'running' : previous.status, startedAt: str(message, 'pipeline_started_at') ?? previous.startedAt, steps: applyStepPatch(previous.steps, patch) }) : previous,
           )
         }
         // A partial event is only a hint — fetch the persisted step state.

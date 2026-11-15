@@ -9,6 +9,7 @@ export function timestampMs(value: string | null | undefined): number | null {
 /** Never let an older REST response restart a terminal execution. */
 export function preserveTerminal(previous: JobDetail | null, incoming: JobDetail): JobDetail {
   if (!previous) return incoming
+  if (previous.status === 'running' && incoming.status === 'queued') return previous
   if (!isTerminalJobStatus(previous.status)) {
     const oldStart = timestampMs(previous.startedAt)
     const newStart = timestampMs(incoming.startedAt)

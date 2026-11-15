@@ -341,7 +341,7 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
   const commitSha = job?.commitSha || locationState.commitSha || cloneCommit?.sha || ''
   const commitLink = commitUrl(job?.repoUrl ?? '', commitSha)
 
-  const totalElapsed = timing.total
+  const totalElapsed = timing.stages
 
   const triggerLabel = (source: string, by: string): string => {
     const base = isWebhookTrigger(source)
@@ -540,6 +540,9 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
             <MetaItem icon={Timer} label={t('run.meta.duration')}>
               {labels.duration(totalElapsed)}
             </MetaItem>
+            <MetaItem icon={Timer} label={t('run.meta.wallDuration')}>
+              {labels.duration(timing.total)}
+            </MetaItem>
           </div>
         </Card>
 
@@ -573,7 +576,7 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
                 </p>
                 {timing.total !== null ? (
                   <p className="mt-1 text-[13px] text-[#A1A1A1]">
-                    {t('run.timing.breakdown', { stages: labels.duration(timing.stages), waiting: labels.duration(timing.waiting) })}
+                    {t('run.timing.breakdown', { total: labels.duration(timing.total), stages: labels.duration(timing.stages), waiting: labels.duration(timing.waiting) })}
                   </p>
                 ) : null}
                 {failedStage ? (
