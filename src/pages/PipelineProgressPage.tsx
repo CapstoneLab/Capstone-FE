@@ -95,9 +95,12 @@ const VERDICT_CONFIG: Record<
 // highlight the row the current verdict landed on ("← 현재 여기").
 const GATE_ROWS: { color: string; label: string; action: string; match: VerdictKind }[] = [
   { color: '#EF4444', label: 'Critical ≥ 1', action: '즉시 차단', match: 'block' },
-  { color: '#F97316', label: 'High ≥ 1', action: '승인 필요', match: 'block_pending_approval' },
-  { color: '#EAB308', label: 'Medium ≥ 1', action: '경고(통과)', match: 'warn' },
-  { color: '#22C55E', label: 'Low / 없음', action: '통과', match: 'pass' },
+  { color: '#EF4444', label: 'High ≥ 2', action: '즉시 차단', match: 'block' },
+  { color: '#F97316', label: 'High = 1', action: '승인 필요', match: 'block_pending_approval' },
+  { color: '#F97316', label: 'Medium ≥ 2', action: '승인 필요', match: 'block_pending_approval' },
+  { color: '#EAB308', label: 'Medium = 1', action: '경고(통과)', match: 'warn' },
+  { color: '#EAB308', label: 'Low ≥ 1', action: '경고(통과)', match: 'warn' },
+  { color: '#22C55E', label: '없음', action: '통과', match: 'pass' },
 ]
 
 const toneBannerClass: Record<'pass' | 'warn' | 'approve' | 'block', string> = {
@@ -601,7 +604,7 @@ export function PipelineProgressPage() {
   // The gate row the verdict landed on (for the "← 현재 여기" highlight).
   const activeRowVerdict: VerdictKind =
     effectiveVerdict ??
-    (counts.critical > 0 ? 'block' : counts.high > 0 ? 'block_pending_approval' : counts.medium > 0 ? 'warn' : 'pass')
+    (counts.critical > 0 || counts.high >= 2 ? 'block' : counts.high > 0 || counts.medium >= 2 ? 'block_pending_approval' : counts.medium > 0 || counts.low > 0 ? 'warn' : 'pass')
 
   const reasons =
     effectiveVerdict === 'warn'
@@ -889,10 +892,17 @@ export function PipelineProgressPage() {
           {/* Gate hierarchy with current position highlighted */}
           <div className="mt-3 space-y-1.5">
             {GATE_ROWS.map((row) => {
-              const active = row.match === activeRowVerdict
+              const applicable = row.label.startsWith('Critical') ? counts.critical > 0
+                : row.label === 'High ≥ 2' ? counts.high >= 2
+                : row.label === 'High = 1' ? counts.high === 1
+                : row.label === 'Medium ≥ 2' ? counts.medium >= 2
+                : row.label === 'Medium = 1' ? counts.medium === 1
+                : row.label === 'Low ≥ 1' ? counts.low > 0
+                : totalCount === 0
+              const active = row.match === activeRowVerdict && applicable
               return (
                 <div
-                  key={row.match}
+                  key={row.label}
                   className={`flex items-center gap-3 rounded-lg border px-3 py-2 text-[13px] ${
                     active ? 'border-[#5B5B5B] bg-[#1E1E1E]' : 'border-transparent'
                   }`}

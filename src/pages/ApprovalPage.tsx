@@ -52,10 +52,10 @@ export function ApprovalPage() {
       .then(([res, approval]) => {
         if (cancelled) return
         setResult(res)
-        // C-3 default: pre-select every blocking High CWE (전체 승인 기본).
+        // C-3 default: pre-select every blocking High/Medium CWE (전체 승인 기본).
         if (res) {
           const cwes = res.findings
-            .filter((f) => f.inScope && f.severity === 'high' && f.cwe)
+            .filter((f) => f.inScope && (f.severity === 'high' || f.severity === 'medium') && f.cwe && res.verdictDetail?.blockReasons.some((reason) => reason.includes(`${f.cwe},`)))
             .map((f) => f.cwe as string)
           setSelectedCwes(new Set(cwes))
         }
@@ -89,22 +89,22 @@ export function ApprovalPage() {
   const verdict = vd?.verdict ?? null
   const commitShort = vd?.scannedCommitSha ? vd.scannedCommitSha.slice(0, 12) : null
 
-  // C-3: only in-scope High findings are eligible. Critical is never listed
+  // C-3: only in-scope High/Medium findings are eligible. Critical is never listed
   // (승인 불가). Dedupe by CWE since approved_cwes is keyed by CWE.
-  const highFindings = useMemo(
-    () => (result?.findings ?? []).filter((f) => f.inScope && f.severity === 'high'),
+  const approvableFindings = useMemo(
+    () => (result?.findings ?? []).filter((f) => f.inScope && (f.severity === 'high' || f.severity === 'medium') && f.cwe && result?.verdictDetail?.blockReasons.some((reason) => reason.includes(`${f.cwe},`))),
     [result],
   )
-  const highCweItems = useMemo(() => {
+  const approvableCweItems = useMemo(() => {
     const byCwe = new Map<string, SecurityFinding>()
-    for (const f of highFindings) {
+    for (const f of approvableFindings) {
       if (f.cwe && !byCwe.has(f.cwe)) byCwe.set(f.cwe, f)
     }
     return Array.from(byCwe.values())
-  }, [highFindings])
+  }, [approvableFindings])
 
   const reasonValid = reason.trim().length > 0
-  const allSelected = highCweItems.length > 0 && highCweItems.every((f) => selectedCwes.has(f.cwe!))
+  const allSelected = approvableCweItems.length > 0 && approvableCweItems.every((f) => selectedCwes.has(f.cwe!))
 
   function toggleCwe(cwe: string, checked: boolean | 'indeterminate') {
     setSelectedCwes((prev) => {
@@ -236,10 +236,10 @@ export function ApprovalPage() {
           {headerBlock}
           <Card className="border-[#DC2626] bg-[#7F1D1D]/30 p-6">
             <p className="flex items-center gap-2 text-[16px] font-semibold text-[#FCA5A5]">
-              <Ban className="h-5 w-5" /> Critical 차단 — 승인 불가
+              <Ban className="h-5 w-5" /> 즉시 차단 — 승인 불가
             </p>
             <p className="mt-2 text-[13px] text-[#FECACA]">
-              Critical은 예외 없이 차단됩니다. 코드 수정 후 새 커밋으로 재실행하세요.
+              Critical 1건 이상 또는 High 2건 이상은 예외 없이 차단됩니다. 코드 수정 후 새 커밋으로 재실행하세요.
             </p>
           </Card>
         </section>
@@ -281,7 +281,7 @@ export function ApprovalPage() {
             ) : null}
             {commitShort ? (
               <p className="mt-2 text-[12px] text-[#A7F3D0]">
-                이 승인은 커밋 {commitShort}에만 유효합니다. 새 커밋에 같은 High가 있으면 다시 승인이
+                이 승인은 커밋 {commitShort}에만 유효합니다. 새 커밋에 같은 High/Medium 취약점이 있으면 다시 승인이
                 필요합니다.
               </p>
             ) : null}
@@ -349,10 +349,10 @@ export function ApprovalPage() {
       <section className="w-full space-y-4">
         {headerBlock}
 
-        {/* C-1: blocking reasons + High items + request creation */}
+        {/* C-1: blocking reasons + High/Medium items + request creation */}
         <Card className="border-[#EA580C] bg-[#7C2D12]/20 p-4">
           <p className="flex items-center gap-2 text-[15px] font-semibold text-[#FDBA74]">
-            <ShieldAlert className="h-4.5 w-4.5" /> 승인 필요 — 차단을 유발한 High 항목
+            <ShieldAlert className="h-4.5 w-4.5" /> 승인 필요 — 차단을 유발한 High/Medium 항목
           </p>
 
           {(vd?.blockReasons ?? []).length > 0 ? (
@@ -364,12 +364,12 @@ export function ApprovalPage() {
           ) : null}
 
           <div className="mt-3 space-y-2">
-            {highCweItems.length === 0 ? (
+            {approvableCweItems.length === 0 ? (
               <p className="text-[12px] text-[#9CA3AF]">
-                차단을 유발한 High 항목 정보를 불러오지 못했습니다.
+                차단을 유발한 High/Medium 항목 정보를 불러오지 못했습니다.
               </p>
             ) : (
-              highCweItems.map((f) => (
+              approvableCweItems.map((f) => (
                 <div
                   key={f.cwe}
                   className="flex items-center justify-between rounded-md border border-[#404040] bg-[#1E1E1E] px-3 py-2 text-[12px]"
@@ -404,12 +404,12 @@ export function ApprovalPage() {
             승인은 보안책임자·팀리드 권한이 필요합니다. 개발자 본인은 승인할 수 없습니다.
           </p>
 
-          {/* C-3: blocking High CWEs as checkboxes — Critical은 노출 안 함 */}
-          {highCweItems.length > 0 ? (
+          {/* C-3: blocking High/Medium CWEs as checkboxes — Critical은 노출 안 함 */}
+          {approvableCweItems.length > 0 ? (
             <div className="mt-3 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
               <p className="text-[12px] font-semibold text-[#D1D5DB]">수용할 항목 선택 (부분 승인)</p>
               <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                {highCweItems.map((f) => (
+                {approvableCweItems.map((f) => (
                   <label
                     key={f.cwe}
                     htmlFor={`ack-${f.cwe}`}
@@ -431,7 +431,7 @@ export function ApprovalPage() {
                 ))}
               </div>
               <p className="mt-2 text-[11px] text-[#6B7280]">
-                선택한 항목만 수용됩니다. 나머지 High는 여전히 차단되어 다시 승인이 필요할 수 있습니다.
+                선택한 항목만 수용됩니다. 나머지 High/Medium 항목은 여전히 차단되어 다시 승인이 필요할 수 있습니다.
               </p>
             </div>
           ) : null}
