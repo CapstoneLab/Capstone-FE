@@ -30,3 +30,15 @@ describe('parseGateMessage', () => {
     expect(parseGateMessage('npm test exited with code 1')).toBeNull()
   })
 })
+
+describe('approval-pending gate step (sample_java6)', () => {
+  it('reads the verdict and counts the progress page uses to offer approval', () => {
+    const summary = parseGateMessage(
+      'verdict=BLOCK_PENDING_APPROVAL 95.0/100 (전체 검사 기준) env=production critical=0 high=1 medium=0 low=0 ' +
+        'risk=P1 policy=1.4.0 | blocked: Insecure Deserialization (CWE-502, High) 검출 — 승인 필요 정책 | ' +
+        'approval required exit code: 1 [security_gate.log] [2026-11-16 00:01:42] [step_exit_code] 1',
+    )
+    expect(summary?.verdict).toBe('block_pending_approval')
+    expect(summary?.counts).toEqual({ critical: 0, high: 1, medium: 0, low: 0 })
+  })
+})

@@ -13,10 +13,9 @@ import { Input } from '@/components/ui/input'
 import { useAuth } from '@/contexts/AuthContext'
 import {
   ApprovalForbiddenError,
-  approveJob,
+  decideApproval,
   fetchJobDetail,
   fetchPipelineDeployment,
-  rejectJob,
   type JobDetail,
   type SecurityFinding,
   type SecuritySeverity,
@@ -33,6 +32,11 @@ type Props = {
   branch: string
   counts: GateCounts
   findings: SecurityFinding[]
+  /** Gate block reasons, e.g. "Insecure Deserialization (CWE-502, High) 검출".
+   *  Listed when the result carries counts but no findings list. */
+  reasons?: string[]
+  /** The backend gate let the run through and it was already deployed. */
+  deployedWithoutApproval?: boolean
 }
 
 type Outcome =
@@ -55,7 +59,7 @@ const severityColor: Record<SecuritySeverity, string> = {
 const POLL_MS = 5000
 const POLL_LIMIT_MS = 15 * 60 * 1000
 
-export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, branch, counts, findings }: Props) {
+export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, branch, counts, findings, reasons = [], deployedWithoutApproval = false }: Props) {
   const navigate = useNavigate()
   const { token, user } = useAuth()
   const queryClient = useQueryClient()
@@ -79,7 +83,11 @@ export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, bran
 
   const severities = approvalSeverities(counts)
   const items = useMemo(
-    () => findings.filter((f) => f.inScope && severities.includes(f.severity)),
+    () => {
+      const inScope = findings.filter((f) => f.inScope && severities.includes(f.severity))
+      // Scope flags can be missing on some results — fall back to the grade.
+      return inScope.length > 0 ? inScope : findings.filter((f) => severities.includes(f.severity))
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [findings, severities.join(',')],
   )
@@ -94,8 +102,9 @@ export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, bran
     const reason = `[승인자: ${name}] ${comment.trim() || (action === 'approve' ? '검토 후 승인' : '검토 후 거부')}`
     try {
       if (action === 'approve') {
-        const res = await approveJob(token, jobId, reason, undefined, name)
-        if (res.resumed || res.followupJobId === jobId) {
+        // Creates the pending approval first when the backend has none yet.
+        const res = await decideApproval(token, jobId, 'approve', reason, name)
+        if (res.resumed || res.resumeFromStage || res.followupJobId === jobId) {
           // A completed execution snapshot must not close the resumed channel.
           await queryClient.cancelQueries({ queryKey: jobKeys.run(jobId) })
           queryClient.removeQueries({ queryKey: jobKeys.run(jobId) })
@@ -111,13 +120,15 @@ export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, bran
           message: res.message,
         })
       } else {
-        await rejectJob(token, jobId, reason, name)
+        await decideApproval(token, jobId, 'reject', reason, name)
         void invalidateJob(queryClient, jobId)
         setOutcome({ kind: 'rejected' })
       }
     } catch (err) {
       if (err instanceof ApprovalForbiddenError) {
-        setError('승인 권한이 없습니다. 보안책임자·팀리드 권한이 필요하며, 개발자 본인은 승인할 수 없습니다.')
+        // Anyone who signs may approve; a 403 means the server still enforces
+        // a role check that has to be removed on the backend.
+        setError(`서버가 승인을 거부했습니다(403). 서버에 남아 있는 역할 권한 검사가 해제되어야 서명만으로 승인할 수 있습니다.${err.detail ? ` (${err.detail})` : ''}`)
       } else {
         setError(err instanceof Error ? err.message : '승인 처리에 실패했습니다.')
       }
@@ -276,7 +287,14 @@ export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, bran
                 다음 항목{summary ? ` (${summary})` : ''}이 발견되었습니다.
               </p>
               <div className="max-h-56 space-y-1.5 overflow-y-auto rounded-lg border border-[#404040] bg-[#1E1E1E] p-2">
-                {items.length === 0 ? (
+                {items.length === 0 && reasons.length > 0 ? (
+                  reasons.map((reason, index) => (
+                    <p key={index} className="flex items-start gap-2 rounded-md px-2 py-1.5 text-[12px] text-[#E5E7EB]">
+                      <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#F97316]" />
+                      {reason}
+                    </p>
+                  ))
+                ) : items.length === 0 ? (
                   <p className="p-2 text-[12px] text-[#9CA3AF]">
                     항목 상세를 불러오지 못했습니다. 결과 화면의 탐지 목록을 확인하세요.
                   </p>
@@ -306,11 +324,19 @@ export function DeployApprovalDialog({ open, onOpenChange, jobId, repoName, bran
                 )}
               </div>
               <p className="text-[15px] font-semibold text-white">승인하시겠습니까?</p>
-              <p className="text-[12px] text-[#9CA3AF]">승인하면 위 항목을 수용하고 배포를 진행합니다.</p>
+              <p className="text-[11px] text-[#9CA3AF]">이름으로 서명하면 누구나 승인할 수 있습니다. 서명은 감사 로그에 남습니다.</p>
+              {deployedWithoutApproval ? (
+                <p className="rounded-md border border-[#D97706] bg-[#78350F]/30 p-2 text-[12px] text-[#FDE68A]">
+                  서버 보안 게이트가 이 실행을 통과시켜 이미 배포되었습니다. 배포 게이트 정책상 위 항목은 승인이
+                  필요하므로, 승인하면 수용 기록이 남고 거부하면 수정 후 재배포가 필요합니다.
+                </p>
+              ) : (
+                <p className="text-[12px] text-[#9CA3AF]">승인하면 위 항목을 수용하고 배포를 진행합니다.</p>
+              )}
 
               <div>
                 <label htmlFor="approver-name" className="text-[12px] font-semibold text-[#D1D5DB]">
-                  승인자 이름 (필수)
+                  승인자 서명 — 이름 (필수)
                 </label>
                 <Input
                   id="approver-name"

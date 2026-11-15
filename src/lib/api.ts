@@ -65,6 +65,10 @@ function pick<T = unknown>(obj: UnknownRecord, ...keys: string[]): T | undefined
 
 function readableDetail(value: unknown): string {
   if (typeof value === 'string') return value
+  // Structured detail, e.g. the 409 duplicate-run { message, existing_job_id }.
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return pick<string>(value as UnknownRecord, 'message', 'msg', 'error') ?? ''
+  }
   if (!Array.isArray(value)) return ''
   return value
     .map((issue) => {
@@ -421,6 +425,22 @@ export function repoNameFromUrl(url: string): string {
   }
 }
 
+/** Run duration in seconds. A finished run is measured from its own
+ *  started_at/completed_at so it stays fixed — a duration_secs that the
+ *  server derives from "now" keeps growing after the run ends. Live runs use
+ *  the reported value. */
+export function runDurationSecs(
+  status: string | null | undefined,
+  startedAt: string | null,
+  completedAt: string | null,
+  reported: number | null | undefined,
+): number {
+  const fromStamps = durationBetween(startedAt, completedAt)
+  const finished = status === 'success' || status === 'failed' || status === 'cancelled'
+  if (finished && startedAt && completedAt) return fromStamps
+  return typeof reported === 'number' && reported > 0 ? reported : fromStamps
+}
+
 function durationBetween(start: string | null, end: string | null): number {
   if (!start || !end) return 0
   const startMs = Date.parse(start)
@@ -482,11 +502,12 @@ function mapJobDetail(raw: UnknownRecord): JobDetail {
   const totalFindings = pick<number>(verdictRaw, 'total_findings', 'totalFindings') ?? 0
   const startedAt = pick<string>(job, 'started_at', 'startedAt') ?? null
   const completedAt = pick<string>(job, 'completed_at', 'completedAt') ?? null
-  const apiDuration = pick<number>(job, 'duration_secs', 'durationSecs')
-  const durationSecs =
-    typeof apiDuration === 'number' && apiDuration > 0
-      ? apiDuration
-      : durationBetween(startedAt, completedAt)
+  const durationSecs = runDurationSecs(
+    pick<string>(job, 'status'),
+    startedAt,
+    completedAt,
+    pick<number>(job, 'duration_secs', 'durationSecs'),
+  )
   const repoUrl = pick<string>(job, 'repo_url', 'repoUrl') ?? ''
 
   return {
@@ -1297,15 +1318,28 @@ export async function fetchJobResult(
   return mapJobResult((await res.json()) as UnknownRecord)
 }
 
-// Raised when the approval endpoints return 403 — the caller (보안책임자/
-// 팀리드가 아닌 개발자 본인 등) lacks approval rights. The UI surfaces this as
+// Raised when the approval endpoints return 403. Approval is open to anyone
+// who signs with a name; a 403 means the server still applies a role check
+// (backend change requested in docs/approval-signature-handoff.md). The UI surfaces this as
 // a permission notice instead of a generic error (화면 C C-2 / C-5).
 export class ApprovalForbiddenError extends Error {
   readonly status = 403
   readonly detail: string
   constructor(detail: string) {
-    super(detail || '승인 권한이 없습니다. 보안책임자/팀리드 권한이 필요합니다.')
+    super(detail || '서버가 승인을 거부했습니다(403).')
     this.name = 'ApprovalForbiddenError'
+    this.detail = detail
+  }
+}
+
+/** Non-403 failure of an approval endpoint, with the HTTP status kept. */
+export class ApprovalHttpError extends Error {
+  readonly status: number
+  readonly detail: string
+  constructor(status: number, detail: string) {
+    super(detail ? `승인 처리 실패 (${status}): ${detail}` : `승인 처리 실패 (${status})`)
+    this.name = 'ApprovalHttpError'
+    this.status = status
     this.detail = detail
   }
 }
@@ -1347,9 +1381,7 @@ async function postApproval(
     }
     console.error(`[api] /approval/${action} failed:`, res.status, text)
     if (res.status === 403) throw new ApprovalForbiddenError(detail)
-    throw new Error(
-      detail ? `승인 처리 실패 (${res.status}): ${detail}` : `승인 처리 실패 (${res.status})`,
-    )
+    throw new ApprovalHttpError(res.status, detail)
   }
 
   const data = (await res.json().catch(() => ({}))) as UnknownRecord
@@ -1386,6 +1418,36 @@ export function approveJob(
   if (approvedCwes && approvedCwes.length > 0) body.approved_cwes = approvedCwes
   if (approverName) body.approver_name = approverName
   return postApproval(token, jobId, 'approve', body)
+}
+
+/**
+ * Approve or reject in one step. The backend only accepts a decision on an
+ * existing pending approval ("404 Pending approval not found" otherwise), so
+ * when there is none yet this creates the request first and retries once.
+ * An already-existing request (409) is fine.
+ */
+export async function decideApproval(
+  token: string,
+  jobId: string,
+  decision: 'approve' | 'reject',
+  reason: string,
+  approverName: string,
+): Promise<ApprovalResponse> {
+  const send = () =>
+    decision === 'approve'
+      ? approveJob(token, jobId, reason, undefined, approverName)
+      : rejectJob(token, jobId, reason, approverName)
+  try {
+    return await send()
+  } catch (error) {
+    if (!(error instanceof ApprovalHttpError) || error.status !== 404) throw error
+  }
+  try {
+    await requestApproval(token, jobId, reason)
+  } catch (error) {
+    if (!(error instanceof ApprovalHttpError) || error.status !== 409) throw error
+  }
+  return send()
 }
 
 // C-2: reject — 수용 불가, 즉시 수정 필요.
@@ -1591,6 +1653,17 @@ export type StartPipelineResponse = {
   message: string
 }
 
+/** Running job id from a 409 duplicate-run response. The backend nests it as
+ *  `{ detail: { existing_job_id } }`; older builds put it at the top level. */
+export function conflictExistingJobId(payload: UnknownRecord | null): string | null {
+  if (!payload) return null
+  const keys = ['existing_job_id', 'existingJobId', 'job_id', 'jobId'] as const
+  const nested = pick<UnknownRecord>(payload, 'detail')
+  const fromDetail =
+    nested && typeof nested === 'object' && !Array.isArray(nested) ? pick<string>(nested, ...keys) : undefined
+  return fromDetail ?? pick<string>(payload, ...keys) ?? null
+}
+
 export async function startPipeline(
   token: string,
   payload: StartPipelinePayload,
@@ -1630,11 +1703,7 @@ export async function startPipeline(
       detail = text
     }
     if (res.status === 409) {
-      const existingJobId =
-        (parsed
-          ? pick<string>(parsed, 'existing_job_id', 'existingJobId', 'job_id', 'jobId')
-          : undefined) ?? null
-      throw new PipelineConflictError(detail, existingJobId)
+      throw new PipelineConflictError(detail, conflictExistingJobId(parsed))
     }
     throw new Error(
       detail
@@ -1703,7 +1772,12 @@ function mapPipelineHistoryItem(raw: UnknownRecord): PipelineHistoryItem {
   const completedSteps = pick<number>(raw, 'completed_steps', 'completedSteps') ?? 0
   const totalSteps = pick<number>(raw, 'total_steps', 'totalSteps') ?? 0
   const progressPercent = pick<number>(raw, 'progress_percent', 'progressPercent')
-  const durationSecs = pick<number>(raw, 'duration_secs', 'durationSecs') ?? 0
+  const durationSecs = runDurationSecs(
+    status,
+    pick<string>(raw, 'started_at', 'startedAt') ?? null,
+    pick<string>(raw, 'completed_at', 'completedAt') ?? null,
+    pick<number>(raw, 'duration_secs', 'durationSecs'),
+  )
   const selectedItems = pick<unknown[]>(raw, 'selected_items', 'selectedItems') ?? []
 
   return {

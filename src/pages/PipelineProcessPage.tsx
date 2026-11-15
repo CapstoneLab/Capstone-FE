@@ -51,8 +51,18 @@ import { useServerNow } from '@/hooks/useServerNow'
 import { executionTiming } from '@/lib/executionTiming'
 import { usePipelineExecution, type ConnectionState } from '@/hooks/usePipelineExecution'
 import { useQueryClient } from '@tanstack/react-query'
-import { prefetchJobResult } from '@/hooks/useJobQueries'
-import { isWebhookTrigger, setRepoDomainUrl, setRepoPipelineInfo } from '@/lib/api'
+import { prefetchJobResult, useJobResultQuery } from '@/hooks/useJobQueries'
+import { DeployApprovalDialog } from '@/components/DeployApprovalDialog'
+import { parseGateMessage } from '@/lib/gateMessage'
+import type { SecuritySeverity, VerdictKind } from '@/lib/api'
+import { getStartTiming, startTimingDurations } from '@/lib/startTiming'
+import { getPendingStart } from '@/lib/pendingStart'
+
+function formatMs(ms: number | undefined): string {
+  if (ms === undefined) return '-'
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`
+}
+import { isWebhookTrigger, PipelineConflictError, setRepoDomainUrl, setRepoPipelineInfo } from '@/lib/api'
 import {
   LOG_LEVELS,
   PIPELINE_STAGES,
@@ -77,6 +87,8 @@ import {
 
 type LocationState = {
   jobId?: string
+  /** Start request still in flight (see lib/pendingStart). */
+  pendingStartId?: string
   repoName?: string
   branch?: string
   commitSha?: string
@@ -154,6 +166,17 @@ function toMs(value: string | null): number | null {
   if (!value) return null
   const ms = Date.parse(value)
   return Number.isNaN(ms) ? null : ms
+}
+
+/** Re-renders every second while `active`, for live elapsed timers. */
+function useNow(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!active) return
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [active])
+  return now
 }
 
 function StageStatusIcon({ status, animate, className = 'h-6 w-6' }: {
@@ -240,9 +263,123 @@ function LogLines({ entries, emptyText, showStage, labels }: {
 export function PipelineProcessPage() {
   const { state } = useLocation()
   const locationState = (state ?? {}) as LocationState
+  // Opened straight from the "파이프라인 실행" click: the start request is
+  // still in flight. Show that, then attach to the execution once it has an id.
+  if (!locationState.jobId && locationState.pendingStartId) {
+    return <PendingStartView key={locationState.pendingStartId} locationState={locationState} />
+  }
   // Remount per execution so live state, timers and sockets never leak
   // from one execution into another.
   return <PipelineExecutionView key={locationState.jobId ?? ''} locationState={locationState} />
+}
+
+type PendingOutcome =
+  | { kind: 'waiting' }
+  | { kind: 'conflict'; existingJobId: string | null }
+  | { kind: 'error'; message: string }
+
+function PendingStartView({ locationState }: { locationState: LocationState }) {
+  const navigate = useNavigate()
+  const { t } = useLanguage()
+  const request = getPendingStart(locationState.pendingStartId)
+  const [outcome, setOutcome] = useState<PendingOutcome>(() =>
+    request ? { kind: 'waiting' } : { kind: 'error', message: t('run.pending.lost') },
+  )
+  const [startedAt] = useState(() => Date.now())
+  const now = useNow(outcome.kind === 'waiting')
+
+  useEffect(() => {
+    if (!request) return
+    let cancelled = false
+    request
+      .then(({ jobId }) => {
+        if (cancelled) return
+        if (!jobId) {
+          setOutcome({ kind: 'error', message: t('pipelineNew.serverNoJobId') })
+          return
+        }
+        // Replace this entry: Back still returns to the new-pipeline page.
+        navigate('/pipeline/progress', {
+          replace: true,
+          state: { jobId, repoName: locationState.repoName, branch: locationState.branch },
+        })
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return
+        if (error instanceof PipelineConflictError) {
+          setOutcome({ kind: 'conflict', existingJobId: error.existingJobId })
+        } else {
+          setOutcome({
+            kind: 'error',
+            message: error instanceof Error ? error.message : t('pipelineNew.startFailed'),
+          })
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [request, navigate, locationState.repoName, locationState.branch, t])
+
+  const target = [locationState.repoName, locationState.branch].filter(Boolean).join(' · ')
+  const openExisting = (jobId: string) =>
+    navigate('/pipeline/progress', {
+      replace: true,
+      state: { jobId, repoName: locationState.repoName, branch: locationState.branch },
+    })
+
+  return (
+    <MainLayout>
+      <section className="w-full space-y-4">
+        <Card className="border-[#404040] bg-[#262626] p-6">
+          {outcome.kind === 'waiting' ? (
+            <div className="flex items-center gap-3">
+              <Loader2 className="h-5 w-5 animate-spin text-[#34D399]" />
+              <div>
+                <p className="text-[16px] font-semibold text-white">{t('run.pending.title')}</p>
+                <p className="mt-1 text-[13px] text-[#9CA3AF]">
+                  {target ? `${target} · ` : ''}
+                  {t('run.pending.elapsed', { secs: Math.max(0, Math.floor((now - startedAt) / 1000)) })}
+                </p>
+              </div>
+            </div>
+          ) : outcome.kind === 'conflict' ? (
+            <div>
+              <p className="text-[16px] font-semibold text-[#FDBA74]">{t('pipelineNew.conflictTitle')}</p>
+              <p className="mt-1 text-[13px] text-[#D1D5DB]">
+                {t('pipelineNew.conflictDescription', {
+                  repo: locationState.repoName || t('pipelineNew.thisRepo'),
+                  branch: locationState.branch ? ` (${locationState.branch})` : '',
+                })}
+              </p>
+              <div className="mt-4 flex flex-wrap justify-end gap-2">
+                <Button variant="outline" onClick={() => navigate('/pipeline/new', { replace: true })}>
+                  {t('run.pending.back')}
+                </Button>
+                <Button
+                  disabled={!outcome.existingJobId}
+                  onClick={() => outcome.existingJobId && openExisting(outcome.existingJobId)}
+                  className="bg-[#34D399] text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
+                >
+                  {t('pipelineNew.openExisting')}
+                </Button>
+              </div>
+              {!outcome.existingJobId ? (
+                <p className="mt-2 text-right text-[12px] text-[#FCA5A5]">{t('pipelineNew.missingJobId')}</p>
+              ) : null}
+            </div>
+          ) : (
+            <div>
+              <p className="text-[16px] font-semibold text-[#FCA5A5]">{t('pipelineNew.startFailed')}</p>
+              <p className="mt-1 break-words text-[13px] text-[#D1D5DB]">{outcome.message}</p>
+              <div className="mt-4 flex justify-end">
+                <Button onClick={() => navigate('/pipeline/new', { replace: true })}>{t('run.pending.back')}</Button>
+              </div>
+            </div>
+          )}
+        </Card>
+      </section>
+    </MainLayout>
+  )
 }
 
 function PipelineExecutionView({ locationState }: { locationState: LocationState }) {
@@ -288,6 +425,11 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
   const serverNow = useServerNow(executionTiming(job, null).ticking)
   const now = serverNow ?? 0
   const timing = executionTiming(job, serverNow)
+  // Activity timestamps ("마지막 로그 N초 전") are this PC's receive times.
+  const localNow = useNow(timing.ticking)
+  // Re-read each render (cheap): phases are recorded by the execution hook.
+  const timingEntry = jobId ? getStartTiming(jobId) : null
+  const startTiming = timingEntry ? startTimingDurations(timingEntry) : null
 
   // Once the run finishes, fetch its result in the background so "보안 결과"
   // opens instantly from the query cache.
@@ -463,6 +605,65 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
     })
   }
 
+  // ── Deployment approval on this page ───────────────────────────────────
+  // The server decides whether this run can be approved
+  // (result.approval_eligible): only a run stopped at the gate pending
+  // approval, never one that was already deployed. This page offers it right
+  // where the run stopped. The gate step text / counts only explain why.
+  const gateSummary =
+    failedStage && failedStage.key === 'gate' ? parseGateMessage(failedStage.errorMessage) : null
+  const gateCounts: Record<SecuritySeverity, number> | null = gateSummary?.counts ?? null
+  const reportedGateVerdict: VerdictKind | null = (() => {
+    const v = gateSummary?.verdict ?? ''
+    if (v.includes('pending') || v.includes('approval')) return 'block_pending_approval'
+    if (v === 'block' || v === 'blocked') return 'block'
+    if (v === 'warn' || v === 'warning') return 'warn'
+    if (v === 'pass' || v === 'passed') return 'pass'
+    return null
+  })()
+
+  // Scan result of the finished run (cached; prefetched when the run ended).
+  const runResult = useJobResultQuery(token, isTerminal ? jobId : '')
+  const runVd = runResult.data?.verdictDetail ?? null
+  const resultCounts: Record<SecuritySeverity, number> | null = useMemo(() => {
+    const data = runResult.data
+    if (!data) return null
+    const sum = (c: Record<SecuritySeverity, number>) => c.critical + c.high + c.medium + c.low
+    if (data.verdictDetail?.counts && sum(data.verdictDetail.counts) > 0) return data.verdictDetail.counts
+    return data.findings
+      .filter((f) => f.inScope)
+      .reduce<Record<SecuritySeverity, number>>(
+        (acc, f) => {
+          acc[f.severity] += 1
+          return acc
+        },
+        { critical: 0, high: 0, medium: 0, low: 0 },
+      )
+  }, [runResult.data])
+  const alreadyApproved = (runVd?.acknowledgedCwes.length ?? 0) > 0
+  const pendingVerdict =
+    runVd?.verdict === 'block_pending_approval' || reportedGateVerdict === 'block_pending_approval'
+  const awaitingApproval =
+    isTerminal && !alreadyApproved && pendingVerdict && runResult.data?.approvalEligible === true
+  // Shown when the server says this run cannot be approved (e.g. already deployed).
+  const approvalBlockedReason =
+    isTerminal && pendingVerdict && runResult.data && runResult.data.approvalEligible !== true
+      ? runResult.data.approvalReason
+      : null
+
+  const [approvalOpen, setApprovalOpen] = useState(false)
+  // Open the approval dialog right here, once, when this run needs approval —
+  // this page is where approval belongs, not the result page.
+  const [approvalAutoOpened, setApprovalAutoOpened] = useState(false)
+  if (awaitingApproval && !approvalAutoOpened) {
+    setApprovalAutoOpened(true)
+    setApprovalOpen(true)
+  }
+  const approvalFindings = runResult.data?.findings ?? []
+  const approvalCounts: Record<SecuritySeverity, number> =
+    gateCounts ?? resultCounts ?? { critical: 0, high: 0, medium: 0, low: 0 }
+  const approvalReasons = gateSummary?.reasons.length ? gateSummary.reasons : runVd?.blockReasons ?? []
+
   if (!jobId) {
     return (
       <MainLayout>
@@ -476,8 +677,15 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
 
   const connectionStyle = CONNECTION_STYLE[connection]
   const deployStage = stages[7]
+
   const headlineLabel = t(`run.headline.${tone}.label`)
-  const headlineMessage = t(`run.headline.${tone}.message`)
+  // A successful run that skipped stages (e.g. no tests) must not claim that
+  // every check passed: "파이프라인 완료 · 건너뜀 N개".
+  const skippedOnSuccess = jobStatus === 'success' ? progress.skipped : 0
+  const headlineMessage =
+    skippedOnSuccess > 0
+      ? t('run.summary.successWithSkipped', { count: skippedOnSuccess })
+      : t(`run.headline.${tone}.message`)
 
   return (
     <MainLayout pipelineElapsed={totalElapsed === null ? undefined : labels.duration(totalElapsed)}>
@@ -562,10 +770,14 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
               <div>
                 <p className="text-[20px] font-bold" style={{ color: toneColor }}>
                   {jobStatus === 'success'
-                    ? (progress.skipped > 0 ? t('run.summary.successWithSkipped') : t('run.summary.success'))
-                    : jobStatus === 'failed'
-                      ? t('run.summary.failed')
-                      : t('run.summary.cancelled')}
+                    ? (skippedOnSuccess > 0
+                      ? t('run.summary.successWithSkipped', { count: skippedOnSuccess })
+                      : t('run.summary.success'))
+                    : awaitingApproval
+                      ? t('run.summary.awaitingApproval')
+                      : jobStatus === 'failed'
+                        ? t('run.summary.failed')
+                        : t('run.summary.cancelled')}
                 </p>
                 <p className="mt-1 text-[13px] text-[#A1A1A1]">
                   {t('run.stagesCompleted', { completed: progress.completed, total: progress.total })}
@@ -588,12 +800,44 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
                     {failedStage.errorMessage ? ` — ${failedStage.errorMessage}` : ''}
                   </p>
                 ) : null}
+                {approvalBlockedReason ? (
+                  <p className="mt-2 text-[12px] text-[#FDBA74]">
+                    {t('run.approval.notEligible', { reason: approvalBlockedReason })}
+                  </p>
+                ) : null}
+                {awaitingApproval ? (
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#EA580C] bg-[#7C2D12]/30 p-3">
+                    <div>
+                      <p className="flex items-center gap-2 text-[14px] font-semibold text-[#FDBA74]">
+                        <ShieldAlert className="h-4 w-4" />{' '}
+                        {t('run.approval.title')}
+                      </p>
+                      <p className="mt-1 text-[12px] text-[#FED7AA]">
+                        {t('run.approval.description', {
+                          items: (['high', 'medium'] as const)
+                            .filter((sev) => approvalCounts[sev] > 0)
+                            .map((sev) => `${sev === 'high' ? 'High' : 'Medium'} ${approvalCounts[sev]}`)
+                            .join(', ') || '-',
+                        })}
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      onClick={() => setApprovalOpen(true)}
+                      className="h-9 shrink-0 bg-[#EA580C] px-4 text-[13px] font-semibold text-white shadow-none hover:bg-[#C2410C]"
+                    >
+                      <ShieldCheck className="mr-1.5 h-4 w-4" /> {t('run.approval.request')}
+                    </Button>
+                  </div>
+                ) : null}
                 <p className="mt-2 text-[13px] text-[#A1A1A1]">
                   {t('run.deployment')}:{' '}
                   {deployUrl ? (
                     <a href={deployUrl} target="_blank" rel="noopener noreferrer" className="text-[#93C5FD] hover:underline">
                       {deployUrl}
                     </a>
+                  ) : awaitingApproval ? (
+                    t('run.approval.deployWaiting')
                   ) : (
                     labels.status(deployStage.status)
                   )}
@@ -734,6 +978,21 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
               logs={logsByStage.get(stage.index) ?? []}
               labels={labels}
               onShowInFullLog={() => showStageLogs(stage.index)}
+              action={
+                // The security gate stopped here pending approval: review it in place.
+                stage.key === 'gate' && awaitingApproval ? (
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-[#EA580C] bg-[#7C2D12]/30 p-2.5">
+                    <p className="text-[12px] text-[#FED7AA]">{t('run.approval.stageHint')}</p>
+                    <Button
+                      type="button"
+                      onClick={() => setApprovalOpen(true)}
+                      className="h-8 shrink-0 bg-[#EA580C] px-3 text-[12px] font-semibold text-white shadow-none hover:bg-[#C2410C]"
+                    >
+                      <ShieldCheck className="mr-1.5 h-3.5 w-3.5" /> {t('run.approval.review')}
+                    </Button>
+                  </div>
+                ) : null
+              }
             />
           ))}
         </Accordion>
@@ -768,20 +1027,20 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
                     {t('run.activity.lastLog')}:{' '}
                     {activity.lastLogAt === null
                       ? t('run.activity.none')
-                      : t('run.activity.secondsAgo', { secs: Math.max(0, Math.floor((now - activity.lastLogAt) / 1000)) })}
+                      : t('run.activity.secondsAgo', { secs: Math.max(0, Math.floor((localNow - activity.lastLogAt) / 1000)) })}
                   </span>
                   <span>
                     {t('run.activity.engine')}:{' '}
                     {activity.lastEngineAt === null
                       ? t('run.activity.checking')
-                      : t('run.activity.secondsAgo', { secs: Math.max(0, Math.floor((now - activity.lastEngineAt) / 1000)) })}
-                    {activity.lastEngineAt !== null && now - activity.lastEngineAt > 30_000 ? (
+                      : t('run.activity.secondsAgo', { secs: Math.max(0, Math.floor((localNow - activity.lastEngineAt) / 1000)) })}
+                    {activity.lastEngineAt !== null && localNow - activity.lastEngineAt > 30_000 ? (
                       <span className="text-[#FBBF24]"> · {t('run.activity.delayed')}</span>
                     ) : null}
                   </span>
                   {activity.lastEngineAt !== null &&
-                  now - activity.lastEngineAt <= 30_000 &&
-                  (activity.lastLogAt === null || now - activity.lastLogAt > 10_000) ? (
+                  localNow - activity.lastEngineAt <= 30_000 &&
+                  (activity.lastLogAt === null || localNow - activity.lastLogAt > 10_000) ? (
                     <span>{t('run.activity.waitingOutput')}</span>
                   ) : null}
                 </div>
@@ -888,6 +1147,15 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
           </p>
         ) : null}
 
+        {startTiming ? (
+          // Start latency for runs launched from this device (click → API →
+          // screen → first stage), so it can be measured in the installed app.
+          <p className="text-right text-[11px] text-[#6B7280]" data-testid="start-timing">
+            {t('run.timing.label')}: {t('run.timing.api')} {formatMs(startTiming.apiResponse)} · {t('run.timing.screen')}{' '}
+            {formatMs(startTiming.screenShown)} · {t('run.timing.firstStage')} {formatMs(startTiming.firstStage)}
+          </p>
+        ) : null}
+
         <div className="flex flex-wrap justify-end gap-2 pt-1">
           {deployUrl ? (
             <Button asChild variant="outline" className="shadow-none">
@@ -954,17 +1222,31 @@ function PipelineExecutionView({ locationState }: { locationState: LocationState
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      {awaitingApproval ? (
+        <DeployApprovalDialog
+          open={approvalOpen}
+          onOpenChange={setApprovalOpen}
+          jobId={jobId}
+          repoName={repoName}
+          branch={branch}
+          counts={approvalCounts}
+          findings={approvalFindings}
+          reasons={approvalReasons}
+        />
+      ) : null}
     </MainLayout>
   )
 }
 
-function StageCard({ stage, isCurrent, duration, logs, labels, onShowInFullLog }: {
+function StageCard({ stage, isCurrent, duration, logs, labels, onShowInFullLog, action }: {
   stage: StageView
   isCurrent: boolean
   duration: number | null
   logs: ResolvedLogEntry[]
   labels: Labels
   onShowInFullLog: () => void
+  /** Shown right under the error details (e.g. the gate's approval button). */
+  action?: ReactNode
 }) {
   const { t } = labels
   const Icon = STAGE_ICONS[stage.index]
@@ -1034,6 +1316,7 @@ function StageCard({ stage, isCurrent, duration, logs, labels, onShowInFullLog }
             </p>
           </div>
         ) : null}
+        {action}
         <div className="max-h-72 overflow-y-auto rounded-md border border-[#404040] bg-[#1E1E1E] p-3">
           <LogLines
             entries={logs}

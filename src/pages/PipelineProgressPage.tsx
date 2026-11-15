@@ -34,7 +34,7 @@ import {
   type SecuritySeverity,
   type VerdictKind,
 } from '@/lib/api'
-import { securityCheckCatalog } from '@/data/securityCatalog'
+import { useSecurityCatalog } from '@/hooks/useSecurityCatalog'
 import { ResultDownloadDialog } from '@/components/ResultDownloadDialog'
 import type { ReportData } from '@/lib/reportExport'
 import { localizeFinding } from '@/lib/findingI18n'
@@ -234,6 +234,8 @@ function shortSummary(text: string): string {
 export function PipelineProgressPage() {
   const navigate = useNavigate()
   const { token } = useAuth()
+  // Server catalog (same source as the new-pipeline screen) — not the bundled list.
+  const { items: securityCheckCatalog } = useSecurityCatalog(token)
   const { resolvedTheme } = useTheme()
   const { t, locale } = useLanguage()
   const { state } = useLocation()
@@ -265,7 +267,6 @@ export function PipelineProgressPage() {
         ? detailQuery.error.message
         : t('result.loadFailed')
       : null
-  const [approvalAutoOpened, setApprovalAutoOpened] = useState(false)
   // Which copy affordance most recently succeeded — keyed by `${id}:code|ai`,
   // shown as "복사됨" briefly.
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
@@ -364,16 +365,8 @@ export function PipelineProgressPage() {
   const effectiveVerdict: VerdictKind | null =
     backendVerdict ?? (hasScanData || !isResultPending ? gateRule.verdict : null)
 
-  // Pop the approval dialog once when the run lands on "승인 필요" and nothing
-  // has been accepted yet (acknowledged CWEs mean it was already approved).
-  if (
-    !approvalAutoOpened &&
-    effectiveVerdict === 'block_pending_approval' && result?.approvalEligible === true &&
-    (vd?.acknowledgedCwes.length ?? 0) === 0
-  ) {
-    setApprovalAutoOpened(true)
-    setApprovalOpen(true)
-  }
+  // No auto-popup here: the approval request lives on the pipeline page where
+  // the run stopped at the gate. This page only offers the "승인 검토" button.
   const verdictCfg = effectiveVerdict ? VERDICT_CONFIG[effectiveVerdict] : null
   const verdictLabel = effectiveVerdict ? t(`result.verdict.${effectiveVerdict}.label`) : ''
   const verdictMessage = effectiveVerdict ? t(`result.verdict.${effectiveVerdict}.message`) : ''
@@ -1161,7 +1154,8 @@ export function PipelineProgressPage() {
         repoName={repoName}
         branch={branch}
         counts={counts}
-        findings={inScopeFindings}
+        findings={allFindings}
+        reasons={vd?.blockReasons ?? []}
       />
     </MainLayout>
   )

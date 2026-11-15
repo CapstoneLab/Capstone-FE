@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { getCachedExecution, mergeJobWithSteps, saveExecution } from '@/hooks/useJobQueries'
+import { markStartPhase } from '@/lib/startTiming'
 import {
   cancelPipeline,
   fetchJobDetail,
@@ -9,11 +10,13 @@ import {
   fetchPipelineSteps,
   type JobDetail,
   type JobStep,
+  type PipelineStepsResponse,
 } from '@/lib/api'
 import { applyJobEvent, preserveTerminal } from '@/lib/executionTiming'
 import { WS_API_BASE_URL } from '@/lib/config'
 import {
   appendLogEvents,
+  foldClockSample,
   isTerminalJobStatus,
   mergeLogSnapshot,
   stageIndexForStep,
@@ -108,7 +111,7 @@ const EVENT_JOB_STATUS: Record<string, JobDetail['status']> = {
   pipeline_canceled: 'cancelled',
 }
 
-function applyStepPatch(steps: JobStep[], patch: Partial<JobStep>): JobStep[] {
+export function applyStepPatch(steps: JobStep[], patch: Partial<JobStep>): JobStep[] {
   const patchStage = stageIndexForStep({
     stepType: patch.stepType ?? '',
     stepName: patch.stepName ?? '',
@@ -119,8 +122,12 @@ function applyStepPatch(steps: JobStep[], patch: Partial<JobStep>): JobStep[] {
       (patchStage !== null && stageIndexForStep(step) === patchStage),
   )
   if (index >= 0) {
+    const current = steps[index]
+    // A replayed "started" event must not reopen a finished stage.
+    const regresses =
+      TERMINAL_STEP.has(current.status) && !!patch.status && !TERMINAL_STEP.has(patch.status)
     const next = steps.slice()
-    next[index] = { ...steps[index], ...patch }
+    next[index] = regresses ? { ...current, ...patch, status: current.status } : { ...current, ...patch }
     return next
   }
   return [
@@ -151,6 +158,15 @@ function streamEventsFrom(message: UnknownRecord): StreamLogEvent[] {
     }))
 }
 
+const TERMINAL_STEP = new Set<JobStep['status']>(['success', 'failed', 'skipped', 'cancelled'])
+
+/** A finished run never goes back to running: late polls, replayed events
+ *  and reconnect snapshots can all carry an older, non-terminal status. */
+export function keepTerminal(previous: JobDetail | null, next: JobDetail): JobDetail {
+  if (!previous || !isTerminalJobStatus(previous.status) || isTerminalJobStatus(next.status)) return next
+  return { ...next, status: previous.status, completedAt: next.completedAt ?? previous.completedAt }
+}
+
 /** A stage event that carries the complete persisted step needs no REST refresh. */
 function isCompleteStep(patch: Partial<JobStep> | null): boolean {
   return !!patch?.stepId && !!patch.stepName && !!patch.stepType && !!patch.status
@@ -168,7 +184,7 @@ function eventSeq(message: UnknownRecord): number | null {
   return num(message, 'seq', 'sequence', 'event_id', 'offset') ?? null
 }
 
-/** Liveness signals for a running execution (epoch ms, null = not seen yet). */
+/** Liveness signals for a running execution (this PC's epoch ms, null = not seen yet). */
 export type ExecutionActivity = {
   /** When the last log line arrived. */
   lastLogAt: number | null
@@ -180,6 +196,9 @@ export type PipelineExecution = {
   job: JobDetail | null
   logs: LogEntry[]
   activity: ExecutionActivity
+  /** Estimated serverClock − thisPC'sClock in ms (0 until estimated). Add it
+   *  to Date.now() before comparing against server timestamps. */
+  clockOffsetMs: number
   connection: ConnectionState
   /** Non-null when the status could not be loaded; raw detail for diagnostics. */
   error: string | null
@@ -204,6 +223,34 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
   const [error, setError] = useState<string | null>(null)
   const [deployUrl, setDeployUrl] = useState<string | null>(cached?.deployUrl ?? null)
   const [activity, setActivity] = useState<ExecutionActivity>({ lastLogAt: null, lastEngineAt: null })
+
+  // Server clock estimate (see foldClockSample). Only re-render on a change
+  // that is visible on a seconds display.
+  const clockOffsetRef = useRef<number | null>(null)
+  const [clockOffsetMs, setClockOffsetMs] = useState(0)
+  const noteServerClock = useCallback((serverMs: number | null, receivedMs = Date.now()) => {
+    const next = foldClockSample(clockOffsetRef.current, serverMs, receivedMs)
+    if (next === null || next === clockOffsetRef.current) return
+    clockOffsetRef.current = next
+    setClockOffsetMs((previous) => (Math.abs(previous - next) >= 250 ? next : previous))
+  }, [])
+  /** Server timestamp → this PC's clock (never in the future). */
+  const toLocal = useCallback(
+    (serverMs: number | null) =>
+      serverMs === null ? null : Math.min(Date.now(), serverMs - (clockOffsetRef.current ?? 0)),
+    [],
+  )
+
+  // Live log lines carry the server's own timestamps — the main clock source.
+  const sampledLogsRef = useRef(0)
+  useEffect(() => {
+    if (logs.length < sampledLogsRef.current) sampledLogsRef.current = 0
+    for (let i = sampledLogsRef.current; i < logs.length; i += 1) {
+      const entry = logs[i]
+      if (entry.live) noteServerClock(entry.timestampMs, entry.receivedAtMs)
+    }
+    sampledLogsRef.current = logs.length
+  }, [logs, noteServerClock])
 
   // Timestamps only move forward (replays and REST snapshots can be older).
   const noteActivity = useCallback((kind: keyof ExecutionActivity, at: number | null) => {
@@ -252,47 +299,60 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
     }
 
     const sync = async () => {
-      const [detail, steps, lines] = await Promise.allSettled([
-        fetchJobDetail(token, jobId).then(detail => {
-          // Render the first server state without waiting for the log snapshot.
-          if (!disposed && detail) setJob(previous => previous ?? detail)
-          return detail
-        }),
-        fetchPipelineSteps(token, jobId),
-        fetchPipelineLogs(token, jobId),
-      ])
-      if (disposed) return
+      // The three requests are applied as each one lands rather than after
+      // all of them: the first paint only needs the job detail, and a slow
+      // log endpoint must not hold the whole screen back.
+      let detailJob: JobDetail | null = null
+      let stepsResponse: PipelineStepsResponse | null = null
+      const firstSync = syncCount === 0
+      const applyJob = () => {
+        if (disposed) return
+        // A terminal job detail wins over a lagging "running" steps summary.
+        const status =
+          detailJob && isTerminalJobStatus(detailJob.status)
+            ? detailJob.status
+            : stepsResponse?.job?.status || detailJob?.status
+        if (status && !isTerminalJobStatus(status)) observedLive = true
+        setJob((previous) => {
+          const base = detailJob ?? previous
+          if (!base) return previous
+          // Keeps known steps when the steps endpoint is momentarily empty
+          // while the backend is still persisting a callback.
+          const merged = mergeJobWithSteps(base, stepsResponse)
+          return preserveTerminal(
+            previous,
+            terminalEventRef.current ? applyJobEvent(merged, terminalEventRef.current) : merged,
+          )
+        })
+      }
 
-      const detailJob = detail.status === 'fulfilled' ? detail.value : null
-      const stepsResponse = steps.status === 'fulfilled' ? steps.value : null
-      noteActivity('lastEngineAt', parseTime(detailJob?.engineHeartbeatAt))
-      const status = detailJob && isTerminalJobStatus(detailJob.status) ? detailJob.status : stepsResponse?.job?.status || detailJob?.status
-      if (status && !isTerminalJobStatus(status)) observedLive = true
-
-      setJob((previous) => {
-        const base = detailJob ?? previous
-        if (!base) return previous
-        // Keeps known steps when the steps endpoint is momentarily empty
-        // while the backend is still persisting a callback.
-        const merged = mergeJobWithSteps(base, stepsResponse)
-        return preserveTerminal(previous, terminalEventRef.current ? applyJobEvent(merged, terminalEventRef.current) : merged)
+      const detailRequest = fetchJobDetail(token, jobId).then((value) => {
+        detailJob = value
+        noteActivity('lastEngineAt', toLocal(parseTime(value?.engineHeartbeatAt)))
+        applyJob()
+        return value
+      })
+      const stepsRequest = fetchPipelineSteps(token, jobId).then((value) => {
+        stepsResponse = value
+        applyJob()
+        return value
+      })
+      const linesRequest = fetchPipelineLogs(token, jobId).then((value) => {
+        if (disposed) return value
+        const live = observedLive && !firstSync
+        // New lines of a live run arrived since the previous poll.
+        if (live && value.length > logsRef.current.length) noteActivity('lastLogAt', Date.now())
+        commitLogs(mergeLogSnapshot(logsRef.current, value, Date.now(), live, liveRef.current))
+        return value
       })
 
-      if (lines.status === 'fulfilled') {
-        // New lines of a live run arrived since the previous poll.
-        if (observedLive && syncCount > 0 && lines.value.length > logsRef.current.length) {
-          noteActivity('lastLogAt', Date.now())
-        }
-        commitLogs(
-          mergeLogSnapshot(
-            logsRef.current,
-            lines.value,
-            Date.now(),
-            observedLive && syncCount > 0,
-            liveRef.current,
-          ),
-        )
-      }
+      const [detail, steps, lines] = await Promise.allSettled([detailRequest, stepsRequest, linesRequest])
+      if (disposed) return
+      const detailStatus = detail.status === 'fulfilled' ? detail.value?.status : undefined
+      const status =
+        detailStatus && isTerminalJobStatus(detailStatus)
+          ? detailStatus
+          : (steps.status === 'fulfilled' ? steps.value?.job?.status : undefined) || detailStatus
       syncCount += 1
 
       if (detail.status === 'rejected' && lines.status === 'rejected') {
@@ -334,7 +394,37 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
       if (timer !== null) window.clearTimeout(timer)
       resyncRef.current = async () => undefined
     }
-  }, [jobId, token, commitLogs, cached, noteActivity])
+  }, [jobId, token, commitLogs, cached, noteActivity, toLocal])
+
+  // Start-latency phases (only recorded for runs started from this device).
+  const hasJob = !!job
+  const firstStageStarted = !!job?.steps.some((step) => step.status !== 'pending')
+  useEffect(() => {
+    if (hasJob && jobId) markStartPhase(jobId, 'screenShown')
+  }, [hasJob, jobId])
+  useEffect(() => {
+    if (firstStageStarted && jobId) markStartPhase(jobId, 'firstStage')
+  }, [firstStageStarted, jobId])
+
+  // Show the service URL as soon as the deploy stage succeeds, instead of
+  // waiting for the backend to finalize the whole job (results, status).
+  const DEPLOY_STAGE = 7
+  const deployStageDone = !!job?.steps.some(
+    (step) => stageIndexForStep(step) === DEPLOY_STAGE && step.status === 'success',
+  )
+  const hasDeployUrl = !!deployUrl
+  useEffect(() => {
+    if (!deployStageDone || hasDeployUrl || !token || !jobId) return
+    let cancelled = false
+    fetchPipelineDeployment(token, jobId)
+      .then((deployment) => {
+        if (!cancelled && deployment.url) setDeployUrl(deployment.url)
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [deployStageDone, hasDeployUrl, token, jobId])
 
   // Once the run is finished and the stream is closed, snapshot what the page
   // shows so reopening it (from history or the result page) is instant. Logs
@@ -395,13 +485,14 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
       }
 
       if (type === 'engine_heartbeat') {
-        noteActivity('lastEngineAt', parseTime(message.timestamp) ?? Date.now())
+        noteServerClock(parseTime(message.timestamp))
+        noteActivity('lastEngineAt', Date.now())
         return
       }
 
       if (type === 'log_snapshot') {
-        noteActivity('lastEngineAt', parseTime(message.engine_heartbeat_at))
-        noteActivity('lastLogAt', parseTime(message.last_log_at))
+        noteActivity('lastEngineAt', toLocal(parseTime(message.engine_heartbeat_at)))
+        noteActivity('lastLogAt', toLocal(parseTime(message.last_log_at)))
         if (typeof message.job_status === 'string') {
           const snapshot = { ...message, status: message.job_status }
           if (isTerminalJobStatus(message.job_status)) terminalEventRef.current = snapshot
@@ -421,8 +512,9 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
 
       if (type === 'log_batch' || type === 'log' || type === 'log_entry') {
         const events = streamEventsFrom(message)
-        const times = events.map((event) => parseTime(event.timestamp)).filter((t): t is number => t !== null)
-        noteActivity('lastLogAt', times.length > 0 ? Math.max(...times) : Date.now())
+        const receivedAt = Date.now()
+        for (const event of events) noteServerClock(parseTime(event.timestamp), receivedAt)
+        noteActivity('lastLogAt', receivedAt)
         commitLogs(appendLogEvents(logsRef.current, streamEventsFrom(message), Date.now()))
         return
       }
@@ -430,6 +522,11 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
       if (Object.hasOwn(EVENT_STEP_STATUS, type) || type === 'step_complete' || type === 'stage_progress') {
         const patch = stepPatchFromEvent(message)
         if (patch) {
+          // Stage events are pushed the moment the server stamps them, so
+          // their started_at/ended_at anchor this client to the server clock.
+          const receivedAt = Date.now()
+          noteServerClock(parseTime(patch.startedAt), receivedAt)
+          noteServerClock(parseTime(patch.endedAt), receivedAt)
           if (!patch.status && EVENT_STEP_STATUS[type]) patch.status = EVENT_STEP_STATUS[type]
           setJob((previous) =>
             previous ? preserveTerminal(previous, { ...previous, status: patch.status === 'running' ? 'running' : previous.status, startedAt: str(message, 'pipeline_started_at') ?? previous.startedAt, steps: applyStepPatch(previous.steps, patch) }) : previous,
@@ -522,7 +619,7 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
       stopHealth()
       socket?.close()
     }
-  }, [jobId, token, commitLogs, cached, noteActivity])
+  }, [jobId, token, commitLogs, cached, noteActivity, noteServerClock, toLocal])
 
   const cancel = useCallback(async () => {
     if (!token || !jobId) return
@@ -543,5 +640,5 @@ export function usePipelineExecution(jobId: string, token: string | null): Pipel
 
   const resync = useCallback(() => resyncRef.current(), [])
 
-  return { job, logs, activity, connection, error, deployUrl, setDeployUrl, cancel, resync }
+  return { job, logs, activity, clockOffsetMs, connection, error, deployUrl, setDeployUrl, cancel, resync }
 }

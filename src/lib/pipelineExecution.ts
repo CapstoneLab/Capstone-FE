@@ -229,8 +229,13 @@ export function stageDurationSecs(
 
 export type ExecutionProgress = {
   total: number
-  /** All terminal stages, including skipped/failed/cancelled; distinct from success. */
+  /** Stages that are done without a problem: succeeded, or explicitly skipped
+   *  by the pipeline (backend status "skipped", e.g. a repo with no tests), so
+   *  a run where every stage passed or was skipped reads 8/8 · 100%. Stages
+   *  never reached after a failure/cancel (shown as skipped) do not count. */
   completed: number
+  /** Stages that actually ran and succeeded. */
+  succeeded: number
   failed: number
   skipped: number
   cancelled: number
@@ -242,11 +247,15 @@ export type ExecutionProgress = {
 
 export function summarizeProgress(stages: StageView[]): ExecutionProgress {
   const count = (status: StageStatus) => stages.filter((stage) => stage.status === status).length
-  const completed = stages.filter((stage) => TERMINAL_STAGE.has(stage.status)).length
+  const succeeded = count('success')
+  const completed =
+    succeeded +
+    stages.filter((stage) => stage.status === 'skipped' && stage.backendStatus === 'skipped').length
   const total = stages.length || TOTAL_STAGES
   return {
     total,
     completed,
+    succeeded,
     failed: count('failed'),
     skipped: count('skipped'),
     cancelled: count('cancelled'),
@@ -546,4 +555,89 @@ export function formatLogsForCopy(
       return `${at !== null ? formatClock(at) : '--:--:--'} ${levelLabel(entry.level)} [${stageLabel(entry.resolvedStage)}] ${entry.message}`
     })
     .join('\n')
+}
+
+// ── Server clock ───────────────────────────────────────────────────────────
+// Stage/job timestamps come from the server, but elapsed timers tick on this
+// PC's clock, so any skew between the two shows up as wrong durations. A line
+// stamped by the server at T and received here at R gives T − R ≤ offset (it
+// cannot arrive before it was written); the largest such sample is the best
+// estimate of serverClock − localClock.
+
+/** Samples further apart than this are a parsing/timezone problem, not skew. */
+const MAX_CLOCK_SKEW_MS = 24 * 60 * 60 * 1000
+
+/** Folds one (serverMs, receivedMs) observation into the running estimate. */
+export function foldClockSample(current: number | null, serverMs: number | null, receivedMs: number): number | null {
+  if (serverMs === null || !Number.isFinite(serverMs)) return current
+  const sample = serverMs - receivedMs
+  if (Math.abs(sample) > MAX_CLOCK_SKEW_MS) return current
+  return current === null || sample > current ? sample : current
+}
+
+/** Estimate from log lines received live (history lines carry no timing). */
+export function estimateClockOffset(entries: LogEntry[], initial: number | null = null): number | null {
+  let offset = initial
+  for (const entry of entries) {
+    if (entry.live) offset = foldClockSample(offset, entry.timestampMs, entry.receivedAtMs)
+  }
+  return offset
+}
+
+/**
+ * Server time (ms) at which the run stopped, or null while it is still live.
+ * Every timer on the page stops here, on the server's own timeline:
+ *   1. completed_at, when the backend reported it;
+ *   2. otherwise, once no stage is running and the run cannot continue —
+ *      job terminal, every stage done, or a stage failed/was cancelled while
+ *      the job status has not caught up yet — the last stage's ended_at;
+ *   3. a terminal job without any timestamps: started_at + duration_secs.
+ */
+export function runStoppedAtMs(
+  job: { startedAt: string | null; completedAt: string | null; durationSecs: number },
+  stages: Pick<StageView, 'status' | 'endedAt'>[],
+  terminal: boolean,
+): number | null {
+  const start = parseTime(job.startedAt)
+  const end = parseTime(job.completedAt)
+  if (end !== null && (start === null || end >= start)) return end
+  const anyRunning = stages.some((stage) => stage.status === 'running')
+  const allDone = stages.length > 0 && stages.every((stage) => stage.status !== 'pending' && stage.status !== 'running')
+  const halted = stages.some((stage) => stage.status === 'failed' || stage.status === 'cancelled')
+  if (!terminal && (anyRunning || !(allDone || halted))) return null
+  const lastEnd = stages.reduce<number | null>((latest, stage) => {
+    const ended = parseTime(stage.endedAt)
+    return ended !== null && (latest === null || ended > latest) ? ended : latest
+  }, null)
+  if (lastEnd !== null && (start === null || lastEnd >= start)) return lastEnd
+  if (terminal && start !== null && job.durationSecs > 0) return start + job.durationSecs * 1000
+  return null
+}
+
+/**
+ * Total run time in seconds once the run has stopped (see runStoppedAtMs),
+ * or null while it is live. Measured from the server's started_at, never
+ * from this PC's clock, so it does not keep growing after the end.
+ */
+export function finishedElapsedSecs(
+  job: { startedAt: string | null; completedAt: string | null; durationSecs: number },
+  stages: Pick<StageView, 'status' | 'endedAt'>[],
+  terminal: boolean,
+): number | null {
+  const start = parseTime(job.startedAt)
+  const stoppedAt = runStoppedAtMs(job, stages, terminal)
+  if (stoppedAt !== null && start !== null) return Math.max(0, Math.round((stoppedAt - start) / 1000))
+  if (terminal) return job.durationSecs > 0 ? job.durationSecs : null
+  return null
+}
+
+/**
+ * Splits the total into time spent inside stages and time between/around
+ * them (queueing, container start-up, hand-over), so the stage chips add up
+ * to the total shown: total = stages + waiting.
+ */
+export function timeBreakdown(totalSecs: number | null, stageSecs: (number | null)[]) {
+  if (totalSecs === null) return null
+  const stages = stageSecs.reduce<number>((sum, secs) => sum + (secs ?? 0), 0)
+  return { total: totalSecs, stages, waiting: Math.max(0, totalSecs - stages) }
 }

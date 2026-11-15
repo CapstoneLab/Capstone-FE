@@ -1015,10 +1015,31 @@ ipcMain.handle('updater:download-and-install', async (event, payload) => {
     throw new Error('Unsupported desktop update platform.')
   }
 
-  spawn(installerPath, [], {
-    detached: true,
-    stdio: 'ignore',
-  }).unref()
+  // Launch the installer and only quit once Windows actually started it.
+  // Windows Smart App Control / Defender can refuse an unsigned installer;
+  // that surfaces as "spawn UNKNOWN" (or EACCES/EPERM) — explain it and show
+  // the downloaded file instead of quitting with a cryptic error.
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn(installerPath, [], { detached: true, stdio: 'ignore' })
+      child.once('error', reject)
+      child.once('spawn', () => {
+        child.unref()
+        resolve()
+      })
+    })
+  } catch (launchError) {
+    const code = launchError && typeof launchError === 'object' ? launchError.code : ''
+    if (code === 'UNKNOWN' || code === 'EACCES' || code === 'EPERM') {
+      shell.showItemInFolder(installerPath)
+      throw new Error(
+        'Windows가 설치 파일 실행을 차단했습니다 (스마트 앱 컨트롤 / Defender). ' +
+          '이 설치 파일은 코드 서명이 없어 차단될 수 있습니다. 다운로드한 파일을 탐색기에 표시했습니다. ' +
+          `(${code})`,
+      )
+    }
+    throw launchError
+  }
 
   setTimeout(() => {
     app.quit()

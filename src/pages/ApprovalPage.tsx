@@ -16,7 +16,9 @@ import {
   type ApprovalResponse,
   type JobResult,
   type SecurityFinding,
+  type SecuritySeverity,
 } from '@/lib/api'
+import { matchGateRule, stricterVerdict } from '@/lib/deploymentGate'
 
 type LocationState = {
   jobId?: string
@@ -86,7 +88,23 @@ export function ApprovalPage() {
   const repoName = result?.repoName || locationState.repoName || ''
   const branch = result?.branch || locationState.branch || ''
   const vd = result?.verdictDetail ?? null
-  const verdict = vd?.verdict ?? null
+  // Same gate as the result page: the count rule (Critical ≥ 1 / High ≥ 2 →
+  // block, High = 1 / Medium ≥ 2 → approval) can only tighten the backend
+  // verdict, so High 2건 is never approvable here even if the backend says so.
+  const gateCounts = useMemo(() => {
+    const sum = (c: Record<SecuritySeverity, number>) => c.critical + c.high + c.medium + c.low
+    if (vd?.counts && sum(vd.counts) > 0) return vd.counts
+    return (result?.findings ?? [])
+      .filter((f) => f.inScope)
+      .reduce<Record<SecuritySeverity, number>>(
+        (acc, f) => {
+          acc[f.severity] += 1
+          return acc
+        },
+        { critical: 0, high: 0, medium: 0, low: 0 },
+      )
+  }, [vd, result])
+  const verdict = result ? stricterVerdict(vd?.verdict ?? null, matchGateRule(gateCounts).verdict) : null
   const commitShort = vd?.scannedCommitSha ? vd.scannedCommitSha.slice(0, 12) : null
 
   // C-3: only in-scope High/Medium findings are eligible. Critical is never listed
@@ -401,7 +419,7 @@ export function ApprovalPage() {
         <Card className="border-[#404040] bg-[#262626] p-4">
           <p className="text-[15px] font-semibold text-white">승인 / 거부</p>
           <p className="mt-1 text-[12px] text-[#9CA3AF]">
-            승인은 보안책임자·팀리드 권한이 필요합니다. 개발자 본인은 승인할 수 없습니다.
+            사유와 함께 이름으로 서명하면 누구나 승인할 수 있습니다. 서명은 감사 로그에 남습니다.
           </p>
 
           {/* C-3: blocking High/Medium CWEs as checkboxes — Critical은 노출 안 함 */}
@@ -456,7 +474,7 @@ export function ApprovalPage() {
 
           {forbidden ? (
             <p className="mt-3 rounded-md border border-[#7F1D1D] bg-[#450A0A]/40 p-2 text-[12px] text-[#FCA5A5]">
-              승인 권한이 없습니다. 보안책임자·팀리드 권한이 필요하며, 개발자 본인은 승인할 수 없습니다.
+              서버가 승인을 거부했습니다(403). 서버에 남아 있는 역할 권한 검사가 해제되어야 서명만으로 승인할 수 있습니다.
             </p>
           ) : null}
           {actionError ? (

@@ -300,12 +300,12 @@ export function AuditLogPage() {
             className="flex w-full rounded-md border border-[#404040] bg-[#1E1E1E] px-3 py-2 text-sm text-white placeholder:text-[#6B7280] shadow-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#34D399]/40"
           />
           <p className="text-[11px] text-[#6B7280]">
-            사유는 필수입니다. 무기한 예외는 금지되며, 승인은 보안책임자·팀리드 권한이 필요합니다.
+            사유는 필수입니다. 무기한 예외는 금지되며, 이름으로 서명하면 누구나 승인할 수 있습니다.
           </p>
 
           {actionForbidden ? (
             <p className="rounded-md border border-[#7F1D1D] bg-[#450A0A]/40 p-2 text-[12px] text-[#FCA5A5]">
-              승인 권한이 없습니다. 보안책임자·팀리드 권한이 필요하며, 개발자 본인은 승인할 수 없습니다.
+              서버가 승인을 거부했습니다(403). 서버에 남아 있는 역할 권한 검사가 해제되어야 서명만으로 승인할 수 있습니다.
             </p>
           ) : null}
           {actionError ? (

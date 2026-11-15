@@ -1,5 +1,6 @@
 import { GitBranch, Loader2, Lock, Play, Search, SquareMousePointer, Star } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
 import { Badge } from '@/components/ui/badge'
@@ -16,14 +17,14 @@ import {
   addLaunchedRepo,
   addTrackedJobId,
   AuthExpiredError,
+  fetchBranches,
   fetchJobsByIds,
-  fetchReposWithBranches,
-  fetchSecurityCatalog,
+  fetchLatestRepoHistory,
+  fetchRepos,
   getCachedRepos,
   getLaunchedRepos,
   getTrackedJobIds,
   isGithubRateLimitError,
-  PipelineConflictError,
   setCachedRepos,
   startPipeline,
   type PipelineEnvironment,
@@ -37,13 +38,15 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { getLanguageColor } from '@/lib/languageColors'
+import { useSecurityCatalog } from '@/hooks/useSecurityCatalog'
+import { markStartClicked, markStartResponse } from '@/lib/startTiming'
+import { registerPendingStart } from '@/lib/pendingStart'
 import type { RepositoryItem } from '@/data/repositories'
 import {
   buildCatalogBySeverity,
   severityMeta,
   severityOrder,
   type CheckSeverity,
-  type SecurityCheckItem,
 } from '@/data/securityCatalog'
 
 export function NewPipelinePage() {
@@ -59,11 +62,14 @@ export function NewPipelinePage() {
     () => !!token && !getCachedRepos(cacheKey),
   )
   const [reposError, setReposError] = useState<string | null>(null)
-  const [selectedRepoId, setSelectedRepoId] = useState('')
-  const [selectedBranch, setSelectedBranch] = useState('')
+  // What the user picked; the effective selection falls back to the first
+  // repo / first branch while nothing valid is picked (derived, not synced).
+  const [pickedRepoId, setSelectedRepoId] = useState('')
+  const [pickedBranch, setSelectedBranch] = useState('')
   const [environment, setEnvironment] = useState<PipelineEnvironment>('development')
-  // Security policy catalog — the server response is the single source of truth.
-  const [catalog, setCatalog] = useState<SecurityCheckItem[]>([])
+  // Security policy catalog — the server response is the single source of truth
+  // (shared, cached query; same list the result page counts against).
+  const { items: catalog, fromServer: catalogFromServer, error: catalogError } = useSecurityCatalog(token)
   // Default to ALL checks selected (spec: "전체 선택" 기본값 권장).
   const [selectedVulnerabilityIds, setSelectedVulnerabilityIds] =
     useState<string[]>([])
@@ -79,19 +85,26 @@ export function NewPipelinePage() {
   const [isResolvingConflict, setIsResolvingConflict] = useState(false)
 
   useEffect(() => {
-    if (!token) {
-      setRepos([])
-      return
-    }
+    if (!token) return
 
     let mounted = true
-    setReposError(null)
 
-    fetchReposWithBranches(token)
+    // Repository list only — branches are fetched for the selected repo below,
+    // instead of fetching every repository's branches before showing anything.
+    fetchRepos(token)
       .then((list) => {
         if (mounted) {
-          setRepos(list)
-          setCachedRepos(cacheKey, list)
+          // Keep branches already known from the cache until the selected
+          // repo's fresh branch list arrives.
+          const cachedById = new Map((getCachedRepos(cacheKey) ?? []).map((repo) => [repo.id, repo]))
+          const merged = list.map((repo) => {
+            const cached = cachedById.get(repo.id)
+            return cached && cached.branches.length > repo.branches.length
+              ? { ...repo, branches: cached.branches, branchCommitShas: cached.branchCommitShas }
+              : repo
+          })
+          setRepos(merged)
+          setCachedRepos(cacheKey, merged)
         }
       })
       .catch((error: unknown) => {
@@ -129,49 +142,71 @@ export function NewPipelinePage() {
     })
   }, [repos, search])
 
-  const selectedRepo = repos.find((repo) => repo.id === selectedRepoId) ?? null
+  const selectedRepoId = repos.some((repo) => repo.id === pickedRepoId) ? pickedRepoId : (repos[0]?.id ?? '')
+  const listedRepo = repos.find((repo) => repo.id === selectedRepoId) ?? null
 
-  const isFirstRunForRepo = false
+  // Branches of the selected repository only (cached per repo).
+  const branchesQuery = useQuery({
+    queryKey: ['repo-branches', listedRepo?.name ?? ''],
+    queryFn: async () => {
+      const [owner, name] = listedRepo!.name.split('/')
+      return fetchBranches(token!, owner, name)
+    },
+    enabled: !!token && !!listedRepo?.name.includes('/'),
+    staleTime: 60_000,
+  })
+  const selectedRepo = useMemo(() => {
+    if (!listedRepo) return null
+    const items = branchesQuery.data
+    if (!items || items.length === 0) return listedRepo
+    const defaultBranch = listedRepo.source.branch
+    const names = items.map((item) => item.name)
+    return {
+      ...listedRepo,
+      branches: defaultBranch && names.includes(defaultBranch)
+        ? [defaultBranch, ...names.filter((name) => name !== defaultBranch)]
+        : names,
+      branchCommitShas: Object.fromEntries(items.map((item) => [item.name, item.commitSha])),
+    }
+  }, [listedRepo, branchesQuery.data])
+
+  // First run = the server has no run of this repository yet. The backend then
+  // scans with the full catalog regardless of what is selected, so the screen
+  // must say so (and send the full list) instead of implying a partial scan.
+  const historyQuery = useQuery({
+    queryKey: ['repo-has-runs', listedRepo?.name ?? ''],
+    queryFn: async () => (await fetchLatestRepoHistory(token!, listedRepo!.name)) !== null,
+    enabled: !!token && !!listedRepo?.name,
+    staleTime: 60_000,
+  })
+  const isFirstRunForRepo = historyQuery.data === false
 
   const allVulnerabilityIds = useMemo(() => catalog.map((c) => c.id), [catalog])
   const bySeverity = useMemo(() => buildCatalogBySeverity(catalog), [catalog])
 
-  // Load the policy catalog from the API and select every returned item by default.
-  useEffect(() => {
-    if (!token) return
-    let cancelled = false
-    fetchSecurityCatalog(token)
-      .then((items) => {
-        if (!cancelled && items.length > 0) {
-          setCatalog(items)
-          setSelectedVulnerabilityIds(items.map((item) => item.id))
-        }
-      })
-      .catch((error) => {
-        if (!cancelled) setStartError(error instanceof Error ? error.message : '보안 정책을 불러오지 못했습니다.')
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [token])
+  // Select every catalog item by default once the server catalog is in.
+  const [catalogSeeded, setCatalogSeeded] = useState(false)
+  if (!catalogSeeded && catalogFromServer) {
+    setCatalogSeeded(true)
+    setSelectedVulnerabilityIds(allVulnerabilityIds)
+  }
 
   // Use the commit SHA returned with the selected branch.
+  // A picked branch that the selected repo does not have (another repo's, or
+  // before the branch list arrived) falls back to the repo's first branch.
+  const selectedBranch =
+    selectedRepo && selectedRepo.branches.includes(pickedBranch)
+      ? pickedBranch
+      : (selectedRepo?.branches[0] ?? pickedBranch)
   const currentCommitSha = selectedRepo?.branchCommitShas?.[selectedBranch] ?? ''
 
-  useEffect(() => {
-    if (repos.length === 0) return
-    if (!selectedRepoId || !repos.some((repo) => repo.id === selectedRepoId)) {
-      const first = repos[0]
-      setSelectedRepoId(first.id)
-      setSelectedBranch(first.branches[0] ?? '')
-    }
-  }, [repos, selectedRepoId])
-
-  useEffect(() => {
-    if (isFirstRunForRepo) {
-      setSelectedVulnerabilityIds(allVulnerabilityIds)
-    }
-  }, [isFirstRunForRepo, allVulnerabilityIds])
+  // First run: the server scans the full catalog, so show every item selected.
+  const firstRunKey = isFirstRunForRepo ? allVulnerabilityIds.join(',') : ''
+  const [appliedFirstRunKey, setAppliedFirstRunKey] = useState('')
+  if (firstRunKey && firstRunKey !== appliedFirstRunKey) {
+    setAppliedFirstRunKey(firstRunKey)
+    setSelectedVulnerabilityIds(allVulnerabilityIds)
+  }
 
   // One-time migration: register repos of previously-run jobs as launched
   // so users who ran pipelines before this feature don't see the forced state.
@@ -233,57 +268,58 @@ export function NewPipelinePage() {
 
   // Min-1 enforcement (spec: 0개 선택은 제출 비활성). First-run repos always
   // send the full baseline, so they're never blocked.
-  const hasNoSelection = !isFirstRunForRepo && selectedVulnerabilityIds.length === 0
+  // Before the catalog arrives the default (all checks) applies — never block.
+  const hasNoSelection = !isFirstRunForRepo && catalogSeeded && selectedVulnerabilityIds.length === 0
 
-  async function handleStartPipeline() {
-    if (!selectedRepo || !token) return
+  function handleStartPipeline() {
+    if (!selectedRepo || !token || isStarting) return
+    // The untouched default is "every check": until the server catalog has
+    // arrived that is sent as [] (the backend then runs the full catalog), so
+    // the click never waits on the catalog request.
+    const checksToSend = isFirstRunForRepo
+      ? allVulnerabilityIds
+      : !catalogSeeded
+        ? []
+        : selectedVulnerabilityIds
+    if (catalogSeeded && checksToSend.length === 0) {
+      setStartError(t('pipelineNew.minSelectionError'))
+      return
+    }
+    const repoName = selectedRepo.name
+    const branch = selectedBranch || selectedRepo.source.branch
+
+    // Send the start request right now, on the click — nothing awaited first.
+    markStartClicked()
+    const request = startPipeline(token, {
+      repoUrl: selectedRepo.repositoryUrl || `https://github.com/${repoName}`,
+      branch,
+      triggerSource: 'manual',
+      environment,
+      selectedItems: checksToSend,
+      commitSha: currentCommitSha || undefined,
+    })
+    // Bookkeeping once the backend answers (the progress page shows the rest).
+    request
+      .then(({ jobId }) => {
+        if (!jobId) return
+        markStartResponse(jobId)
+        addTrackedJobId(cacheKey, jobId)
+        setLaunchedRepoUrls(addLaunchedRepo(cacheKey, repoName))
+      })
+      .catch(() => undefined)
+
     setStartError(null)
     setIsStarting(true)
-    try {
-      const checksToSend = isFirstRunForRepo
-        ? allVulnerabilityIds
-        : selectedVulnerabilityIds
-      // Guard: never start a non-first-run pipeline with zero checks.
-      if (checksToSend.length === 0) {
-        setStartError(t('pipelineNew.minSelectionError'))
-        return
-      }
-      const repoUrlToSend =
-        selectedRepo.repositoryUrl || `https://github.com/${selectedRepo.name}`
-      const { jobId } = await startPipeline(token, {
-        repoUrl: repoUrlToSend,
-        branch: selectedBranch,
-        triggerSource: 'manual',
-        environment,
-        selectedItems: checksToSend,
-        commitSha: currentCommitSha || undefined,
-      })
-      if (!jobId) throw new Error(t('pipelineNew.serverNoJobId'))
-      addTrackedJobId(cacheKey, jobId)
-      const nextLaunched = addLaunchedRepo(cacheKey, selectedRepo.name)
-      setLaunchedRepoUrls(nextLaunched)
-      navigate('/pipeline/progress', {
-        state: {
-          jobId,
-          repoName: selectedRepo.name,
-          branch: selectedBranch,
-          selectedChecks: selectedVulnerabilityTitles,
-        },
-      })
-    } catch (error) {
-      if (error instanceof PipelineConflictError) {
-        setConflictDialog({
-          existingJobId: error.existingJobId,
-          detail: error.detail,
-        })
-        return
-      }
-      setStartError(
-        error instanceof Error ? error.message : t('pipelineNew.startFailed'),
-      )
-    } finally {
-      setIsStarting(false)
-    }
+    // Move to the progress screen immediately; it attaches to the execution
+    // as soon as the job id arrives (and handles a duplicate run or an error).
+    navigate('/pipeline/progress', {
+      state: {
+        pendingStartId: registerPendingStart(request),
+        repoName,
+        branch,
+        selectedChecks: selectedVulnerabilityTitles,
+      },
+    })
   }
 
   function handleConfirmConflict() {
@@ -380,7 +416,13 @@ export function NewPipelinePage() {
 
                 <div className="flex items-center gap-4 text-[12px] text-[#6B7280]">
                   <span className="inline-flex items-center gap-1">
-                    <GitBranch className="h-3.5 w-3.5" /> {t('pipelineNew.branchCount', { count: repo.branches.length })}
+                    <GitBranch className="h-3.5 w-3.5" />{' '}
+                    {/* Branch lists load per selected repo; others show the default branch. */}
+                    {repo.id === selectedRepoId && selectedRepo && selectedRepo.branches.length > 1
+                      ? t('pipelineNew.branchCount', { count: selectedRepo.branches.length })
+                      : repo.branches.length > 1
+                        ? t('pipelineNew.branchCount', { count: repo.branches.length })
+                        : repo.source.branch || '-'}
                   </span>
                   <span className="inline-flex items-center gap-1">
                     <Star className="h-3.5 w-3.5" /> {repo.stars}
@@ -415,6 +457,11 @@ export function NewPipelinePage() {
                       <SelectValue placeholder={t('pipelineNew.selectBranch')} />
                     </SelectTrigger>
                     <SelectContent>
+                      {branchesQuery.isFetching && selectedRepo.branches.length <= 1 ? (
+                        <div className="flex items-center gap-2 px-2 py-1.5 text-[12px] text-[#9CA3AF]">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" /> {t('pipelineNew.loadingBranches')}
+                        </div>
+                      ) : null}
                       {selectedRepo.branches.map((branch) => (
                         <SelectItem key={branch} value={branch}>
                           {branch}
@@ -449,6 +496,9 @@ export function NewPipelinePage() {
                     <p className="font-semibold text-[#D1FAE5]">{t('pipelineNew.firstRunTitle')}</p>
                     <p className="mt-1 text-[#A7F3D0]">
                       {t('pipelineNew.firstRunDescription')}
+                    </p>
+                    <p className="mt-1 font-semibold text-[#D1FAE5]">
+                      {t('pipelineNew.firstRunScope', { count: allVulnerabilityIds.length })}
                     </p>
                   </div>
                 </div>
@@ -565,6 +615,12 @@ export function NewPipelinePage() {
           </Card>
         ) : null}
 
+        {catalogError && !catalogFromServer ? (
+          <p className="rounded-lg border border-[#78350F] bg-[#451A03]/40 p-3 text-center text-sm text-[#FCD34D]">
+            {t('pipelineNew.catalogFallback')}
+          </p>
+        ) : null}
+
         {startError ? (
           <p className="rounded-lg border border-[#7F1D1D] bg-[#450A0A]/40 p-3 text-center text-sm text-[#FCA5A5]">
             {startError}
@@ -580,7 +636,7 @@ export function NewPipelinePage() {
             {t('dashboard.cancel')}
           </Button>
           <Button
-            onClick={() => void handleStartPipeline()}
+            onClick={handleStartPipeline}
             className="bg-[#34D399] text-[#0B1B14] shadow-none hover:bg-[#28C48A]"
             disabled={!selectedRepo || !token || isStarting || hasNoSelection}
           >
