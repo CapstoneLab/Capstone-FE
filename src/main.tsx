@@ -1,4 +1,5 @@
 import { StrictMode } from 'react'
+import { QueryProvider } from '@/components/QueryProvider'
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter, HashRouter } from 'react-router-dom'
 import './index.css'
@@ -11,6 +12,7 @@ import { ZoomControl } from '@/components/layout/ZoomControl'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
+    <QueryProvider>
     <ThemeProvider>
       <LanguageProvider>
         <ZoomProvider>
@@ -31,5 +33,6 @@ createRoot(document.getElementById('root')!).render(
         </ZoomProvider>
       </LanguageProvider>
     </ThemeProvider>
+    </QueryProvider>
   </StrictMode>,
 )

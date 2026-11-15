@@ -73,6 +73,7 @@
 | 7 | POST | `/api/pipelines/{job_id}/cancel` | **실행 중인 파이프라인 취소** | O (SSH `pkill -9 -f {job_id}`) |
 | 8 | DELETE | `/api/pipelines/{job_id}` | **Job 완전 삭제** (DB cascade + 결과파일) | O (실행 중이면 kill 선행) |
 | 9 | GET  | `/api/jobs/{job_id}/result` | **보안 분석 상세 결과** (findings 리스트, AI 제안) | O → `/pipeline-result` 또는 ubuntu push 후 DB 조회 |
+| 10 | GET/PUT | `/api/repos/{owner}/{repo}/webhook` | GitHub push 웹훅 조회·등록·해제 | O |
 
 ---
 
@@ -411,6 +412,40 @@
 - 404: `job_id` 없음
 - 425 Too Early: 아직 종료되지 않은 job (스펙 합의 필요, 응답 정책 결정)
 - 502/504: ubuntu 호출 실패 (pull 모드 사용 시)
+
+### 3.10 GET/PUT `/api/repos/{owner}/{repo}/webhook` — push 웹훅 ★
+
+프론트의 저장소 `탐지` 토글은 이 엔드포인트를 통해 GitHub 저장소의 push 이벤트를
+백엔드에 등록하거나 해제한다. 웹훅 secret과 GitHub API 토큰은 프론트에 노출하지
+않고 백엔드가 관리해야 한다.
+
+`GET` 응답:
+
+```json
+{
+  "enabled": true,
+  "url": "https://api.example.com/webhooks/github/123",
+  "events": ["push"]
+}
+```
+
+`PUT` 요청:
+
+```json
+{
+  "enabled": true,
+  "events": ["push"]
+}
+```
+
+`enabled: true`이면 백엔드는 저장소에 push 웹훅을 upsert하고, 수신한 GitHub
+`push` 이벤트에서 `repository.full_name`, `ref`, `after`를 검증한 뒤 해당 브랜치의
+최신 커밋을 대상으로 `POST /api/pipelines`를 `trigger_source: "webhook"`으로
+호출한다. `enabled: false`이면 해당 웹훅을 삭제하거나 비활성화한다.
+
+웹훅 수신 처리는 중복 이벤트에 안전해야 하며 GitHub delivery id를 멱등키로 사용해야
+한다. 프론트는 대시보드에서 파이프라인 히스토리를 주기적으로 갱신하므로, 웹훅
+수신 후 별도 프론트 요청 없이 새 파이프라인을 표시할 수 있어야 한다.
 
 ---
 

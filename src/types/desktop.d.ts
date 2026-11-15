@@ -47,6 +47,11 @@ declare global {
         acknowledgeCallback?: (url: string) => Promise<void>
         onCallback?: (callback: (url: string) => void) => () => void
       }
+      pipelineLink?: {
+        getPendingOpen?: () => Promise<string | null>
+        acknowledgeOpen?: (jobId: string) => Promise<void>
+        onOpen?: (callback: (jobId: string) => void) => () => void
+      }
       report?: {
         savePdf?: (
           html: string,

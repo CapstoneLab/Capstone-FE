@@ -47,6 +47,36 @@ function DesktopAuthCallbackBridge() {
   return null
 }
 
+// Opens the run screen when GitHub's "Details" link launches secupipeline://pipeline/{jobId}.
+function DesktopPipelineLinkBridge() {
+  const navigate = useNavigate()
+
+  useEffect(() => {
+    const pipelineLink = window.desktop?.pipelineLink
+    if (!pipelineLink) return
+
+    let active = true
+    const openRun = (jobId: string) => {
+      if (!active || typeof jobId !== 'string' || !jobId) return
+      navigate('/pipeline/progress', { state: { jobId } })
+    }
+
+    const unsubscribe = pipelineLink.onOpen?.(openRun)
+    void pipelineLink.getPendingOpen?.().then((jobId) => {
+      if (!active || !jobId) return
+      openRun(jobId)
+      void pipelineLink.acknowledgeOpen?.(jobId)
+    })
+
+    return () => {
+      active = false
+      unsubscribe?.()
+    }
+  }, [navigate])
+
+  return null
+}
+
 function AuthRedirect({ children }: { children: React.ReactNode }) {
   const { user, isLoading } = useAuth()
   if (isLoading) {
@@ -86,6 +116,7 @@ function App() {
   return (
     <div className="relative h-full overflow-hidden bg-[#1E1E1E] text-gray-50">
       <DesktopAuthCallbackBridge />
+      <DesktopPipelineLinkBridge />
       <NativeFrameBar />
       <div className="mt-9 h-[calc(100%-36px)] overflow-hidden">
         <AnimatePresence mode="wait" initial={false}>

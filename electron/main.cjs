@@ -34,6 +34,53 @@ function findAuthCallbackUrl(argv) {
   return Array.isArray(argv) ? argv.find((value) => isAuthCallbackUrl(value)) || null : null
 }
 
+// Deep link from GitHub commit status "Details": secupipeline://pipeline/{jobId}
+let pendingPipelineJobId = null
+
+function parsePipelineLinkJobId(value) {
+  if (typeof value !== 'string') return null
+
+  try {
+    const parsed = new URL(value)
+    if (parsed.protocol !== `${authProtocol}:` || parsed.hostname.toLowerCase() !== 'pipeline') {
+      return null
+    }
+    const jobId = decodeURIComponent(parsed.pathname.replace(/^\/+|\/+$/g, ''))
+    return /^[A-Za-z0-9_-]{1,128}$/.test(jobId) ? jobId : null
+  } catch {
+    return null
+  }
+}
+
+function findPipelineLinkJobId(argv) {
+  if (!Array.isArray(argv)) return null
+  for (const value of argv) {
+    const jobId = parsePipelineLinkJobId(value)
+    if (jobId) return jobId
+  }
+  return null
+}
+
+function receivePipelineLink(jobId) {
+  if (!jobId) return
+
+  pendingPipelineJobId = jobId
+  focusMainWindow()
+
+  if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isLoading()) {
+    mainWindow.webContents.send('pipeline:open', jobId)
+  }
+}
+
+function receiveProtocolUrl(url) {
+  const jobId = parsePipelineLinkJobId(url)
+  if (jobId) {
+    receivePipelineLink(jobId)
+    return
+  }
+  receiveAuthCallback(url)
+}
+
 function focusMainWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return
   if (mainWindow.isMinimized()) mainWindow.restore()
@@ -206,6 +253,8 @@ if (!hasSingleInstanceLock) {
   app.on('second-instance', (_event, argv) => {
     const callbackUrl = findAuthCallbackUrl(argv)
     if (callbackUrl) receiveAuthCallback(callbackUrl)
+    const pipelineJobId = findPipelineLinkJobId(argv)
+    if (pipelineJobId) receivePipelineLink(pipelineJobId)
     focusMainWindow()
   })
 }
@@ -213,7 +262,7 @@ if (!hasSingleInstanceLock) {
 // macOS delivers a custom protocol URL through open-url instead of argv.
 app.on('open-url', (event, url) => {
   event.preventDefault()
-  receiveAuthCallback(url)
+  receiveProtocolUrl(url)
 })
 
 function normalizeRepoValue(value) {
@@ -285,12 +334,15 @@ const fallbackGithubRepo = getRepositoryFromPackageJson() || defaultGithubRepo
 app.setName('Secupipeline')
 
 function getAppIconPath() {
-  const candidates = [
+  const rendererIcons = [
     path.join(appRootDir, 'renderer-dist', 'app-logo.ico'),
     path.join(appRootDir, 'renderer-dist', 'app-logo.png'),
+  ]
+  const publicIcons = [
     path.join(appRootDir, 'public', 'app-logo.ico'),
     path.join(appRootDir, 'public', 'app-logo.png'),
   ]
+  const candidates = isDev ? [...publicIcons, ...rendererIcons] : [...rendererIcons, ...publicIcons]
 
   return candidates.find((candidate) => fs.existsSync(candidate))
 }
@@ -764,6 +816,7 @@ function createWindow() {
   win.webContents.on('did-finish-load', () => sendMaximizedState(win))
   win.webContents.on('did-finish-load', () => {
     if (pendingAuthCallback) win.webContents.send('auth:callback', pendingAuthCallback)
+    if (pendingPipelineJobId) win.webContents.send('pipeline:open', pendingPipelineJobId)
   })
   win.on('closed', () => {
     if (devLoadRetryTimer !== null) clearTimeout(devLoadRetryTimer)
@@ -864,6 +917,10 @@ ipcMain.handle('auth:open-github-login', async (_event, loginUrl) => {
 ipcMain.handle('auth:get-pending-callback', () => pendingAuthCallback)
 ipcMain.handle('auth:ack-callback', (_event, callbackUrl) => {
   if (pendingAuthCallback === callbackUrl) pendingAuthCallback = null
+})
+ipcMain.handle('pipeline:get-pending-open', () => pendingPipelineJobId)
+ipcMain.handle('pipeline:ack-open', (_event, jobId) => {
+  if (pendingPipelineJobId === jobId) pendingPipelineJobId = null
 })
 
 ipcMain.handle('app:get-info', () => {
@@ -979,6 +1036,8 @@ app.whenReady().then(() => {
 
   const initialCallbackUrl = findAuthCallbackUrl(process.argv)
   if (initialCallbackUrl) receiveAuthCallback(initialCallbackUrl)
+  const initialPipelineJobId = findPipelineLinkJobId(process.argv)
+  if (initialPipelineJobId) receivePipelineLink(initialPipelineJobId)
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

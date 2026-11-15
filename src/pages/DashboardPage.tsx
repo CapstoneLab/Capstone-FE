@@ -18,8 +18,10 @@ import {
   Shield,
   Star,
   Trash2,
+  Webhook,
+  X,
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   CategoryScale,
   Chart as ChartJS,
@@ -38,23 +40,31 @@ import {
   AuthExpiredError,
   deletePipeline,
   deriveJobStatus,
-  fetchJobsByIds,
   fetchPipelineHistory,
   fetchRepos,
   fetchReposWithBranches,
+  fetchRepositoryWebhookStatuses,
   getCachedRepos,
   getRepoDetectEnabled,
   isGithubRateLimitError,
+  isWebhookTrigger,
   removeTrackedJobId,
   setCachedRepos,
+  setRepositoryWebhook,
   setRepoDetectEnabled,
+  WebhookRequestError,
   type JobDetail,
   type JobVerdict,
   type PipelineHistoryItem,
+  type RepositoryWebhookStatus,
 } from '@/lib/api'
 import { getLanguageColor } from '@/lib/languageColors'
+import { PIPELINE_STAGES, stageIndexForTag } from '@/lib/pipelineExecution'
 import { useAuth } from '@/contexts/AuthContext'
 import { getAuthCacheKey } from '@/contexts/AuthContext'
+import { useQueryClient } from '@tanstack/react-query'
+import { getJobDetailsCached, prefetchRun } from '@/hooks/useJobQueries'
+import type { QueryClient } from '@tanstack/react-query'
 import { useLanguage } from '@/contexts/LanguageContext'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -78,6 +88,10 @@ type PipelineItem = {
   jobId: string
   repoName: string
   description: string
+  /** Raw trigger_source (`webhook`, `manual`, ...). Missing on old cache entries. */
+  triggerSource?: string
+  /** Commit hash of the run; missing on old cache entries. */
+  commitSha?: string
   branch: string
   durationSec: number
   status: 'success' | 'failed' | 'running' | 'queued' | 'cancelled'
@@ -93,6 +107,34 @@ type PipelineItem = {
 }
 
 type DashboardTab = 'repo' | 'pipeline'
+
+type TriggerFilter = 'all' | 'webhook' | 'manual'
+
+type WebhookToast = {
+  jobId: string
+  repoName: string
+  branch: string
+}
+
+const WEBHOOK_TOAST_DURATION_MS = 8000
+
+/**
+ * Localised name of the stage a failed run stopped at, from the
+ * backend-reported latest step. Null when the backend did not report it.
+ */
+function failedStageLabel(
+  run: PipelineItem,
+  t: (key: string) => string,
+): string | null {
+  const index = stageIndexForTag(run.currentStepName)
+  if (index !== null) return t(`run.stage.${PIPELINE_STAGES[index].key}`)
+  return run.currentStepName || null
+}
+
+function webhookEventsLabel(status: RepositoryWebhookStatus | undefined): string {
+  const events = status && status.state !== 'unknown' ? status.webhook.events : []
+  return (events.length > 0 ? events : ['push']).join(', ')
+}
 
 const dashboardTabOrder: DashboardTab[] = ['repo', 'pipeline']
 
@@ -133,6 +175,8 @@ function mapJobToPipelineItem(job: JobDetail): PipelineItem {
     jobId: job.jobId,
     repoName: job.repoName,
     description: `${job.triggerSource || 'pipeline'} · ${job.branch || '-'}`,
+    triggerSource: job.triggerSource,
+    commitSha: job.commitSha,
     branch: job.branch,
     durationSec: job.durationSecs,
     status: finalStatus,
@@ -183,6 +227,8 @@ function mapHistoryToPipelineItem(
     jobId: history.jobId,
     repoName: enriched?.repoName || repoNameFromHistoryUrl(history.repoUrl),
     description: `${history.triggerSource || 'pipeline'} · ${history.branch || '-'}`,
+    triggerSource: history.triggerSource || enriched?.triggerSource || '',
+    commitSha: history.commitSha || enriched?.commitSha || '',
     branch: history.branch,
     durationSec: history.durationSecs || enriched?.durationSec || 0,
     status: history.status,
@@ -198,19 +244,23 @@ function mapHistoryToPipelineItem(
   }
 }
 
+// Details go through the query cache: a finished run is fetched once, ever
+// (persisted across restarts), so only new or still-running jobs hit the API.
 async function fetchPipelineHistoryDetails(
+  client: QueryClient,
   token: string,
   historyItems: PipelineHistoryItem[],
 ): Promise<Map<string, JobDetail>> {
-  const details = await fetchJobsByIds(token, historyItems.map((item) => item.jobId))
+  const details = await getJobDetailsCached(client, token, historyItems.map((item) => item.jobId))
   return new Map(details.map((item) => [item.jobId, item]))
 }
 
 async function enrichPipelineHistory(
+  client: QueryClient,
   token: string,
   historyItems: PipelineHistoryItem[],
 ): Promise<PipelineItem[]> {
-  const detailsById = await fetchPipelineHistoryDetails(token, historyItems)
+  const detailsById = await fetchPipelineHistoryDetails(client, token, historyItems)
   return historyItems.map((item) => mapHistoryToPipelineItem(item, detailsById.get(item.jobId)))
 }
 
@@ -263,6 +313,7 @@ function scoreTone(score: number): { color: string } {
 export function DashboardPage() {
   const navigate = useNavigate()
   const { token, user, isLoading: isAuthLoading, logout } = useAuth()
+  const queryClient = useQueryClient()
   const { locale, t } = useLanguage()
   const cacheKey = getAuthCacheKey(token, user)
   const [activeTab, setActiveTab] = useState<DashboardTab>('repo')
@@ -298,12 +349,91 @@ export function DashboardPage() {
   const [jobsError, setJobsError] = useState<string | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null)
+  const [webhookUpdatingRepoId, setWebhookUpdatingRepoId] = useState<string | null>(null)
+  const [webhookError, setWebhookError] = useState<{
+    message: string
+    isPermission: boolean
+  } | null>(null)
+  // Server-side webhook state per repository full name. Missing = not loaded
+  // yet; `unknown` = lookup failed → keep the locally cached toggle value.
+  const [webhookStatuses, setWebhookStatuses] = useState<
+    Record<string, RepositoryWebhookStatus>
+  >({})
+  const [triggerFilter, setTriggerFilter] = useState<TriggerFilter>('all')
+  const [webhookToasts, setWebhookToasts] = useState<WebhookToast[]>([])
+  // Job ids already seen by history polling; anything new that came from a
+  // webhook raises a toast.
+  const knownJobIdsRef = useRef<Set<string> | null>(null)
   const loadingTimerRef = useRef<number | null>(null)
   const historyRepoQuery = activeTab === 'pipeline' ? searchKeyword : ''
 
   useEffect(() => {
     dayjs.locale(locale)
   }, [locale])
+
+  const dismissWebhookToast = useCallback((jobId: string) => {
+    setWebhookToasts((prev) => prev.filter((toast) => toast.jobId !== jobId))
+  }, [])
+
+  const pushWebhookToasts = useCallback(
+    (items: WebhookToast[]) => {
+      if (items.length === 0) return
+      setWebhookToasts((prev) => {
+        const existing = new Set(prev.map((toast) => toast.jobId))
+        // Keep the stack short: newest three only.
+        return [...items.filter((item) => !existing.has(item.jobId)), ...prev].slice(0, 3)
+      })
+      for (const item of items) {
+        window.setTimeout(() => dismissWebhookToast(item.jobId), WEBHOOK_TOAST_DURATION_MS)
+      }
+    },
+    [dismissWebhookToast],
+  )
+
+  // Only the set of names matters; repos is replaced again once branches load.
+  const repoNamesKey = useMemo(
+    () => repos.map((repo) => repo.name).filter(Boolean).sort().join('\n'),
+    [repos],
+  )
+
+  useEffect(() => {
+    if (isAuthLoading || !token || !repoNamesKey) return
+    let mounted = true
+    fetchRepositoryWebhookStatuses(token, repoNamesKey.split('\n'))
+      .then((statuses) => {
+        if (mounted) setWebhookStatuses(Object.fromEntries(statuses))
+      })
+      .catch((error: unknown) => {
+        if (!mounted) return
+        if (error instanceof AuthExpiredError) {
+          logout()
+          navigate('/auth', { replace: true })
+          return
+        }
+        console.warn('[DashboardPage] webhook status lookup failed:', error)
+      })
+    return () => {
+      mounted = false
+    }
+  }, [token, isAuthLoading, repoNamesKey, logout, navigate])
+
+  // Reflect the server's webhook state in the 탐지 toggles (and their cache).
+  useEffect(() => {
+    const updates = new Map<string, boolean>()
+    for (const repo of repos) {
+      const status = webhookStatuses[repo.name]
+      if (!status || status.state === 'unknown') continue
+      const enabled = status.state === 'on'
+      if (repo.detectEnabled !== enabled) updates.set(repo.id, enabled)
+    }
+    if (updates.size === 0) return
+    updates.forEach((enabled, repoId) => setRepoDetectEnabled(cacheKey, repoId, enabled))
+    setRepos((prev) =>
+      prev.map((repo) =>
+        updates.has(repo.id) ? { ...repo, detectEnabled: updates.get(repo.id)! } : repo,
+      ),
+    )
+  }, [webhookStatuses, repos, cacheKey])
 
   useEffect(() => {
     if (isAuthLoading) {
@@ -420,6 +550,25 @@ export function DashboardPage() {
         const fetchedItems = response.items.map((item) => mapHistoryToPipelineItem(item))
         if (cancelled) return
 
+        // The first page establishes the baseline; later polls toast only
+        // runs that appeared since and were started by a GitHub webhook.
+        const known = knownJobIdsRef.current
+        if (initial || !known) {
+          knownJobIdsRef.current = new Set(fetchedItems.map((item) => item.jobId))
+        } else {
+          const fresh = fetchedItems.filter((item) => !known.has(item.jobId))
+          fresh.forEach((item) => known.add(item.jobId))
+          pushWebhookToasts(
+            fresh
+              .filter((item) => isWebhookTrigger(item.triggerSource))
+              .map((item) => ({
+                jobId: item.jobId,
+                repoName: item.repoName,
+                branch: item.branch,
+              })),
+          )
+        }
+
         setPipelines((previous) => {
           const previousById = new Map(previous.map((item) => [item.jobId, item]))
           const refreshedItems = fetchedItems.map((item) =>
@@ -447,7 +596,7 @@ export function DashboardPage() {
 
         if (initial && response.items.length > 0) {
           const historyById = new Map(response.items.map((item) => [item.jobId, item]))
-          void fetchPipelineHistoryDetails(token!, response.items).then((detailsById) => {
+          void fetchPipelineHistoryDetails(queryClient, token!, response.items).then((detailsById) => {
             if (cancelled || detailsById.size === 0) return
             setPipelines((previous) => {
               const enriched = previous.map((item) => {
@@ -462,8 +611,8 @@ export function DashboardPage() {
         }
 
         const hasActive = response.items.some((item) => !TERMINAL_PIPELINE_STATUS.has(item.status))
-        if (!cancelled && hasActive) {
-          timer = window.setTimeout(() => tick(false), 3000)
+        if (!cancelled) {
+          timer = window.setTimeout(() => tick(false), hasActive ? 3000 : 10000)
         }
       } catch (error) {
         if (cancelled) return
@@ -486,7 +635,7 @@ export function DashboardPage() {
       cancelled = true
       if (timer !== null) window.clearTimeout(timer)
     }
-  }, [token, cacheKey, historyRepoQuery, isAuthLoading, logout, navigate])
+  }, [token, cacheKey, historyRepoQuery, isAuthLoading, logout, navigate, pushWebhookToasts, queryClient])
 
   const loadMoreHistory = async () => {
     if (!token || isHistoryLoadingMore || !historyHasMore) return
@@ -499,7 +648,7 @@ export function DashboardPage() {
         limit: HISTORY_PAGE_SIZE,
         offset: pipelines.length,
       })
-      const nextItems = await enrichPipelineHistory(token, response.items)
+      const nextItems = await enrichPipelineHistory(queryClient, token, response.items)
       setPipelines((previous) => {
         const previousIds = new Set(previous.map((item) => item.jobId))
         const merged = [...previous, ...nextItems.filter((item) => !previousIds.has(item.jobId))]
@@ -592,14 +741,28 @@ export function DashboardPage() {
     [repos, searchKeyword],
   )
 
+  const triggerCounts = useMemo(() => {
+    const webhook = pipelines.filter((item) => isWebhookTrigger(item.triggerSource)).length
+    return { all: pipelines.length, webhook, manual: pipelines.length - webhook }
+  }, [pipelines])
+
   const filteredPipelines = useMemo(
     () =>
       pipelines.filter((item) => {
+        const fromWebhook = isWebhookTrigger(item.triggerSource)
+        if (triggerFilter === 'webhook' && !fromWebhook) return false
+        if (triggerFilter === 'manual' && fromWebhook) return false
         const text = `${item.repoName} ${item.description}`.toLowerCase()
         return text.includes(searchKeyword.toLowerCase())
       }),
-    [pipelines, searchKeyword],
+    [pipelines, searchKeyword, triggerFilter],
   )
+
+  const triggerLabel = (source: string | undefined) => {
+    if (isWebhookTrigger(source)) return t('dashboard.trigger.webhook')
+    if (!source || source === 'manual') return t('dashboard.trigger.manual')
+    return source
+  }
 
   const deleteTarget = useMemo(
     () => pipelines.find((item) => item.jobId === deleteTargetId) ?? null,
@@ -734,6 +897,36 @@ export function DashboardPage() {
               />
             </label>
               </div>
+            {webhookError ? (
+              <Card
+                role="alert"
+                className="flex flex-col gap-3 border-[#7F1D1D] bg-[#2A1515] p-4 text-[13px] text-[#FCA5A5] md:flex-row md:items-start md:justify-between"
+              >
+                <p className="whitespace-pre-line break-words">{webhookError.message}</p>
+                <div className="flex shrink-0 gap-2">
+                  {webhookError.isPermission ? (
+                    <Button
+                      type="button"
+                      onClick={() => {
+                        setWebhookError(null)
+                        logout()
+                        navigate('/auth', { replace: true })
+                      }}
+                    >
+                      {t('dashboard.reLogin')}
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="text-[#FCA5A5] hover:bg-white/10"
+                    onClick={() => setWebhookError(null)}
+                  >
+                    {t('dashboard.close')}
+                  </Button>
+                </div>
+              </Card>
+            ) : null}
             {isLoading || isReposLoading ? (
               Array.from({ length: 3 }).map((_, idx) => (
                 <Card key={idx} className="h-36 animate-pulse border-gray-500/60 bg-gray-700/30" />
@@ -775,6 +968,23 @@ export function DashboardPage() {
                         <Badge className="border-white/15 bg-[#3A3A3A] text-[#9CA3AF]">
                           <Globe className="mr-1 h-3 w-3" /> {repo.visibility}
                         </Badge>
+                        {webhookStatuses[repo.name]?.state === 'on' ? (
+                          <Badge
+                            className="border-[#6EE7B7] bg-[#065F46] text-[#6EE7B7]"
+                            title={t('dashboard.webhookOnTooltip', {
+                              events: webhookEventsLabel(webhookStatuses[repo.name]),
+                            })}
+                          >
+                            <Webhook className="mr-1 h-3 w-3" /> {t('dashboard.webhookOn')}
+                          </Badge>
+                        ) : webhookStatuses[repo.name]?.state === 'unknown' ? (
+                          <Badge
+                            className="border-white/15 bg-[#3A3A3A] text-[#9CA3AF]"
+                            title={t('dashboard.webhookUnknownTooltip')}
+                          >
+                            <Webhook className="mr-1 h-3 w-3" /> {t('dashboard.webhookUnknown')}
+                          </Badge>
+                        ) : null}
                       </div>
                       <p className="mt-2 text-[12px] text-[#6B7280]">{repo.description}</p>
                       <p className="mt-5 flex flex-wrap items-center gap-4 text-[12px] text-[#6B7280]">
@@ -820,9 +1030,11 @@ export function DashboardPage() {
                         {t('dashboard.detect')}
                         <button
                           type="button"
-                          onClick={(event) => {
+                          onClick={async (event) => {
                             event.stopPropagation()
                             const nextEnabled = !repo.detectEnabled
+                            if (!token || webhookUpdatingRepoId) return
+                            setWebhookUpdatingRepoId(repo.id)
                             setRepoDetectEnabled(cacheKey, repo.id, nextEnabled)
                             setRepos((prev) =>
                               prev.map((item) =>
@@ -831,17 +1043,71 @@ export function DashboardPage() {
                                   : item,
                               ),
                             )
+                            try {
+                              const webhook = await setRepositoryWebhook(
+                                token,
+                                repo.name,
+                                nextEnabled,
+                              )
+                              if (webhook.enabled !== nextEnabled) {
+                                throw new Error('서버가 요청한 웹훅 상태를 반영하지 않았습니다.')
+                              }
+                              setWebhookStatuses((prev) => ({
+                                ...prev,
+                                [repo.name]: {
+                                  state: webhook.enabled ? 'on' : 'off',
+                                  webhook,
+                                },
+                              }))
+                              setWebhookError(null)
+                            } catch (error) {
+                              setRepoDetectEnabled(cacheKey, repo.id, !nextEnabled)
+                              setRepos((prev) =>
+                                prev.map((item) =>
+                                  item.id === repo.id
+                                    ? { ...item, detectEnabled: !nextEnabled }
+                                    : item,
+                                ),
+                              )
+                              if (error instanceof AuthExpiredError) {
+                                logout()
+                                navigate('/auth', { replace: true })
+                                return
+                              }
+                              // Separate from reposError so a webhook failure
+                              // doesn't replace the whole repository list.
+                              setWebhookError({
+                                message: `${repo.name}: ${
+                                  error instanceof Error
+                                    ? error.message
+                                    : '저장소 웹훅 설정을 변경하지 못했습니다.'
+                                }`,
+                                isPermission:
+                                  error instanceof WebhookRequestError &&
+                                  error.isPermissionError,
+                              })
+                            } finally {
+                              setWebhookUpdatingRepoId(null)
+                            }
                           }}
-                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition ${
+                          disabled={webhookUpdatingRepoId === repo.id}
+                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition disabled:cursor-wait ${
                             repo.detectEnabled ? 'bg-green-500' : 'bg-gray-500'
                           }`}
+                          role="switch"
+                          aria-checked={repo.detectEnabled}
+                          aria-busy={webhookUpdatingRepoId === repo.id}
                           aria-label={t('dashboard.detectToggle')}
                         >
                           <span
-                            className={`inline-block h-5 w-5 transform rounded-full bg-white transition ${
+                            className={`inline-flex h-5 w-5 transform items-center justify-center rounded-full bg-white transition ${
                               repo.detectEnabled ? 'translate-x-5' : 'translate-x-1'
                             }`}
-                          />
+                          >
+                            {webhookUpdatingRepoId === repo.id ? (
+                              <Loader2 className="h-3 w-3 animate-spin text-gray-500" />
+                            ) : null}
+                          </span>
                         </button>
                       </div>
                     </div>
@@ -916,6 +1182,29 @@ export function DashboardPage() {
               </label>
             </div>
 
+            <div className="flex flex-wrap gap-2" role="group" aria-label="trigger filter">
+              {(['all', 'webhook', 'manual'] as const).map((key) => {
+                const active = triggerFilter === key
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => setTriggerFilter(key)}
+                    className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[12px] font-semibold transition-colors ${
+                      active
+                        ? 'border-[#6EE7B7] bg-[#065F46] text-[#6EE7B7]'
+                        : 'border-white/15 bg-[#2E2E2E] text-[#9CA3AF] hover:text-gray-100'
+                    }`}
+                  >
+                    {key === 'webhook' ? <Webhook className="h-3.5 w-3.5" /> : null}
+                    {t(`dashboard.trigger.${key}`)}
+                    <span className="opacity-70">{triggerCounts[key]}</span>
+                  </button>
+                )
+              })}
+            </div>
+
             <Card className="p-4">
               <p className="mb-3 text-sm text-gray-200">{t('dashboard.scoreTrend')}</p>
               <div className="h-52">
@@ -959,6 +1248,13 @@ export function DashboardPage() {
                 <Card
                   key={run.jobId}
                   className="border-white/10 bg-[#262626] p-4"
+                  // Prefetch the result while the pointer is on the row, so the
+                  // result page opens from cache.
+                  onMouseEnter={() => {
+                    if (run.status === 'success' || run.status === 'failed' || run.status === 'cancelled') {
+                      prefetchRun(queryClient, token, run.jobId)
+                    }
+                  }}
                 >
                   <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
                     <div className="flex-1">
@@ -982,16 +1278,36 @@ export function DashboardPage() {
                             {run.status === 'running' ? t('dashboard.running') : t('dashboard.queued')}
                           </Badge>
                         ) : null}
+                        {run.status === 'failed' ? (
+                          <Badge
+                            className="border-[#FCA5A5] bg-transparent px-2 py-0.5 text-[11px] text-[#FCA5A5]"
+                            title={t('dashboard.runFailedHint')}
+                          >
+                            {failedStageLabel(run, t)
+                              ? t('dashboard.runFailedAt', { stage: failedStageLabel(run, t)! })
+                              : t('dashboard.runFailed')}
+                          </Badge>
+                        ) : null}
                         {run.status !== 'cancelled' && run.verdict ? (
                           <Badge
                             className={`px-2 py-0.5 text-[11px] ${verdictMeta[run.verdict].className}`}
                             title={run.verdictReason ?? undefined}
                           >
-                            {verdictMeta[run.verdict].label}
+                            {t('dashboard.securityVerdict')} {verdictMeta[run.verdict].label}
                           </Badge>
                         ) : null}
                       </div>
-                      <p className="mt-3 text-[12px] text-[#6B7280]">{run.description}</p>
+                      <p className="mt-3 flex items-center gap-2 text-[12px] text-[#6B7280]">
+                        {isWebhookTrigger(run.triggerSource) ? (
+                          <Badge className="border-[#A5B4FC] bg-[#312E81] px-2 py-0.5 text-[11px] text-[#C7D2FE]">
+                            <Webhook className="mr-1 h-3 w-3" />
+                            {t('dashboard.trigger.webhook')}
+                          </Badge>
+                        ) : (
+                          <span>{triggerLabel(run.triggerSource)}</span>
+                        )}
+                        <span>· {run.branch || '-'}</span>
+                      </p>
                       <div className="mt-4 flex flex-wrap items-center gap-4 text-[12px] text-[#6B7280]">
                         <span className="inline-flex items-center gap-1">
                           <GitBranch className="h-4.5 w-4.5 text-[#6B7280]" />
@@ -999,6 +1315,14 @@ export function DashboardPage() {
                         <Badge className="border-[#6EE7B7] bg-[#065F46] px-3 py-1 text-[12px] text-[#6EE7B7]">
                           {run.branch || '-'}
                         </Badge>
+                        {run.commitSha ? (
+                          <span
+                            className="font-mono text-[12px] text-[#6B7280]"
+                            title={run.commitSha}
+                          >
+                            {run.commitSha.slice(0, 7)}
+                          </span>
+                        ) : null}
                         <span className="inline-flex items-center gap-1 text-[12px] text-[#6B7280]">
                           <Clock3 className="h-4 w-4" /> {formatDuration(run.durationSec)}
                         </span>
@@ -1109,6 +1433,7 @@ export function DashboardPage() {
                               jobId: run.jobId,
                               repoName: run.repoName,
                               branch: run.branch,
+                              commitSha: run.commitSha,
                             },
                           })
                         }}
@@ -1176,6 +1501,62 @@ export function DashboardPage() {
           )}
         </AnimatePresence>
       </section>
+
+      <div
+        className="pointer-events-none fixed right-4 z-50 flex w-[min(22rem,calc(100vw-2rem))] flex-col gap-2"
+        style={{ bottom: 'calc(5rem + env(safe-area-inset-bottom, 0px))' }}
+        aria-live="polite"
+      >
+        <AnimatePresence initial={false}>
+          {webhookToasts.map((toast) => (
+            <motion.div
+              key={toast.jobId}
+              layout
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, x: 24 }}
+              transition={{ duration: 0.2 }}
+              className="pointer-events-auto"
+            >
+              <Card role="status" className="flex items-start gap-3 border-[#4338CA] bg-[#1E1B4B] p-3">
+                <Webhook className="mt-0.5 h-5 w-5 shrink-0 text-[#A5B4FC]" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-[13px] font-semibold text-[#E0E7FF]">
+                    {t('dashboard.webhookToastTitle')}
+                  </p>
+                  <p className="mt-0.5 truncate text-[12px] text-[#A5B4FC]">
+                    {toast.repoName || toast.jobId} · {toast.branch || '-'}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      dismissWebhookToast(toast.jobId)
+                      navigate('/pipeline/progress', {
+                        state: {
+                          jobId: toast.jobId,
+                          repoName: toast.repoName,
+                          branch: toast.branch,
+                        },
+                      })
+                    }}
+                    className="mt-2 text-[12px] font-semibold text-[#C7D2FE] underline underline-offset-2 hover:text-white"
+                  >
+                    {t('dashboard.webhookToastView')}
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => dismissWebhookToast(toast.jobId)}
+                  className="rounded-md p-1 text-[#A5B4FC] hover:bg-white/10 hover:text-white"
+                  aria-label={t('dashboard.close')}
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </Card>
+            </motion.div>
+          ))}
+        </AnimatePresence>
+      </div>
 
       <Dialog
         open={!!deleteTarget}

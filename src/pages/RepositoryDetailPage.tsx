@@ -1,8 +1,26 @@
 import dayjs from 'dayjs'
 import 'dayjs/locale/ko'
 import relativeTime from 'dayjs/plugin/relativeTime'
-import { ArrowUpRight, Check, CheckCircle2, CircleEllipsis, Copy, GitBranch, Globe, LoaderCircle, XCircle } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import {
+  ArrowUpRight,
+  Ban,
+  Check,
+  CheckCircle2,
+  CircleEllipsis,
+  Clock,
+  Copy,
+  ExternalLink,
+  GitBranch,
+  Globe,
+  Loader2,
+  Pencil,
+  Rocket,
+  ShieldAlert,
+  XCircle,
+} from 'lucide-react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
+import { getJobDetailCached, getJobDetailsCached, getPipelineStepsCached } from '@/hooks/useJobQueries'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
 import { type RepositoryItem } from '@/data/repositories'
@@ -17,26 +35,29 @@ import {
   AuthExpiredError,
   deriveJobStatus,
   fetchGithubRepoExtras,
-  fetchJobsByIds,
   fetchLatestCommit,
+  fetchDeploymentSettings,
   fetchPipelineDeployment,
+  fetchPipelineHistory,
+  fetchLatestRepoHistory,
   fetchReposWithBranches,
   getCachedRepos,
-  getRepoExternalUrl,
-  normalizeWebUrl,
-  fetchLatestRepoHistory,
-  fetchJobDetail,
-  historyJobDetail,
+  getRepoDomainUrl,
+  getRepoExternalDomainUrl,
   getRepoPipelineInfo,
   getTrackedJobIds,
+  normalizeHttpUrl,
+  repoNameFromUrl,
+  saveDeploymentSettings,
   setCachedRepos,
-  setRepoExternalUrl,
-  fetchRepoDeploymentSettings,
-  saveRepoDeploymentSettings,
+  setRepoDomainUrl,
+  setRepoExternalDomainUrl,
   type GitHubCommitInfo,
   type JobDetail,
-  type JobStatus,
+  type PipelineHistoryItem,
 } from '@/lib/api'
+import { buildStageViews, summarizeProgress, type StageStatus } from '@/lib/pipelineExecution'
+import { parseGateMessage } from '@/lib/gateMessage'
 
 dayjs.extend(relativeTime)
 dayjs.locale('ko')
@@ -50,9 +71,23 @@ const pipelineStatusMeta = {
     className: 'border-[#F87171] bg-[#7F1D1D] text-[#FCA5A5]',
     icon: XCircle,
   },
-  running: { className: 'border-blue-400 bg-blue-950 text-blue-200', icon: LoaderCircle },
-  queued: { className: 'border-amber-400 bg-amber-950 text-amber-200', icon: CircleEllipsis },
-  cancelled: { className: 'border-gray-400 bg-gray-800 text-gray-200', icon: XCircle },
+  running: {
+    className: 'border-[#60A5FA] bg-[#1E3A8A] text-[#BFDBFE]',
+    icon: Loader2,
+  },
+  queued: {
+    className: 'border-[#6B7280] bg-[#374151] text-[#D1D5DB]',
+    icon: Clock,
+  },
+  cancelled: {
+    className: 'border-[#6B7280] bg-[#374151] text-[#D1D5DB]',
+    icon: Ban,
+  },
+  // Pipeline ran fine but the security gate stopped the deploy.
+  blocked: {
+    className: 'border-[#F87171] bg-[#7F1D1D] text-[#FCA5A5]',
+    icon: ShieldAlert,
+  },
   pending: {
     className: 'border-[#F59E0B] bg-[#78350F] text-[#FCD34D]',
     icon: CircleEllipsis,
@@ -61,11 +96,172 @@ const pipelineStatusMeta = {
 
 type PipelineStatusKey = keyof typeof pipelineStatusMeta
 
-function jobStatusToPipelineStatus(status: JobStatus): PipelineStatusKey {
-  return status in pipelineStatusMeta ? status : 'pending'
+const stageSegmentClass: Record<StageStatus, string> = {
+  success: 'bg-[#34D399]',
+  failed: 'bg-[#F87171]',
+  running: 'bg-[#60A5FA] animate-pulse',
+  cancelled: 'bg-[#6B7280]',
+  skipped: 'bg-[#3A3A3A]',
+  pending: 'bg-[#3A3A3A]',
 }
 
-const pipelineStages = ['clone', 'install', 'security-light', 'test', 'security-deep', 'security-gate', 'build', 'deploy']
+const severityDotClass = {
+  critical: 'bg-[#EF4444]',
+  high: 'bg-[#F97316]',
+  medium: 'bg-[#EAB308]',
+  low: 'bg-[#22C55E]',
+} as const
+
+// Re-poll interval while the latest run is still queued/running.
+const LIVE_REFRESH_MS = 5000
+
+// Sort by createdAt — that's when the user *requested* the run, which is
+// the most stable "latest" signal. Completed/started timestamps can disagree
+// (long-running failed job finishing after a quick success started later).
+function timestampMs(item: Pick<JobDetail, 'createdAt' | 'startedAt' | 'completedAt'>): number {
+  const candidate = item.createdAt ?? item.startedAt ?? item.completedAt ?? ''
+  const parsed = Date.parse(candidate)
+  return Number.isNaN(parsed) ? 0 : parsed
+}
+
+// Minimal JobDetail from a history row, used when /api/jobs/{id} fails.
+function historyItemToJobDetail(item: PipelineHistoryItem): JobDetail {
+  return {
+    jobId: item.jobId,
+    repoUrl: item.repoUrl,
+    repoName: repoNameFromUrl(item.repoUrl),
+    branch: item.branch,
+    triggerSource: item.triggerSource,
+    commitSha: item.commitSha,
+    triggeredBy: '',
+    status: item.status,
+    overallResult: item.overallResult,
+    createdAt: item.createdAt,
+    startedAt: item.startedAt,
+    completedAt: item.completedAt,
+    durationSecs: item.durationSecs,
+    steps: [],
+    verdict: null,
+    verdictReason: null,
+    totalFindings: 0,
+    severityCounts: { critical: 0, high: 0, medium: 0, low: 0 },
+    summaries: [],
+    securityScore: 100,
+  }
+}
+
+type LatestRunLookup = {
+  repoName: string
+  job: JobDetail | null
+  /** Most recent successful run — the one whose deployment is "live". */
+  latestSuccessJobId: string | null
+}
+
+// Latest pipeline run for a repository. The backend history is the source
+// of truth (it includes webhook-triggered runs and runs from other devices);
+// the locally tracked job ids are only a fallback when history is
+// unavailable or empty.
+async function loadLatestRun(
+  client: QueryClient,
+  token: string,
+  cacheKey: string,
+  repoName: string,
+): Promise<LatestRunLookup> {
+  const repoKey = repoName.toLowerCase()
+  let job: JobDetail | null = null
+  let latestSuccessJobId: string | null = null
+
+  try {
+    const history = await fetchPipelineHistory(token, { repo: repoName, limit: 20 })
+    const items = history.items
+      .filter((item) => repoNameFromUrl(item.repoUrl).toLowerCase() === repoKey)
+      .sort((a, b) => timestampMs(b) - timestampMs(a))
+    // History matches by substring ("sample_java" also hits "sample_java6"), so
+    // other repos can push this one off the first page — page through then.
+    const head = items[0] ?? (history.hasMore ? await fetchLatestRepoHistory(token, repoName) : null)
+    latestSuccessJobId =
+      items.find((item) => item.status === 'success')?.jobId ??
+      (head?.status === 'success'
+        ? head.jobId
+        : history.hasMore
+          ? (await fetchLatestRepoHistory(token, repoName, 'success').catch(() => null))?.jobId ?? null
+          : null)
+    if (head) {
+      const detail = await getJobDetailCached(client, token, head.jobId).catch(() => null)
+      job = detail ?? historyItemToJobDetail(head)
+    }
+  } catch {
+    // fall through to the tracked-id fallback
+  }
+
+  if (!job) {
+    const trackedIds = getTrackedJobIds(cacheKey)
+    if (trackedIds.length > 0) {
+      const jobs = await getJobDetailsCached(client, token, trackedIds).catch(() => [] as JobDetail[])
+      const repoJobs = jobs
+        .filter((item) => item.repoName.toLowerCase() === repoKey)
+        .sort((a, b) => timestampMs(b) - timestampMs(a))
+      job = repoJobs[0] ?? null
+      latestSuccessJobId ??= repoJobs.find((item) => item.status === 'success')?.jobId ?? null
+    }
+  }
+
+  // Some backends omit steps from /api/jobs/{id}; the steps endpoint has them.
+  if (job && job.steps.length === 0) {
+    const steps = await getPipelineStepsCached(client, token, job.jobId).catch(() => null)
+    if (steps && steps.steps.length > 0) job = { ...job, steps: steps.steps }
+  }
+
+  return { repoName, job, latestSuccessJobId }
+}
+
+function DomainRow({
+  label,
+  icon,
+  url,
+  emptyText,
+  hint,
+  actions,
+}: {
+  label: string
+  icon: ReactNode
+  url: string
+  emptyText: string
+  hint?: string
+  actions?: ReactNode
+}) {
+  return (
+    <div className="rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
+      <div className="flex items-center justify-between gap-2">
+        <p className="inline-flex items-center gap-1.5 text-[12px] text-[#6B7280]">
+          {icon}
+          {label}
+        </p>
+        <div className="flex items-center gap-1">{actions}</div>
+      </div>
+      <div className="mt-1.5 flex items-center gap-2 text-[14px] text-[#D1D5DB]">
+        <Globe className="h-4 w-4 shrink-0 text-[#34D399]" />
+        {url ? (
+          <a
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex min-w-0 items-center gap-1 break-all text-[#34D399] underline-offset-4 hover:underline"
+          >
+            {url}
+            <ArrowUpRight className="h-3.5 w-3.5 shrink-0" />
+          </a>
+        ) : (
+          <span className="text-[#9CA3AF]">{emptyText}</span>
+        )}
+      </div>
+      {hint ? <p className="mt-1 text-[11px] text-[#6B7280]">{hint}</p> : null}
+    </div>
+  )
+}
+
+const smallButtonClass =
+  'inline-flex items-center gap-1 rounded-md border border-[#3A3A3A] bg-[#262626] px-2 py-0.5 text-[11px] text-[#9CA3AF] hover:border-[#6B7280] hover:text-[#D1D5DB] disabled:cursor-not-allowed disabled:opacity-40'
 
 function parseOwnerRepo(fullName: string): { owner: string; repo: string } | null {
   const [owner, repo] = fullName.split('/')
@@ -92,13 +288,6 @@ async function copyToClipboard(value: string): Promise<void> {
 
 export function RepositoryDetailPage() {
   const { state } = useLocation()
-  const { repoId } = useParams()
-  const { token } = useAuth()
-  return <RepositoryDetailContent key={`${token}:${(state as { repoId?: string } | null)?.repoId ?? repoId}`} />
-}
-
-function RepositoryDetailContent() {
-  const { state } = useLocation()
   const { repoId: paramRepoId = '' } = useParams()
   const { token, user, logout } = useAuth()
   const { locale, t } = useLanguage()
@@ -116,28 +305,27 @@ function RepositoryDetailContent() {
   const [isRepoLoading, setIsRepoLoading] = useState(
     () => !!token && !!resolvedRepoId && !repo,
   )
-  const [latestJob, setLatestJob] = useState<JobDetail | null>(null)
   const [latestCommit, setLatestCommit] = useState<GitHubCommitInfo | null>(null)
   // Branch list + push time fetched fresh from GitHub (public repos).
   const [githubBranches, setGithubBranches] = useState<string[] | null>(null)
   const [githubPushedAt, setGithubPushedAt] = useState<string | null>(null)
   const [repoError, setRepoError] = useState<string | null>(null)
-  // Service deployments and user-configured external URLs remain separate.
+  // Deployment URL sources are resolved automatically: backend deployment,
+  // the pipeline's cached URL, then GitHub's configured repository homepage.
   const [githubHomepageUrl, setGithubHomepageUrl] = useState<string | null>(null)
   const [deploymentLookup, setDeploymentLookup] = useState<{
     repoName: string
     url: string | null
-    jobId: string
+    jobId: string | null
   } | null>(null)
-  const [copiedRow, setCopiedRow] = useState<string | null>(null)
-  const [serverExternalUrl, setServerExternalUrl] = useState<string | null>(null)
-  const [settingsReady, setSettingsReady] = useState(false)
-  const [settingsLoadError, setSettingsLoadError] = useState(false)
-  const [savingExternal, setSavingExternal] = useState(false)
-  const [editingExternal, setEditingExternal] = useState(false)
+  const [copiedKey, setCopiedKey] = useState<'platform' | 'external' | null>(null)
+  // External (non-SecuPipeline) deployment URL entered by the user.
+  // Local edits override storage; keyed by repo so navigation resets them.
+  const [externalOverride, setExternalOverride] = useState<{ repoName: string; url: string } | null>(null)
+  const [isEditingExternal, setIsEditingExternal] = useState(false)
   const [externalDraft, setExternalDraft] = useState('')
-  const [externalError, setExternalError] = useState(false)
-  const [pipelineError, setPipelineError] = useState(false)
+  const [externalError, setExternalError] = useState<string | null>(null)
+  const [isSavingExternal, setIsSavingExternal] = useState(false)
 
   useEffect(() => {
     dayjs.locale(locale)
@@ -184,102 +372,47 @@ function RepositoryDetailContent() {
     }
   }, [token, resolvedRepoId, cacheKey, repo, logout, navigate])
 
+  // External deployment URL saved on the server (deployment-settings).
+  // localStorage stays as an offline cache of the last known value.
   useEffect(() => {
     if (!token || !repo) return
     const parsed = parseOwnerRepo(repo.name)
     if (!parsed) return
     let cancelled = false
-    fetchRepoDeploymentSettings(token, parsed.owner, parsed.repo).then(async (settings) => {
-      if (cancelled) return
-      // Migrate the old device preference only when the server has no record.
-      // A cleared server setting must not resurrect an older local value.
-      const localUrl = getRepoExternalUrl(cacheKey, repo.name)
-      const externalUrl = !settings.configured && localUrl
-        ? await saveRepoDeploymentSettings(token, parsed.owner, parsed.repo, localUrl)
-        : settings.externalUrl
-      if (cancelled) return
-      setServerExternalUrl(externalUrl)
-      setGithubHomepageUrl(settings.homepage)
-      setSettingsReady(true)
-      setSettingsLoadError(false)
-    }).catch((error: unknown) => {
-      if (cancelled) return
-      if (error instanceof AuthExpiredError) { logout(); navigate('/auth', { replace: true }); return }
-      setSettingsLoadError(true)
-    })
-    return () => { cancelled = true }
-  }, [token, repo, cacheKey, logout, navigate])
-
-  // Poll the server history, including webhook runs created on other devices.
-  useEffect(() => {
-    setLatestJob(null)
-    setDeploymentLookup(null)
-    setPipelineError(false)
-    if (!token || !repo) return
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const refresh = async () => {
-      let job: JobDetail | null = null
-      let retry = false
-      try {
-        let latest
-        try {
-          latest = await fetchLatestRepoHistory(token, repo.name)
-        } catch (error) {
-          if (error instanceof AuthExpiredError) throw error
-          // Local IDs are only a fallback when the history request fails.
-          retry = true
-          const jobs = await fetchJobsByIds(token, getTrackedJobIds(cacheKey))
-          job = jobs.filter((item) => item.repoName.toLowerCase() === repo.name.toLowerCase())
-            .sort((a, b) => (Date.parse(b.createdAt ?? b.startedAt ?? '') || 0) - (Date.parse(a.createdAt ?? a.startedAt ?? '') || 0))[0] ?? null
-          if (!job) throw error
-        }
-        if (latest) {
-          job = historyJobDetail(latest)
-          try {
-            const detail = await fetchJobDetail(token, latest.jobId)
-            if (detail) job = detail
-            else retry = true
-          }
-          catch (error) {
-            if (error instanceof AuthExpiredError) throw error
-            retry = true
-          }
-        }
-        if (cancelled) return
-        setLatestJob(job)
-        setPipelineError(retry)
-        if (!job) setDeploymentLookup(null)
-        if (job) {
-          let url = (await fetchPipelineDeployment(token, job.jobId)).url
-          let deploymentJobId = job.jobId
-          if (!url) {
-            const successful = await fetchLatestRepoHistory(token, repo.name, 'success')
-            if (successful && successful.jobId !== job.jobId) {
-              url = (await fetchPipelineDeployment(token, successful.jobId)).url
-              deploymentJobId = successful.jobId
-            }
-          }
-          if (!cancelled) setDeploymentLookup({ repoName: repo.name, url, jobId: deploymentJobId })
-        }
-      } catch (error) {
-        if (cancelled) return
-        if (error instanceof AuthExpiredError) {
-          logout()
-          navigate('/auth', { replace: true })
-          return
-        }
-        retry = true
-        setPipelineError(true)
-      } finally {
-        if (!cancelled && (retry || job?.status === 'running' || job?.status === 'queued')) {
-          timer = setTimeout(refresh, 5000)
-        }
-      }
+    fetchDeploymentSettings(token, parsed.owner, parsed.repo)
+      .then((settings) => {
+        if (cancelled || !settings) return
+        setRepoExternalDomainUrl(cacheKey, repo.name, settings.externalUrl)
+        setExternalOverride({ repoName: repo.name, url: settings.externalUrl })
+      })
+      .catch(() => {
+        // keep the cached value
+      })
+    return () => {
+      cancelled = true
     }
-    void refresh()
-    return () => { cancelled = true; clearTimeout(timer) }
-  }, [token, cacheKey, repo, logout, navigate])
+  }, [token, cacheKey, repo])
+
+  // This repo's most recent pipeline run (backend history first), cached per
+  // repo and persisted: the status card renders instantly from the last known
+  // state, then refreshes in the background — every 5s while a run is live.
+  const queryClient = useQueryClient()
+  const repoName = repo?.name ?? ''
+  const latestRunQuery = useQuery({
+    queryKey: ['repo-latest-run', cacheKey, repoName],
+    queryFn: () => loadLatestRun(queryClient, token!, cacheKey, repoName),
+    enabled: !!token && !!repoName,
+    staleTime: 10_000,
+    refetchInterval: (query) => {
+      const status = query.state.data?.job?.status
+      return status === 'queued' || status === 'running' ? LIVE_REFRESH_MS : false
+    },
+  })
+  const latestRun = latestRunQuery.data ?? null
+
+  const latestJob = latestRun && repo && latestRun.repoName === repo.name ? latestRun.job : null
+  const latestSuccessJobId =
+    latestRun && repo && latestRun.repoName === repo.name ? latestRun.latestSuccessJobId : null
 
   // Best-effort fetch of the latest commit on the repo's default branch.
   // The backend's documented surface doesn't include a commits endpoint, so
@@ -307,7 +440,7 @@ function RepositoryDetailContent() {
       })
 
     // Refresh branch list + push time straight from GitHub (public repos).
-    fetchGithubRepoExtras(parsed.owner, parsed.repo, token)
+    fetchGithubRepoExtras(parsed.owner, parsed.repo, token ?? undefined)
       .then((extras) => {
         if (cancelled) return
         if (extras.branches.length > 0) setGithubBranches(extras.branches)
@@ -321,17 +454,60 @@ function RepositoryDetailContent() {
     }
   }, [token, repo])
 
+  // SecuPipeline deployment URL recorded by the backend. The latest run is
+  // tried first; if it did not deploy (failed / still running), the most
+  // recent successful run's deployment is what is actually live.
+  const latestJobId = latestJob?.jobId ?? null
+  useEffect(() => {
+    if (!token || !repo) return
+    const candidates = [latestJobId, latestSuccessJobId].filter(
+      (id, index, list): id is string => !!id && list.indexOf(id) === index,
+    )
+    if (candidates.length === 0) return
+
+    let cancelled = false
+    ;(async () => {
+      for (const jobId of candidates) {
+        const deployment = await fetchPipelineDeployment(token, jobId).catch(() => ({ url: null }))
+        if (cancelled) return
+        if (deployment.url) {
+          setDeploymentLookup({ repoName: repo.name, url: deployment.url, jobId })
+          setRepoDomainUrl(cacheKey, repo.name, deployment.url)
+          return
+        }
+      }
+      if (!cancelled) setDeploymentLookup({ repoName: repo.name, url: null, jobId: null })
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [token, latestJobId, latestSuccessJobId, repo, cacheKey])
+
   // Use considerVerdict=false here: the "파이프라인 최근 상태" badge reflects
   // whether the pipeline EXECUTED successfully, not whether the security
   // scan exceeded its threshold. The verdict is a separate concern surfaced
   // on the dashboard.
-  const pipelineStatusKey: PipelineStatusKey = useMemo(() => {
-    if (latestJob)
-      return jobStatusToPipelineStatus(
-        deriveJobStatus(latestJob, { considerVerdict: false }),
-      )
-    return 'pending'
+  const runSummary = useMemo(() => {
+    if (!latestJob) return null
+    const status = deriveJobStatus(latestJob, { considerVerdict: false })
+    const stages = buildStageViews(latestJob.steps, status)
+    const progress = summarizeProgress(stages)
+    return {
+      status,
+      stages,
+      progress,
+      failedStage: stages.find((stage) => stage.status === 'failed') ?? null,
+      cancelledStage: stages.find((stage) => stage.status === 'cancelled') ?? null,
+      runningStage: progress.currentIndex >= 0 ? stages[progress.currentIndex] : null,
+    }
   }, [latestJob])
+
+  const isGateBlocked =
+    runSummary?.status === 'failed' && runSummary.failedStage?.key === 'gate'
+  const pipelineStatusKey: PipelineStatusKey = isGateBlocked
+    ? 'blocked'
+    : runSummary?.status ?? repo?.pipelineStatus ?? 'pending'
 
   if (isRepoLoading) {
     return (
@@ -408,16 +584,34 @@ function RepositoryDetailContent() {
       ? dayjs(pushedAtRaw).format('YYYY-MM-DD HH:mm')
       : pushedAtRaw
     : '-'
-  const domainUrl = deploymentLookup?.repoName === repo.name ? deploymentLookup.url ?? '' : ''
-  // Separate from the legacy cache that was also written by pipeline deployments.
-  const savedExternalUrl = serverExternalUrl ?? getRepoExternalUrl(cacheKey, repo.name)
-  const externalUrl = savedExternalUrl || normalizeWebUrl(repo.domainUrl || githubHomepageUrl || '')
-  const duplicateUrl = !!externalUrl && externalUrl === domainUrl
-  const stageStates = pipelineStages.map((type) => latestJob?.steps.find((step) =>
-    step.stepType === type || step.stepName === type ||
-    ({ 'security-light': 'lightweight-security', 'security-deep': 'deep-security', 'security-gate': 'security_gate' } as Record<string, string>)[type] === step.stepName))
-  const failedStage = stageStates.findIndex((step) => step?.status === 'failed')
-  const failureReason = (failedStage >= 0 ? stageStates[failedStage]?.errorMessage : null) || latestJob?.errorMessage
+  // 1) SecuPipeline deployment: backend record first, then the URL the
+  //    pipeline page cached from the deploy-stage logs (full_name key, then
+  //    the numeric id as legacy migration).
+  const repoDeployment = deploymentLookup?.repoName === repo.name ? deploymentLookup : null
+  const platformUrl =
+    repoDeployment?.url ||
+    normalizeHttpUrl(getRepoDomainUrl(cacheKey, repo.name) || getRepoDomainUrl(cacheKey, repo.id))
+  const platformJobId = repoDeployment?.url ? repoDeployment.jobId : null
+
+  const externalManualUrl =
+    externalOverride?.repoName === repo.name
+      ? externalOverride.url
+      : getRepoExternalDomainUrl(cacheKey, repo.name)
+  const setExternalManualUrl = (url: string) => setExternalOverride({ repoName: repo.name, url })
+
+  // 2) External deployment: what the user entered, else the GitHub
+  //    repository's "homepage" setting (via backend /api/repos or GitHub).
+  const githubExternalUrl = normalizeHttpUrl(repo.domainUrl) || normalizeHttpUrl(githubHomepageUrl)
+  const externalUrl = normalizeHttpUrl(externalManualUrl) || githubExternalUrl
+  // The GitHub homepage often points at the very URL SecuPipeline deployed;
+  // don't list the same address twice.
+  const showExternalUrl = externalUrl && externalUrl !== platformUrl ? externalUrl : ''
+  const externalSourceHint = showExternalUrl
+    ? normalizeHttpUrl(externalManualUrl)
+      ? t('repo.domain.sourceManual')
+      : t('repo.domain.sourceGithub')
+    : undefined
+
   const description = repo.description?.trim() || t('repo.noDescription')
   const branch =
     pipelineInfo?.branch?.trim() ||
@@ -426,31 +620,116 @@ function RepositoryDetailContent() {
     repo.branches[0] ||
     '-'
 
-  const handleDomainCopy = async (row: string, value: string) => {
+  const handleCopy = async (key: 'platform' | 'external', value: string) => {
+    if (!value) return
     try {
       await copyToClipboard(value)
-      setCopiedRow(row)
-      window.setTimeout(() => setCopiedRow(null), 1500)
-    } catch { setCopiedRow(null) }
+      setCopiedKey(key)
+      window.setTimeout(() => setCopiedKey((current) => (current === key ? null : current)), 1500)
+    } catch {
+      setCopiedKey(null)
+    }
+  }
+
+  const startExternalEdit = () => {
+    setExternalDraft(normalizeHttpUrl(externalManualUrl) || showExternalUrl || '')
+    setExternalError(null)
+    setIsEditingExternal(true)
+  }
+
+  const persistExternal = async (url: string): Promise<boolean> => {
+    const parsed = parseOwnerRepo(repo.name)
+    if (!token || !parsed) return false
+    setIsSavingExternal(true)
+    setExternalError(null)
+    try {
+      const saved = await saveDeploymentSettings(token, parsed.owner, parsed.repo, url)
+      const stored = url ? saved.externalUrl : ''
+      setRepoExternalDomainUrl(cacheKey, repo.name, stored)
+      setExternalManualUrl(stored)
+      return true
+    } catch (error) {
+      setExternalError(error instanceof Error ? error.message : String(error))
+      return false
+    } finally {
+      setIsSavingExternal(false)
+    }
   }
 
   const saveExternal = async () => {
-    const parsed = parseOwnerRepo(repo.name)
-    if (!token || !parsed || savingExternal) return
-    setSavingExternal(true)
-    try {
-      const url = await saveRepoDeploymentSettings(token, parsed.owner, parsed.repo, externalDraft)
-      setServerExternalUrl(url)
-      setSettingsReady(true)
-      setSettingsLoadError(false)
-      // Best-effort cache; server persistence determines whether saving succeeded.
-      try { setRepoExternalUrl(cacheKey, repo.name, url) } catch { /* storage may be disabled */ }
-      setEditingExternal(false)
-      setExternalError(false)
-    } catch (error) {
-      if (error instanceof AuthExpiredError) { logout(); navigate('/auth', { replace: true }); return }
-      setExternalError(true)
-    } finally { setSavingExternal(false) }
+    const raw = externalDraft.trim()
+    const normalized = normalizeHttpUrl(raw)
+    if (raw && !normalized) {
+      setExternalError(t('repo.domain.invalid'))
+      return
+    }
+    // Saving the value GitHub already provides is not an override.
+    const toStore = normalized && normalized !== githubExternalUrl ? normalized : ''
+    if (await persistExternal(toStore)) setIsEditingExternal(false)
+  }
+
+  const removeExternal = async () => {
+    if (await persistExternal('')) setIsEditingExternal(false)
+  }
+
+  const copyButton = (key: 'platform' | 'external', value: string) => (
+    <button
+      type="button"
+      onClick={() => void handleCopy(key, value)}
+      disabled={!value}
+      className={smallButtonClass}
+    >
+      {copiedKey === key ? <Check className="h-3 w-3 text-[#34D399]" /> : <Copy className="h-3 w-3" />}
+      {copiedKey === key ? t('repo.copied') : t('repo.copy')}
+    </button>
+  )
+
+  const runTime = latestJob ? latestJob.createdAt ?? latestJob.startedAt : null
+  const runTimeLabel = runTime && dayjs(runTime).isValid() ? dayjs(runTime).fromNow() : '-'
+  const stageLabel = (key: string) => t(`run.stage.${key}`)
+
+  let runHeadline: string | null = null
+  let runErrorDetail: string | null = null
+  if (runSummary) {
+    const { status: runStatus, progress, failedStage, cancelledStage, runningStage } = runSummary
+    if (isGateBlocked) {
+      runHeadline = t('repo.run.gateBlocked')
+      runErrorDetail = failedStage?.errorMessage?.trim() || latestJob?.verdictReason?.trim() || latestJob?.errorMessage?.trim() || null
+    } else if (runStatus === 'failed') {
+      runHeadline = failedStage
+        ? t('repo.run.failedAt', { stage: `${failedStage.number}. ${stageLabel(failedStage.key)}` })
+        : t('repo.run.failedUnknownStage')
+      runErrorDetail =
+        failedStage?.errorMessage?.trim() ||
+        latestJob?.verdictReason?.trim() ||
+        latestJob?.errorMessage?.trim() ||
+        t('repo.run.noErrorReason')
+    } else if (runStatus === 'cancelled') {
+      runHeadline = cancelledStage
+        ? t('repo.run.cancelledAt', { stage: `${cancelledStage.number}. ${stageLabel(cancelledStage.key)}` })
+        : t('repo.status.cancelled')
+    } else if (runStatus === 'running') {
+      runHeadline = runningStage
+        ? t('repo.run.runningAt', {
+            stage: `${runningStage.number}. ${stageLabel(runningStage.key)}`,
+            completed: progress.completed,
+            total: progress.total,
+          })
+        : t('repo.status.running')
+    } else if (runStatus === 'queued') {
+      runHeadline = t('repo.run.queued')
+    } else {
+      runHeadline = t('repo.run.succeeded', { total: progress.total })
+    }
+  }
+
+  const gateSummary = parseGateMessage(runErrorDetail)
+
+  const openLatestRun = () => {
+    if (!latestJob) return
+    navigate('/pipeline/progress', {
+      state: { jobId: latestJob.jobId, repoName: repo.name, branch: latestJob.branch },
+    })
   }
 
   return (
@@ -485,73 +764,184 @@ function RepositoryDetailContent() {
         <div className="grid gap-4 md:grid-cols-2">
           <Card className="border-[#404040] bg-[#262626] p-4">
             <p className="text-[16px] font-semibold text-white">{t('repo.domainTitle')}</p>
-            {[
-              { id: 'service', label: t('repo.serviceDeployment'), url: domainUrl },
-              { id: 'external', label: t('repo.externalDeployment'), url: duplicateUrl ? '' : externalUrl },
-            ].map((row) => (
-              <div key={row.id} className="mt-3 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
-                <div className="flex items-center justify-between gap-2 text-sm text-gray-300">
-                  <span>{row.label}</span>
-                  <div className="flex gap-2">
-                    {row.id === 'external' && <button type="button" disabled={!settingsReady && !settingsLoadError} onClick={() => {
-                      setExternalDraft(savedExternalUrl || externalUrl)
-                      setExternalError(false)
-                      setEditingExternal(true)
-                    }}>{t(externalUrl ? 'repo.edit' : 'repo.add')}</button>}
-                    {row.url && <button type="button" aria-label={`${row.label} ${t('repo.copy')}`} onClick={() => void handleDomainCopy(row.id, row.url)}>
-                      {copiedRow === row.id ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-                    </button>}
+            <div className="mt-3 space-y-2">
+              <DomainRow
+                label={t('repo.domain.platform')}
+                icon={<Rocket className="h-3.5 w-3.5 text-[#34D399]" />}
+                url={platformUrl}
+                emptyText={t('repo.domain.platformEmpty')}
+                hint={
+                  platformJobId
+                    ? t('repo.domain.platformFromJob', { jobId: platformJobId.slice(0, 8) })
+                    : undefined
+                }
+                actions={copyButton('platform', platformUrl)}
+              />
+
+              {isEditingExternal ? (
+                <div className="rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
+                  <p className="inline-flex items-center gap-1.5 text-[12px] text-[#6B7280]">
+                    <ExternalLink className="h-3.5 w-3.5 text-[#9CA3AF]" />
+                    {t('repo.domain.external')}
+                  </p>
+                  <input
+                    type="url"
+                    autoFocus
+                    value={externalDraft}
+                    onChange={(event) => {
+                      setExternalDraft(event.target.value)
+                      setExternalError(null)
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' && !isSavingExternal) void saveExternal()
+                      if (event.key === 'Escape') setIsEditingExternal(false)
+                    }}
+                    placeholder={t('repo.domain.externalPlaceholder')}
+                    className="mt-1.5 w-full rounded-md border border-[#404040] bg-[#171717] px-2.5 py-1.5 text-[13px] text-[#E5E7EB] outline-none placeholder:text-[#6B7280] focus:border-[#3ECF8E]"
+                  />
+                  {externalError ? (
+                    <p className="mt-1 text-[11px] text-[#FCA5A5]">{externalError}</p>
+                  ) : null}
+                  <div className="mt-2 flex justify-end gap-1">
+                    <button type="button" className={smallButtonClass} onClick={() => setIsEditingExternal(false)}>
+                      {t('repo.cancel')}
+                    </button>
+                    <button
+                      type="button"
+                      className={`${smallButtonClass} border-[#3ECF8E] text-[#6EE7B7]`}
+                      disabled={isSavingExternal}
+                      onClick={() => void saveExternal()}
+                    >
+                      {isSavingExternal ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                      {t('repo.save')}
+                    </button>
                   </div>
                 </div>
-                <div className="mt-2 flex items-center gap-2 text-sm">
-                  <Globe className="h-4 w-4 shrink-0 text-[#34D399]" />
-                  {row.url ? <a href={row.url} target="_blank" rel="noopener noreferrer" className="break-all text-[#34D399] hover:underline">{row.url}</a>
-                    : <span className="text-gray-400">{t(row.id === 'external' && duplicateUrl ? 'repo.sameDeployment' : 'repo.domainEmpty')}</span>}
-                </div>
-                {row.id === 'service' && row.url && <Link className="mt-2 block break-all text-xs text-gray-400 hover:underline" to="/pipeline/progress" state={{ jobId: deploymentLookup?.jobId }}>
-                  {t('repo.deployedBy', { id: deploymentLookup?.jobId ?? '' })}
-                </Link>}
-                {row.id === 'external' && settingsLoadError && <p role="alert" className="mt-2 text-xs text-amber-300">{t('repo.settingsLoadFailed')}</p>}
-                {row.id === 'external' && editingExternal && <form className="mt-3 space-y-2" onSubmit={(event) => { event.preventDefault(); void saveExternal() }}>
-                  <input aria-label={t('repo.externalDeployment')} className="w-full rounded border border-gray-600 bg-[#262626] p-2 text-white" value={externalDraft} onChange={(event) => setExternalDraft(event.target.value)} placeholder={t('repo.domainPlaceholder')} />
-                  <p className="text-xs text-gray-400">{t('repo.externalHint')}</p>
-                  {externalError && <p role="alert" className="text-sm text-red-300">{t('repo.invalidUrl')}</p>}
-                  <Button type="submit" disabled={savingExternal}>{t('repo.save')}</Button>
-                  <Button type="button" variant="outline" onClick={() => setEditingExternal(false)}>{t('repo.cancel')}</Button>
-                </form>}
-              </div>
-            ))}
+              ) : (
+                <DomainRow
+                  label={t('repo.domain.external')}
+                  icon={<ExternalLink className="h-3.5 w-3.5 text-[#9CA3AF]" />}
+                  url={showExternalUrl}
+                  emptyText={t('repo.domain.externalEmpty')}
+                  hint={externalError ?? externalSourceHint}
+                  actions={
+                    <>
+                      {normalizeHttpUrl(externalManualUrl) ? (
+                        <button
+                          type="button"
+                          className={smallButtonClass}
+                          disabled={isSavingExternal}
+                          onClick={() => void removeExternal()}
+                        >
+                          {t('repo.remove')}
+                        </button>
+                      ) : null}
+                      <button type="button" className={smallButtonClass} onClick={startExternalEdit}>
+                        <Pencil className="h-3 w-3" />
+                        {showExternalUrl ? t('repo.edit') : t('repo.add')}
+                      </button>
+                      {copyButton('external', showExternalUrl)}
+                    </>
+                  }
+                />
+              )}
+            </div>
           </Card>
 
           <Card className="border-[#404040] bg-[#262626] p-4">
-            <p className="text-[16px] font-semibold text-white">{t('repo.pipelineRecentStatus')}</p>
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-[16px] font-semibold text-white">{t('repo.pipelineRecentStatus')}</p>
+              {latestJob ? (
+                <button type="button" className={smallButtonClass} onClick={openLatestRun}>
+                  {t('repo.run.viewDetails')}
+                  <ArrowUpRight className="h-3 w-3" />
+                </button>
+              ) : null}
+            </div>
             <div className="mt-3 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
-              <Badge className={`inline-flex items-center gap-1.5 ${status.className}`}>
-                <StatusIcon className={`h-3.5 w-3.5 ${pipelineStatusKey === 'running' ? 'animate-spin' : ''}`} /> {t(`repo.status.${pipelineStatusKey}`)}
-              </Badge>
-              <p className="mt-2 text-[12px] text-[#9CA3AF]">
-                {latestJob
-                  ? t('repo.latestBranchStatus', { branch: latestJob.branch || '-' })
-                  : t('repo.noPipelineRuns')}
-              </p>
-              {pipelineError && <p role="alert" className="mt-2 text-sm text-amber-300">{t('repo.pipelineLoadFailed')}</p>}
-              {latestJob && <>
-                <ol aria-label={t('repo.pipelineProgress')} className="mt-3 grid grid-cols-4 gap-2">
-                  {pipelineStages.map((type, index) => {
-                    const stepStatus = stageStates[index]?.status ?? 'pending'
-                    return <li key={type} className="text-xs text-gray-300" title={t(`repo.stageStatus.${stepStatus}`)}>
-                      <div className={`mb-1 h-1.5 rounded ${stepStatus === 'failed' ? 'bg-red-400' : stepStatus === 'success' ? 'bg-emerald-400' : stepStatus === 'running' ? 'animate-pulse bg-blue-400' : 'bg-gray-600'}`} />
-                      {index + 1}. {t(`repo.stage.${type}`)}
-                    </li>
-                  })}
-                </ol>
-                {failedStage >= 0 && <div role="alert" className="mt-3 text-sm text-red-300">
-                  <p>{t('repo.failedStage', { number: failedStage + 1, stage: t(`repo.stage.${pipelineStages[failedStage]}`) })}</p>
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge className={`inline-flex items-center gap-1.5 ${status.className}`}>
+                  <StatusIcon
+                    className={`h-3.5 w-3.5 ${pipelineStatusKey === 'running' ? 'animate-spin' : ''}`}
+                  />{' '}
+                  {t(`repo.status.${pipelineStatusKey}`)}
+                </Badge>
+                {latestJob ? (
+                  <span className="text-[12px] text-[#9CA3AF]">
+                    {t('repo.run.meta', { branch: latestJob.branch || '-', time: runTimeLabel })}
+                  </span>
+                ) : null}
+              </div>
 
-                </div>}
-                {pipelineStatusKey === 'failed' && <p className="mt-2 whitespace-pre-wrap break-words text-sm text-red-300">{failureReason || t('repo.failureNotReported')}</p>}
-                <Link className="mt-3 inline-block text-sm text-emerald-300 hover:underline" to="/pipeline/progress" state={{ jobId: latestJob.jobId }}>{t('repo.viewDetails')}</Link>
-              </>}
+              {runSummary ? (
+                <>
+                  <div className="mt-3 flex gap-1" aria-hidden>
+                    {runSummary.stages.map((stage) => (
+                      <div
+                        key={stage.key}
+                        title={`${stage.number}. ${stageLabel(stage.key)} — ${stage.status}`}
+                        className={`h-1.5 flex-1 rounded-full ${stageSegmentClass[stage.status]}`}
+                      />
+                    ))}
+                  </div>
+                  <p
+                    className={`mt-2 text-[13px] ${
+                      runSummary.status === 'failed' ? 'font-semibold text-[#FCA5A5]' : 'text-[#D1D5DB]'
+                    }`}
+                  >
+                    {runHeadline}
+                  </p>
+                  {gateSummary ? (
+                    <div className="mt-2 space-y-2 rounded-md border border-[#7F1D1D] bg-[#450A0A]/40 px-3 py-2 text-[12px]">
+                      {gateSummary.reasons.length > 0 ? (
+                        <div>
+                          <p className="text-[11px] text-[#9CA3AF]">{t('repo.gate.reasons')}</p>
+                          <ul className="mt-0.5 list-disc space-y-0.5 pl-4 font-medium text-[#FCA5A5]">
+                            {gateSummary.reasons.map((reason) => (
+                              <li key={reason}>{reason}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[#D1D5DB]">
+                        {gateSummary.score !== null ? (
+                          <span>
+                            {t('repo.gate.score')}{' '}
+                            <b className="tabular-nums">{gateSummary.score}</b>
+                            <span className="text-[#9CA3AF]">/100</span>
+                          </span>
+                        ) : null}
+                        {gateSummary.counts
+                          ? (['critical', 'high', 'medium', 'low'] as const).map((key) => (
+                              <span key={key} className="inline-flex items-center gap-1">
+                                <span className={`h-2 w-2 rounded-full ${severityDotClass[key]}`} />
+                                <span className="capitalize">{key}</span>
+                                <b className="tabular-nums">{gateSummary.counts![key]}</b>
+                              </span>
+                            ))
+                          : null}
+                      </div>
+                      {gateSummary.env || gateSummary.risk || gateSummary.policy ? (
+                        <p className="text-[11px] text-[#6B7280]">
+                          {[
+                            gateSummary.env && `${t('repo.gate.env')} ${gateSummary.env}`,
+                            gateSummary.risk && `${t('repo.gate.risk')} ${gateSummary.risk}`,
+                            gateSummary.policy && `${t('repo.gate.policy')} v${gateSummary.policy}`,
+                          ]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : runErrorDetail ? (
+                    <p className="mt-1 whitespace-pre-wrap break-words rounded-md bg-[#450A0A]/40 px-2 py-1.5 font-mono text-[11px] text-[#FCA5A5]">
+                      {runErrorDetail}
+                    </p>
+                  ) : null}
+                </>
+              ) : (
+                <p className="mt-2 text-[12px] text-[#9CA3AF]">{t('repo.noPipelineRuns')}</p>
+              )}
             </div>
           </Card>
         </div>

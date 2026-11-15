@@ -1,23 +1,36 @@
-import { stepFromStream, mergeStreamStep, reduceStreamLogs, type StreamLogs, type StreamMessage } from '@/lib/pipelineStream'
 import {
+  ArrowDownToLine,
+  Ban,
+  CalendarClock,
+  Check,
   CheckCircle2,
   CircleDashed,
+  CircleDot,
+  CircleMinus,
   Clock3,
   CodeXml,
+  Copy,
   ExternalLink,
   FlaskConical,
   GitBranch,
+  GitCommitHorizontal,
   Hammer,
+  Hash,
   Loader2,
+  Maximize2,
+  Minimize2,
   Package,
   Rocket,
+  ScrollText,
   Shield,
   ShieldAlert,
   ShieldCheck,
+  Timer,
+  User,
   XCircle,
 } from 'lucide-react'
-import type { ComponentType } from 'react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import type { ComponentType, ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { MainLayout } from '@/components/layout/MainLayout'
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion'
@@ -33,1770 +46,875 @@ import {
 } from '@/components/ui/dialog'
 import { useAuth } from '@/contexts/AuthContext'
 import { getAuthCacheKey } from '@/contexts/AuthContext'
+import { useLanguage } from '@/contexts/LanguageContext'
+import { usePipelineExecution, type ConnectionState } from '@/hooks/usePipelineExecution'
+import { useQueryClient } from '@tanstack/react-query'
+import { prefetchJobResult } from '@/hooks/useJobQueries'
+import { isWebhookTrigger, setRepoDomainUrl, setRepoPipelineInfo } from '@/lib/api'
 import {
-  cancelPipeline,
-  fetchJobDetail,
-  fetchJobResult,
-  fetchPipelineDeployment,
-  fetchPipelineLogs,
-  fetchPipelineSteps,
-  setRepoDomainUrl,
-  setRepoPipelineInfo,
-  type JobDetail,
-  type JobStep,
-} from '@/lib/api'
-import { WS_API_BASE_URL } from '@/lib/config'
+  LOG_LEVELS,
+  PIPELINE_STAGES,
+  buildStageViews,
+  executionTone,
+  filterLogEntries,
+  formatClock,
+  formatDateTime,
+  formatDurationSecs,
+  formatLogsForCopy,
+  isTerminalJobStatus,
+  resolveLogStage,
+  stageDurationSecs,
+  summarizeProgress,
+  type ExecutionTone,
+  type LogEntry,
+  type LogFilter,
+  type LogLevel,
+  type StageStatus,
+  type StageView,
+} from '@/lib/pipelineExecution'
 
 type LocationState = {
   jobId?: string
   repoName?: string
   branch?: string
+  commitSha?: string
 }
 
-// Poll often enough that each newly appended backend log batch is reflected
-// in the UI without making the desktop app noisy.
-const POLL_INTERVAL_MS = 2500
-const WS_RECONNECT_DELAY_MS = 3000
-const TERMINAL_JOB_STATUSES = new Set(['success', 'failed', 'cancelled'])
-const TERMINAL_STEP_STATUSES = new Set(['success', 'failed', 'cancelled', 'skipped'])
+type ResolvedLogEntry = LogEntry & { resolvedStage: number | null }
 
-const stepIconMap: { match: RegExp; icon: ComponentType<{ className?: string }> }[] = [
-  { match: /clone|checkout|git|레포|클론/i, icon: GitBranch },
-  { match: /install|deps|dependen|npm|pip|pnpm|yarn|의존성|설치/i, icon: Package },
-  // Security Gate must be checked BEFORE the generic /security/ pattern,
-  // otherwise the gate step would be classified as a regular scan step.
-  { match: /gate|verdict|threshold|게이트/i, icon: ShieldCheck },
-  { match: /deep|deep-scan|sast-deep|심화/i, icon: ShieldAlert },
-  { match: /scan|secret|gitleaks|semgrep|sast|security|보안|검사/i, icon: Shield },
-  { match: /test|lint|coverage|테스트/i, icon: FlaskConical },
-  { match: /build|compile|bundle|빌드/i, icon: Hammer },
-  { match: /deploy|release|publish|배포/i, icon: Rocket },
+type Translate = (key: string, replacements?: Record<string, string | number>) => string
+
+/** Language-dependent labels shared by the page's sub-components. */
+type Labels = {
+  t: Translate
+  stageName: (index: number | null) => string
+  status: (status: StageStatus) => string
+  level: (level: LogLevel) => string
+  duration: (secs: number | null | undefined) => string
+}
+
+const STAGE_ICONS: ComponentType<{ className?: string }>[] = [
+  GitBranch,
+  Package,
+  Shield,
+  FlaskConical,
+  ShieldAlert,
+  ShieldCheck,
+  Hammer,
+  Rocket,
 ]
 
-const PLACEHOLDER_STEPS: JobStep[] = [
-  { stepId: 'ph-clone', stepName: '레포지토리 클론', stepType: 'clone', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
-  { stepId: 'ph-install', stepName: '의존성 설치', stepType: 'install', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
-  { stepId: 'ph-scan-light', stepName: '경량 보안 검사', stepType: 'security-light', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
-  { stepId: 'ph-test', stepName: '테스트', stepType: 'test', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
-  { stepId: 'ph-scan-deep', stepName: '심화 보안 검사', stepType: 'security-deep', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
-  { stepId: 'ph-security-gate', stepName: '보안 게이트', stepType: 'security-gate', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
-  { stepId: 'ph-build', stepName: '빌드', stepType: 'build', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
-  { stepId: 'ph-deploy', stepName: '배포', stepType: 'deploy', status: 'pending', errorMessage: null, startedAt: null, endedAt: null, durationSecs: null },
-]
-
-function displayStepName(step: JobStep, idx: number) {
-  const template = PLACEHOLDER_STEPS[idx]
-  if (template) return template.stepName
-
-  const type = `${step.stepType} ${step.stepName}`.toLowerCase()
-  if (/clone|checkout|git/.test(type)) return '레포지토리 클론'
-  if (/install|deps|dependen|npm|pip|pnpm|yarn/.test(type)) return '의존성 설치'
-  if (/light|scan-light|security-light/.test(type)) return '경량 보안 검사'
-  if (/test|lint|coverage/.test(type)) return '테스트'
-  if (/deep|scan-deep|security-deep|sast-deep/.test(type)) return '심화 보안 검사'
-  if (/gate|verdict|threshold/.test(type)) return '보안 게이트'
-  if (/build|compile|bundle/.test(type)) return '빌드'
-  if (/deploy|release|publish/.test(type)) return '배포'
-  return step.stepName || step.stepType || `단계 ${idx + 1}`
+const STATUS_COLOR: Record<StageStatus, string> = {
+  success: '#3ECF8E',
+  running: '#60A5FA',
+  failed: '#EF4444',
+  pending: '#6B7280',
+  skipped: '#6B7280',
+  cancelled: '#9CA3AF',
 }
 
-function stepIndexFromName(name: string): number | null {
-  const key = name.toLowerCase().replace(/\.log$/i, '').replace(/_/g, '-').trim()
-  if (/clone|checkout|repository|레포|클론/.test(key)) return 0
-  if (/install|deps|dependency|의존성|설치/.test(key)) return 1
-  if (/lightweight-security|light-security|security-light|gitleaks|경량/.test(key)) return 2
-  if (/test|jest|lint|테스트/.test(key)) return 3
-  if (/deep-security|security-deep|semgrep|sast-deep|심화/.test(key)) return 4
-  if (/security-gate|gate|verdict|보안\s*게이트/.test(key)) return 5
-  if (/build|compile|bundle|빌드/.test(key)) return 6
-  if (/deploy|release|publish|배포/.test(key)) return 7
-  return null
+const TONE_COLOR: Record<ExecutionTone, string> = {
+  success: '#3ECF8E',
+  running: '#60A5FA',
+  failed: '#EF4444',
+  queued: '#6B7280',
+  cancelled: '#9CA3AF',
 }
 
-function stepIndexFromLogLine(line: string): number | null {
-  const tag = line.match(/\[([^\]\r\n]+?)(?:\.log)?\]/)?.[1]
-  return tag ? stepIndexFromName(tag) : null
+const LEVEL_CLASS: Record<LogLevel, string> = {
+  INFO: 'text-[#93C5FD]',
+  WARN: 'text-[#FCD34D]',
+  ERROR: 'text-[#FCA5A5]',
+  DEBUG: 'text-[#9CA3AF]',
 }
 
-function stepLogKeysForIndex(idx: number): string[] {
-  switch (idx) {
-    case 0:
-      return ['clone', 'checkout']
-    case 1:
-      return ['install', 'deps', 'dependency']
-    case 2:
-      return ['lightweight-security', 'light-security', 'gitleaks']
-    case 3:
-      return ['test', 'jest', 'lint']
-    case 4:
-      return ['deep-security', 'sast-deep', 'semgrep']
-    case 5:
-      return ['security-gate', 'gate', 'verdict']
-    case 6:
-      return ['build', 'compile', 'bundle']
-    case 7:
-      return ['deploy', 'release', 'publish']
+const CONNECTION_STYLE: Record<ConnectionState, { color: string; pulse: boolean }> = {
+  connecting: { color: '#F59E0B', pulse: true },
+  live: { color: '#34D399', pulse: true },
+  reconnecting: { color: '#F59E0B', pulse: false },
+  closed: { color: '#6B7280', pulse: false },
+}
+
+function stageKey(index: number) {
+  return `stage-${index}`
+}
+
+function shortSha(sha: string) {
+  return sha ? sha.slice(0, 7) : ''
+}
+
+function commitUrl(repoUrl: string, sha: string): string | null {
+  if (!sha || !/github\.com/i.test(repoUrl)) return null
+  return `${repoUrl.replace(/\.git$/, '').replace(/\/+$/, '')}/commit/${sha}`
+}
+
+function toMs(value: string | null): number | null {
+  if (!value) return null
+  const ms = Date.parse(value)
+  return Number.isNaN(ms) ? null : ms
+}
+
+/** Re-renders every second while `active`, for live elapsed timers. */
+function useNow(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!active) return
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [active])
+  return now
+}
+
+function StageStatusIcon({ status, animate, className = 'h-6 w-6' }: {
+  status: StageStatus
+  animate: boolean
+  className?: string
+}) {
+  const style = { color: STATUS_COLOR[status] }
+  switch (status) {
+    case 'success':
+      return <CheckCircle2 className={className} style={style} />
+    case 'failed':
+      return <XCircle className={className} style={style} />
+    case 'running':
+      return animate ? (
+        <Loader2 className={`${className} animate-spin`} style={style} />
+      ) : (
+        <CircleDot className={className} style={style} />
+      )
+    case 'skipped':
+      return <CircleMinus className={className} style={style} />
+    case 'cancelled':
+      return <Ban className={className} style={style} />
     default:
-      return []
+      return <CircleDashed className={className} style={style} />
   }
 }
 
-function iconForStep(step: JobStep): ComponentType<{ className?: string }> {
-  const haystack = `${step.stepName} ${step.stepType}`
-  for (const entry of stepIconMap) {
-    if (entry.match.test(haystack)) return entry.icon
-  }
-  return ShieldAlert
-}
-
-function formatDuration(totalSeconds: number) {
-  if (!totalSeconds || totalSeconds < 0) return '0s'
-  const minutes = Math.floor(totalSeconds / 60)
-  const seconds = Math.round(totalSeconds % 60)
-  if (minutes === 0) return `${seconds}s`
-  return `${minutes}m ${String(seconds).padStart(2, '0')}s`
-}
-
-function buildStableLogTimestamps(count: number, totalSeconds: number) {
-  if (count <= 0) return []
-  const total = Math.max(0, Math.round(totalSeconds || 0))
-  if (count === 1) return [total]
-  return Array.from({ length: count }, (_, idx) =>
-    Math.min(total, Math.round((total * idx) / (count - 1))),
+function MetaItem({ icon: Icon, label, children }: {
+  icon: ComponentType<{ className?: string }>
+  label: string
+  children: ReactNode
+}) {
+  return (
+    <div className="min-w-0">
+      <p className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-[#6B7280]">
+        <Icon className="h-3.5 w-3.5" /> {label}
+      </p>
+      <div className="mt-1 truncate text-[14px] text-[#E5E7EB]">{children}</div>
+    </div>
   )
 }
 
-function boundedDurationSecs(value: number, capSecs: number): number | null {
-  if (!Number.isFinite(value) || value <= 0) return null
-  const rounded = Math.max(1, Math.round(value))
-  const cap = Math.max(0, Math.round(capSecs || 0))
-  if (cap > 0 && rounded > Math.max(1, Math.ceil(cap * 1.2))) return null
-  return rounded
-}
-
-function backendStepDurationSecs(step: JobStep, capSecs: number): number | null {
-  const explicitDuration = boundedDurationSecs(step.durationSecs ?? 0, capSecs)
-  if (explicitDuration !== null) return explicitDuration
-
-  if (step.startedAt && step.endedAt) {
-    const startMs = Date.parse(step.startedAt)
-    const endMs = Date.parse(step.endedAt)
-    if (!Number.isNaN(startMs) && !Number.isNaN(endMs) && endMs > startMs) {
-      return boundedDurationSecs((endMs - startMs) / 1000, capSecs)
-    }
+function LogLines({ entries, emptyText, showStage, labels }: {
+  entries: ResolvedLogEntry[]
+  emptyText: string
+  showStage: boolean
+  labels: Labels
+}) {
+  if (entries.length === 0) {
+    return <p className="font-mono text-[12px] text-[#6B7280]">{emptyText}</p>
   }
-
-  return null
-}
-
-function stepDurationStorageKey(jobId: string) {
-  return `secupipeline:step-durations:${jobId}`
-}
-
-function readStepDurationCache(jobId: string): Record<string, number> {
-  if (!jobId) return {}
-  try {
-    const raw = window.localStorage.getItem(stepDurationStorageKey(jobId))
-    if (!raw) return {}
-    const parsed = JSON.parse(raw) as Record<string, unknown>
-    return Object.fromEntries(
-      Object.entries(parsed).filter(([, value]) => typeof value === 'number' && value >= 0),
-    ) as Record<string, number>
-  } catch {
-    return {}
-  }
-}
-
-function writeStepDurationCache(jobId: string, durations: Record<string, number>) {
-  if (!jobId) return
-  try {
-    window.localStorage.setItem(stepDurationStorageKey(jobId), JSON.stringify(durations))
-  } catch {
-    // localStorage can be unavailable in hardened desktop/webview contexts.
-  }
-}
-
-function statusColor(status: JobStep['status']): string {
-  switch (status) {
-    case 'success':
-      return '#3ECF8E'
-    case 'failed':
-      return '#EF4444'
-    case 'running':
-      return '#F59E0B'
-    case 'skipped':
-      return '#6B7280'
-    default:
-      return '#404040'
-  }
-}
-
-function statusLabel(status: JobStep['status']): string {
-  switch (status) {
-    case 'success':
-      return '성공'
-    case 'failed':
-      return '실패'
-    case 'running':
-      return '진행 중'
-    case 'skipped':
-      return '건너뜀'
-    default:
-      return '대기'
-  }
-}
-
-function StepStatusIcon({ status }: { status: JobStep['status'] }) {
-  if (status === 'success') return <CheckCircle2 className="h-7 w-7 text-[#3ECF8E]" />
-  if (status === 'failed') return <XCircle className="h-7 w-7 text-[#EF4444]" />
-  if (status === 'running') return <Loader2 className="h-7 w-7 animate-spin text-[#F59E0B]" />
-  return <CircleDashed className="h-7 w-7 text-[#6B7280]" />
-}
-
-function jobStatusBadge(status: string): { label: string; dotColor: string } {
-  switch (status) {
-    case 'success':
-      return { label: '성공', dotColor: '#3ECF8E' }
-    case 'failed':
-      return { label: '실패', dotColor: '#EF4444' }
-    case 'cancelled':
-      return { label: '취소됨', dotColor: '#6B7280' }
-    case 'running':
-      return { label: '실행 중', dotColor: '#F59E0B' }
-    case 'queued':
-      return { label: '대기 중', dotColor: '#6B7280' }
-    default:
-      return { label: status || '-', dotColor: '#6B7280' }
-  }
+  return (
+    <>
+      {entries.map((entry) => {
+        const at = entry.timestampMs ?? (entry.live ? entry.receivedAtMs : null)
+        return (
+          <div
+            key={entry.seq}
+            className="grid grid-cols-[auto_auto_1fr] items-baseline gap-x-2 font-mono text-[12px] leading-5"
+          >
+            <span
+              className="text-[#6B7280]"
+              title={at === null ? labels.t('run.logs.line', { n: entry.seq + 1 }) : undefined}
+            >
+              {at !== null ? formatClock(at) : `#${String(entry.seq + 1).padStart(4, '0')}`}
+            </span>
+            <span className={`min-w-[2.75rem] font-semibold ${LEVEL_CLASS[entry.level]}`}>
+              {labels.level(entry.level)}
+            </span>
+            <span className="min-w-0 break-all text-[#D1D5DB]">
+              {showStage ? (
+                <span className="mr-2 text-[#808080]">[{labels.stageName(entry.resolvedStage)}]</span>
+              ) : null}
+              {entry.message}
+            </span>
+          </div>
+        )
+      })}
+    </>
+  )
 }
 
 export function PipelineProcessPage() {
   const { state } = useLocation()
-  const { token, user } = useAuth()
-  const jobId = (state as LocationState | null)?.jobId ?? ''
-  return <PipelineProcessContent key={`${getAuthCacheKey(token, user)}:${jobId}`} />
+  const locationState = (state ?? {}) as LocationState
+  // Remount per execution so live state, timers and sockets never leak
+  // from one execution into another.
+  return <PipelineExecutionView key={locationState.jobId ?? ''} locationState={locationState} />
 }
 
-function PipelineProcessContent() {
+function PipelineExecutionView({ locationState }: { locationState: LocationState }) {
   const navigate = useNavigate()
   const { token, user } = useAuth()
-  const { state } = useLocation()
-  const locationState = (state ?? {}) as LocationState
+  const { locale, t } = useLanguage()
   const jobId = locationState.jobId ?? ''
   const cacheKey = getAuthCacheKey(token, user)
 
-  const [job, setJob] = useState<JobDetail | null>(null)
-  const [logs, setLogs] = useState<string[]>([])
-  const [deployUrl, setDeployUrl] = useState<string | null>(null)
-  const streamLiveRef = useRef(false)
-  const streamRevisionRef = useRef(0)
-  const [lastLogAt, setLastLogAt] = useState<number | null>(null)
-  const [lastEngineAt, setLastEngineAt] = useState<number | null>(null)
-  const [activityNow, setActivityNow] = useState(Date.now())
-  const [logStreamStatus, setLogStreamStatus] = useState<
-    'connecting' | 'live' | 'reconnecting' | 'complete'
-  >('connecting')
-  // Elapsed-seconds-since-job-start for each log line, captured the first
-  // time we observe it. Lets us render "+12s [build.log] ..." on the line
-  // even though the backend's lines are plain strings without timestamps.
-  const [logTimestamps, setLogTimestamps] = useState<number[]>([])
-  const [error, setError] = useState<string | null>(null)
-  const [, setIsInitialLoading] = useState(true)
-  const [elapsedSec, setElapsedSec] = useState(0)
-  const [isCancelling, setIsCancelling] = useState(false)
-  const [isCancelDialogOpen, setIsCancelDialogOpen] = useState(false)
-  const [storedStepDurations, setStoredStepDurations] = useState<Record<string, number>>(() =>
-    readStepDurationCache(jobId),
+  const labels: Labels = useMemo(
+    () => ({
+      t,
+      stageName: (index) =>
+        index === null ? t('run.stage.general') : t(`run.stage.${PIPELINE_STAGES[index].key}`),
+      status: (status) => t(`run.status.${status}`),
+      level: (level) => t(`run.level.${level}`),
+      duration: (secs) => formatDurationSecs(secs, locale),
+    }),
+    [t, locale],
   )
-  // Steps the user has expanded. We auto-add the running step's key so its
-  // logs are visible without a manual click, but never auto-close items.
-  const [openSteps, setOpenSteps] = useState<string[]>([])
 
-  // Frontend-observed per-step lifecycle: when we first saw the step
-  // transition to running, when it terminated, and where in the global
-  // log array the boundaries fell. This is our source of truth for
-  // per-step duration AND for slicing logs when the backend's per-step
-  // timestamps / log prefixes are missing. Without this, a step with no
-  // dedicated [stepname.log] tag and no startedAt/endedAt would render
-  // empty logs even though they sit in the global panel.
-  type StepLifecycleEntry = {
-    observedStartMs: number
-    observedEndMs: number | null
-    startLogIdx: number
-    endLogIdx: number | null
-  }
-  const [stepLifecycle, setStepLifecycle] = useState<
-    Record<string, StepLifecycleEntry>
-  >({})
+  const { job, logs, activity, connection, error, deployUrl, setDeployUrl, cancel } =
+    usePipelineExecution(jobId, token)
+
+  const [isCancelling, setIsCancelling] = useState(false)
+  // Raw backend detail of a failed cancel (shown as a tooltip).
+  const [cancelError, setCancelError] = useState<string | null>(null)
+  const [isCancelDialogOpen, setIsCancelDialogOpen] = useState(false)
+  const [openStages, setOpenStages] = useState<string[]>([])
+  const [logFilter, setLogFilter] = useState<LogFilter>({
+    stage: 'all',
+    levels: new Set(LOG_LEVELS),
+  })
+  const [logsOpen, setLogsOpen] = useState('all-logs')
+  const [logsExpanded, setLogsExpanded] = useState(false)
+  const [following, setFollowing] = useState(true)
+  const [copied, setCopied] = useState(false)
 
   const logContainerRef = useRef<HTMLDivElement | null>(null)
-  const logsRef = useRef<string[]>([])
-  const lastLogCount = useRef(0)
-  const startedAtMsRef = useRef<number | null>(null)
-  const hasObservedLiveRunRef = useRef(false)
-  // Last live-computed duration per step. Lets a step keep showing its real
-  // elapsed (e.g. 12s) right when status flips running→success, before the
-  // backend has filled durationSecs/endedAt. Without this the cell snaps to
-  // "0s" for a poll cycle or two and looks wrong.
-  const lastLiveStepDurationRef = useRef<Record<string, number>>({})
+  const followRef = useRef(true)
+  // When this client first saw a stage running — used only if the backend
+  // has not reported that stage's started_at yet.
+  const observedStartRef = useRef<Record<number, number>>({})
+
+  const jobStatus = job?.status ?? 'queued'
+  const isTerminal = isTerminalJobStatus(jobStatus)
+  const now = useNow(!isTerminal)
+
+  // Once the run finishes, fetch its result in the background so "보안 결과"
+  // opens instantly from the query cache.
+  const queryClient = useQueryClient()
+  useEffect(() => {
+    if (isTerminal) prefetchJobResult(queryClient, token, jobId)
+  }, [isTerminal, queryClient, token, jobId])
+
+  const stages = useMemo(() => buildStageViews(job?.steps ?? [], jobStatus), [job?.steps, jobStatus])
+  const progress = summarizeProgress(stages)
+  const tone = executionTone(jobStatus)
+  const toneColor = TONE_COLOR[tone]
+  const currentStage = progress.currentIndex >= 0 ? stages[progress.currentIndex] : null
+  const failedStage = stages.find((stage) => stage.status === 'failed') ?? null
 
   useEffect(() => {
-    const timer = window.setInterval(() => setActivityNow(Date.now()), 1000)
-    return () => window.clearInterval(timer)
-  }, [])
-
-  useEffect(() => {
-    setStoredStepDurations(readStepDurationCache(jobId))
-  }, [jobId])
-
-  useEffect(() => {
-    if (!jobId || !token) {
-      setIsInitialLoading(false)
-      return
-    }
-
-    let cancelled = false
-    let timer: number | null = null
-
-    async function tick() {
-      const streamRevision = streamRevisionRef.current
-      let isTerminal = false
-      let nextJobForTick: JobDetail | null = null
-      let polledLogCount: number | null = null
-      let polledLogTags: string[] = []
-      // Fetch independently so a transient failure in one endpoint does not
-      // discard the other's payload (e.g. logs must keep streaming even if
-      // job detail blips, and vice versa).
-      const [jobResult, logsResult, stepsResult] = await Promise.allSettled([
-        fetchJobDetail(token!, jobId),
-        fetchPipelineLogs(token!, jobId),
-        fetchPipelineSteps(token!, jobId),
-      ])
-      if (cancelled) return
-
-      let detailError: unknown = null
-      if (jobResult.status === 'fulfilled') {
-        const nextJob = jobResult.value
-        if (nextJob) {
-          nextJobForTick = nextJob
-          setJob((previous) => streamRevision === streamRevisionRef.current ? nextJob : previous ?? nextJob)
-          if (nextJob.engineHeartbeatAt) {
-            const heartbeatAt = Date.parse(nextJob.engineHeartbeatAt)
-            if (Number.isFinite(heartbeatAt)) setLastEngineAt((previous) => Math.max(previous ?? 0, heartbeatAt))
-          }
-          isTerminal = TERMINAL_JOB_STATUSES.has(nextJob.status)
-          if (!isTerminal) {
-            hasObservedLiveRunRef.current = true
-          }
-        }
-      } else {
-        detailError = jobResult.reason
-        console.error('[pipeline-poll] job detail failed:', detailError)
-      }
-
-      if (stepsResult.status === 'fulfilled' && streamRevision === streamRevisionRef.current) {
-        const response = stepsResult.value
-        if (response.job?.status) {
-          isTerminal = TERMINAL_JOB_STATUSES.has(response.job.status)
-          if (!isTerminal) hasObservedLiveRunRef.current = true
-        }
-        setJob((previous) => {
-          const base = previous ?? nextJobForTick
-          if (!base) return previous
-          return {
-            ...base,
-            // Do not erase useful job-detail step state when the dedicated
-            // endpoint is briefly empty while callbacks are being persisted.
-            steps: response.steps.length > 0 ? response.steps : base.steps,
-            ...(response.job?.status
-              ? { status: response.job.status as JobDetail['status'] }
-              : {}),
-            ...(response.job?.startedAt ? { startedAt: response.job.startedAt } : {}),
-            ...(response.job?.completedAt ? { completedAt: response.job.completedAt } : {}),
-            ...(typeof response.job?.durationSecs === 'number'
-              ? { durationSecs: response.job.durationSecs }
-              : {}),
-          }
-        })
-      } else {
-        if (stepsResult.status === 'rejected') console.error('[pipeline-poll] steps fetch failed:', stepsResult.reason)
-      }
-
-      if (logsResult.status === 'fulfilled' && !streamLiveRef.current && streamRevision === streamRevisionRef.current) {
-        const nextLogs = logsResult.value
-        const currentLogs = logsRef.current
-        const isStaleRestSnapshot =
-          nextLogs.length < currentLogs.length &&
-          nextLogs.every((line, index) => currentLogs[index] === line)
-        const effectiveLogs =
-          (nextLogs.length === 0 && currentLogs.length > 0) || isStaleRestSnapshot
-            ? currentLogs
-            : nextLogs
-        polledLogCount = nextLogs.length
-        polledLogTags = Array.from(
-          new Set(
-            nextLogs
-              .map((line) => line.match(/\[([^\]\r\n]+?)(?:\.log)?\]/)?.[1])
-              .filter((tag): tag is string => Boolean(tag))
-              .map((tag) => tag.toLowerCase().replace(/_/g, '-')),
-          ),
-        )
-        // Don't wipe accumulated logs on an empty response. The backend
-        // returns [] both for "no logs yet" and for transient errors; in
-        // either case keep the lines we already have so failures still
-        // show the captured output.
-        logsRef.current = effectiveLogs
-        setLogs(effectiveLogs)
-
-        // Stamp each NEW line with its elapsed-since-job-start so the user
-        // sees real-time "+5s [build.log] ..." in the log panel. We only
-        // append for lines we haven't seen before; existing line indexes
-        // keep their original timestamp.
-        if (nextJobForTick && TERMINAL_JOB_STATUSES.has(nextJobForTick.status)) {
-          setLogTimestamps((prev) =>
-            effectiveLogs.length === 0
-              ? prev
-              : buildStableLogTimestamps(effectiveLogs.length, nextJobForTick.durationSecs),
-          )
-        } else {
-          const jobStartMs = startedAtMsRef.current
-          if (jobStartMs !== null) {
-            const elapsed = Math.max(0, Math.round((Date.now() - jobStartMs) / 1000))
-            setLogTimestamps((prev) => {
-              if (effectiveLogs.length === 0) return prev
-              if (effectiveLogs.length <= prev.length) return prev.slice(0, effectiveLogs.length)
-              const additions = effectiveLogs.length - prev.length
-              return [...prev, ...new Array<number>(additions).fill(elapsed)]
-            })
-          }
-        }
-      } else {
-        if (logsResult.status === 'rejected') console.error('[pipeline-poll] logs fetch failed:', logsResult.reason)
-      }
-
-      if (import.meta.env.DEV) {
-        console.log('[pipeline-poll]', {
-          jobId,
-          at: new Date().toLocaleTimeString(),
-          jobOk: jobResult.status === 'fulfilled',
-          logsOk: logsResult.status === 'fulfilled',
-          stepsOk: stepsResult.status === 'fulfilled',
-          status: nextJobForTick?.status ?? null,
-          logCount: polledLogCount,
-          tags: polledLogTags,
-        })
-      }
-
-      // Only surface an error to the UI if BOTH fetches failed — otherwise
-      // the user still gets useful data and shouldn't see a red banner.
-      if (detailError && logsResult.status === 'rejected') {
-        setError(
-          detailError instanceof Error
-            ? detailError.message
-            : '파이프라인 상태를 가져오지 못했습니다.',
-        )
-      } else {
-        setError(null)
-      }
-
-      setIsInitialLoading(false)
-
-      if (!isTerminal) {
-        timer = window.setTimeout(tick, document.hidden || streamLiveRef.current ? 10000 : POLL_INTERVAL_MS)
+    for (const stage of stages) {
+      if (stage.status === 'running' && observedStartRef.current[stage.index] === undefined) {
+        observedStartRef.current[stage.index] = Date.now()
       }
     }
+  }, [stages])
 
-    tick()
+  const stageDuration = (stage: StageView) =>
+    stageDurationSecs(stage, now, observedStartRef.current[stage.index])
 
-    return () => {
-      cancelled = true
-      if (timer !== null) window.clearTimeout(timer)
+  const resolvedLogs: ResolvedLogEntry[] = useMemo(
+    () => logs.map((entry) => ({ ...entry, resolvedStage: resolveLogStage(entry, stages, now) })),
+    [logs, stages, now],
+  )
+
+  const logsByStage = useMemo(() => {
+    const map = new Map<number, ResolvedLogEntry[]>()
+    for (const entry of resolvedLogs) {
+      if (entry.resolvedStage === null) continue
+      const list = map.get(entry.resolvedStage) ?? []
+      list.push(entry)
+      map.set(entry.resolvedStage, list)
     }
-  }, [jobId, token])
+    return map
+  }, [resolvedLogs])
 
-  useEffect(() => {
-    if (!jobId || !token) return
-
-    let disposed = false
-    let completed = false
-    let socket: WebSocket | null = null
-    let reconnectTimer: number | null = null
-    let healthTimer: number | null = null
-    let lastResponse = Date.now()
-    let stream: StreamLogs = { cursor: null, lines: [], times: [] }
-    let synced = false
-    streamLiveRef.current = false
-
-    const displayStream = () => {
-      logsRef.current = stream.lines
-      setLogs(stream.lines)
-      setLogTimestamps(stream.times.map((time) => time !== null && startedAtMsRef.current !== null
-        ? Math.max(0, Math.round((time - startedAtMsRef.current) / 1000)) : 0))
-    }
-
-    let stepsRequest = 0
-    let stageRevision = 0
-    const refreshSteps = async () => {
-      const request = ++stepsRequest
-      const revision = stageRevision
-      try {
-        const response = await fetchPipelineSteps(token, jobId)
-        if (disposed || request !== stepsRequest || revision !== stageRevision) return
-        setJob((previous) => {
-          if (!previous) return previous
-          return {
-            ...previous,
-            steps: response.steps.length > 0 ? response.steps : previous.steps,
-            ...(response.job?.status
-              ? { status: response.job.status as JobDetail['status'] }
-              : {}),
-            ...(response.job?.repoUrl ? { repoUrl: response.job.repoUrl } : {}),
-            ...(response.job?.branch ? { branch: response.job.branch } : {}),
-            ...(response.job?.startedAt ? { startedAt: response.job.startedAt } : {}),
-            ...(response.job?.completedAt ? { completedAt: response.job.completedAt } : {}),
-            ...(typeof response.job?.durationSecs === 'number'
-              ? { durationSecs: response.job.durationSecs }
-              : {}),
-          }
-        })
-      } catch (refreshError) {
-        console.error('[pipeline-ws] steps refresh failed:', refreshError)
-      }
-    }
-
-    const refreshDeployment = async () => {
-      try {
-        const deployment = await fetchPipelineDeployment(token, jobId)
-        if (!disposed) setDeployUrl(deployment.url)
-      } catch (refreshError) {
-        console.error('[pipeline-ws] deployment refresh failed:', refreshError)
-      }
-    }
-
-    const refreshFinalState = async () => {
-      const [detailResult, resultResponse] = await Promise.allSettled([
-        fetchJobDetail(token, jobId),
-        fetchJobResult(token, jobId),
-      ])
-      if (disposed) return
-      if (detailResult.status === 'fulfilled' && detailResult.value) {
-        setJob(detailResult.value)
-      }
-      if (resultResponse.status === 'rejected') {
-        console.error('[pipeline-ws] result refresh failed:', resultResponse.reason)
-      }
-      try {
-        const finalLogs = await fetchPipelineLogs(token, jobId)
-        if (!disposed && finalLogs.length > 0) {
-          logsRef.current = finalLogs
-          setLogs(finalLogs)
-        }
-      } catch { /* retain streamed logs */ }
-      await refreshDeployment()
-    }
-
-    const connect = () => {
-      if (disposed || completed) return
-      const url = `${WS_API_BASE_URL}/api/pipelines/${encodeURIComponent(jobId)}/logs/ws`
-      synced = false
-      streamLiveRef.current = false
-      socket = new WebSocket(url)
-
-      socket.onopen = () => {
-        setLogStreamStatus('connecting')
-        lastResponse = Date.now()
-        socket?.send(JSON.stringify({ type: 'authenticate', token, ...(stream.cursor !== null ? { after_seq: stream.cursor } : {}) }))
-        healthTimer = window.setInterval(() => {
-          if (Date.now() - lastResponse > 30000) { socket?.close(); return }
-          if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'ping' }))
-        }, 10000)
-      }
-
-      socket.onmessage = (event) => {
-        let message: StreamMessage
-        try {
-          message = JSON.parse(String(event.data)) as StreamMessage
-        } catch (parseError) {
-          console.error('[pipeline-ws] invalid message:', parseError)
-          return
-        }
-
-        lastResponse = Date.now()
-        if (message.type === 'pong') return
-        if (message.type === 'sync_complete') {
-          synced = true
-          streamLiveRef.current = true
-          streamRevisionRef.current += 1
-          setLogStreamStatus(completed ? 'complete' : 'live')
-          if (!completed) displayStream()
-          void refreshSteps()
-          return
-        }
-        const previous = stream
-        stream = reduceStreamLogs(stream, message)
-        if (stream === previous) return
-        streamRevisionRef.current += 1
-        if (message.type === 'engine_heartbeat') {
-          const timestamp = Date.parse(message.timestamp ?? '')
-          if (Number.isFinite(timestamp)) setLastEngineAt((old) => Math.max(old ?? 0, timestamp))
-        }
-        if (message.type === 'log_snapshot') {
-          const heartbeatAt = Date.parse(message.engine_heartbeat_at ?? '')
-          const logAt = Date.parse(message.last_log_at ?? '')
-          if (Number.isFinite(heartbeatAt)) setLastEngineAt((old) => Math.max(old ?? 0, heartbeatAt))
-          if (Number.isFinite(logAt)) setLastLogAt((old) => Math.max(old ?? 0, logAt))
-          void refreshSteps()
-          if (TERMINAL_JOB_STATUSES.has(message.job_status ?? '')) {
-            completed = true
-            displayStream()
-            setLogStreamStatus('complete')
-            void refreshFinalState()
-          }
-        }
-        if (message.type === 'log_snapshot' || message.type === 'log_batch') {
-          if (message.type === 'log_batch' && stream.lines.length > previous.lines.length) {
-            const newest = stream.times.slice(previous.times.length).filter((time): time is number => time !== null)
-            if (newest.length) setLastLogAt((old) => Math.max(old ?? 0, ...newest))
-          }
-          if (synced) displayStream()
-          return
-        }
-        if (message.type?.startsWith('stage_') || message.type === 'step_started' || message.type === 'step_complete') {
-          const incoming = stepFromStream(message)
-          if (incoming) {
-            stageRevision += 1
-            setJob((previous) => previous ? {
-              ...previous,
-              latestStepName: incoming.stepName,
-              steps: mergeStreamStep(previous.steps, incoming),
-            } : previous)
-          } else {
-            void refreshSteps()
-          }
-          return
-        }
-        if (['pipeline_complete', 'pipeline_completed', 'pipeline_failed', 'pipeline_cancelled'].includes(message.type ?? '')) {
-          completed = true
-          setLogStreamStatus('complete')
-          void refreshFinalState()
-        }
-      }
-
-      socket.onerror = () => {
-        // onclose owns reconnect scheduling, avoiding two simultaneous timers.
-        console.error('[pipeline-ws] connection failed:', url)
-        socket?.close()
-      }
-
-      socket.onclose = (event) => {
-        streamLiveRef.current = false
-        if (healthTimer !== null) window.clearInterval(healthTimer)
-        healthTimer = null
-        if (!disposed && !completed) {
-          console.warn('[pipeline-ws] disconnected:', {
-            code: event.code,
-            reason: event.reason || 'handshake/connection failure',
-          })
-        }
-        socket = null
-        if (!disposed && !completed) {
-          setLogStreamStatus('reconnecting')
-          reconnectTimer = window.setTimeout(connect, WS_RECONNECT_DELAY_MS)
-        }
-      }
-    }
-
-    // Job/log/step hydration is handled by the polling effect above.
-    void refreshDeployment()
-    void fetchJobResult(token, jobId).catch(() => undefined)
-    connect()
-
-    return () => {
-      disposed = true
-      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
-      if (healthTimer !== null) window.clearInterval(healthTimer)
-      streamLiveRef.current = false
-      socket?.close()
-    }
-  }, [jobId, token])
-
-  useEffect(() => {
-    if (!logContainerRef.current) return
-    if (logs.length === lastLogCount.current) return
-    lastLogCount.current = logs.length
-    const el = logContainerRef.current
-    el.scrollTop = el.scrollHeight
-  }, [logs])
+  const visibleLogs = useMemo(() => filterLogEntries(resolvedLogs, logFilter), [resolvedLogs, logFilter])
 
   const repoName = job?.repoName || locationState.repoName || ''
   const branch = job?.branch || locationState.branch || ''
-  const apiSteps = job?.steps ?? []
-  const jobStatus = job?.status ?? 'queued'
-  const jobBadge = jobStatusBadge(jobStatus)
-  const isTerminal = TERMINAL_JOB_STATUSES.has(jobStatus)
 
-  const hasJobStarted = !!(
-    job?.startedAt ||
-    (jobStatus && jobStatus !== 'queued') ||
-    apiSteps.some((s) => s.status !== 'pending') ||
-    logs.length > 0
-  )
-
-  useEffect(() => {
-    // Priority 1: backend's authoritative startedAt — set every time it changes
-    if (job?.startedAt) {
-      const ms = Date.parse(job.startedAt)
-      if (!Number.isNaN(ms)) {
-        startedAtMsRef.current = ms
-      }
-    } else if (hasJobStarted && startedAtMsRef.current === null) {
-      // Priority 2: started but backend hasn't told us when → use now as fallback (once)
-      startedAtMsRef.current = Date.now()
+  // Commit: backend field first, then navigation state, then what the
+  // clone stage actually printed ("HEAD is now at <sha>").
+  const cloneCommit = useMemo(() => {
+    for (const entry of logsByStage.get(0) ?? []) {
+      const head = entry.raw.match(/HEAD\s+is\s+now\s+at\s+([0-9a-f]{7,40})\s+(.+)/i)
+      if (head) return { sha: head[1], message: head[2].trim() }
+      const labeled = entry.raw.match(/(?:commit|sha)\s*[:=]\s*([0-9a-f]{7,40})\b/i)
+      if (labeled) return { sha: labeled[1], message: '' }
     }
+    return null
+  }, [logsByStage])
+  const commitSha = job?.commitSha || locationState.commitSha || cloneCommit?.sha || ''
+  const commitLink = commitUrl(job?.repoUrl ?? '', commitSha)
 
-    if (!hasJobStarted) {
-      setElapsedSec(0)
-      return
-    }
-
-    const start = startedAtMsRef.current
-    if (start === null) return
-
+  const totalElapsed = useMemo(() => {
+    if (!job) return null
+    const start = job.startedAt ? Date.parse(job.startedAt) : Number.NaN
     if (isTerminal) {
-      if (job?.durationSecs && job.durationSecs > 0) {
-        setElapsedSec(job.durationSecs)
-      } else {
-        setElapsedSec(Math.max(0, Math.round((Date.now() - start) / 1000)))
-      }
+      if (job.durationSecs > 0) return job.durationSecs
+      const end = job.completedAt ? Date.parse(job.completedAt) : Number.NaN
+      return !Number.isNaN(start) && !Number.isNaN(end) ? Math.max(0, (end - start) / 1000) : null
+    }
+    if (Number.isNaN(start)) return null
+    return Math.max(0, (now - start) / 1000)
+  }, [job, isTerminal, now])
+
+  const triggerLabel = (source: string, by: string): string => {
+    const base = isWebhookTrigger(source)
+      ? t('run.trigger.webhook')
+      : !source || source === 'manual'
+        ? t('run.trigger.manual')
+        : source
+    return by ? `${base} · ${by}` : base
+  }
+
+  // Keep the running stage open; when the run fails, open the failed stage.
+  useEffect(() => {
+    const keys: string[] = []
+    if (currentStage) keys.push(stageKey(currentStage.index))
+    if (isTerminal && failedStage) keys.push(stageKey(failedStage.index))
+    if (keys.length === 0) return
+    setOpenStages((previous) => {
+      const missing = keys.filter((key) => !previous.includes(key))
+      return missing.length === 0 ? previous : [...previous, ...missing]
+    })
+  }, [currentStage, failedStage, isTerminal])
+
+  // Follow the tail only while the user is at the bottom.
+  useLayoutEffect(() => {
+    const el = logContainerRef.current
+    if (!el || !followRef.current) return
+    el.scrollTop = el.scrollHeight
+  }, [visibleLogs.length, logsExpanded, logsOpen])
+
+  // Deployment URL printed by a successful Deployment stage.
+  const lastDomainRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!job?.repoName || stages[7]?.status !== 'success') return
+    const lines = logsByStage.get(7) ?? []
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const found = lines[i].raw.match(/(https?:\/\/[^\s<>"'`)]+)/i)?.[1]?.replace(/[.,;]+$/, '')
+      if (!found) continue
+      if (lastDomainRef.current === found) return
+      lastDomainRef.current = found
+      setDeployUrl(deployUrl ?? found)
+      setRepoDomainUrl(cacheKey, job.repoName, found)
       return
     }
+  }, [job?.repoName, stages, logsByStage, deployUrl, setDeployUrl, cacheKey])
 
-    // Immediately seed once so we don't show 0 for a tick when refreshing mid-run
-    setElapsedSec(Math.max(0, Math.round((Date.now() - start) / 1000)))
-
-    const id = window.setInterval(() => {
-      const s = startedAtMsRef.current
-      if (s === null) return
-      setElapsedSec(Math.max(0, Math.round((Date.now() - s) / 1000)))
-    }, 1000)
-    return () => window.clearInterval(id)
-  }, [hasJobStarted, isTerminal, job?.startedAt, job?.durationSecs])
-
-  type LogEntry = { line: string; elapsedSec: number }
-
-  // Build a list of every log line with its elapsed-since-job-start. The
-  // single flat list is the source of truth for both the bottom "실시간
-  // 로그" panel and the per-step time-window fallback below.
-  const allLogEntries: LogEntry[] = useMemo(
-    () => logs.map((line, idx) => ({ line, elapsedSec: logTimestamps[idx] ?? 0 })),
-    [logs, logTimestamps],
-  )
-
-  const stepLogsMap = useMemo(() => {
-    const map = new Map<string, LogEntry[]>()
-    // Try several tag patterns so we recognize the step bucket regardless
-    // of which prefix style the backend chose. Order = priority:
-    //   [name]            — anywhere in the line (timestamp prefixes OK)
-    //   [name.log]        — same
-    //   name:             — at start
-    //   === name ===      — at start
-    const tagPatterns: RegExp[] = [
-      /\[([^\]\r\n]{1,80}?)(?:\.log)?\]/,
-      /^([^:\r\n]{1,80})\s*:\s/,
-      /^={2,}\s*([^=\r\n]{1,80}?)\s*={2,}/,
-    ]
-    allLogEntries.forEach((entry) => {
-      let key = '__general__'
-      for (const pat of tagPatterns) {
-        const m = entry.line.match(pat)
-        if (m && m[1]) {
-          key = m[1].toLowerCase().replace(/\.log$/i, '').replace(/_/g, '-').trim()
-          break
-        }
-      }
-      const list = map.get(key) ?? []
-      list.push(entry)
-      map.set(key, list)
+  // Feed the repository detail page's source card.
+  useEffect(() => {
+    if (!job?.repoName) return
+    setRepoPipelineInfo(cacheKey, job.repoName, {
+      branch: job.branch || undefined,
+      triggeredBy: job.triggeredBy || user?.login || undefined,
+      triggeredAt: job.createdAt ?? job.startedAt ?? undefined,
+      lastStatus: job.status,
+      ...(commitSha ? { commitSha } : {}),
+      ...(cloneCommit?.message ? { commitMessage: cloneCommit.message } : {}),
     })
-    return map
-  }, [allLogEntries])
-
-  const generalLogEntries: LogEntry[] = stepLogsMap.get('__general__') ?? []
-  const hasTaggedStepLogs = Array.from(stepLogsMap.keys()).some((key) => key !== '__general__')
-
-  // Compute a step's elapsed-since-job-start window so we can pull logs that
-  // arrived *during* the step's lifetime even if their bracketed prefix
-  // doesn't match the step name.
-  const stepWindow = (step: JobStep): { start: number; end: number } | null => {
-    const jobStartMs = startedAtMsRef.current
-    if (jobStartMs === null || !step.startedAt) return null
-    const startMs = Date.parse(step.startedAt)
-    if (Number.isNaN(startMs)) return null
-    const startElapsed = Math.max(0, Math.round((startMs - jobStartMs) / 1000))
-    let endElapsed = Number.POSITIVE_INFINITY
-    if (step.endedAt) {
-      const endMs = Date.parse(step.endedAt)
-      if (!Number.isNaN(endMs)) {
-        endElapsed = Math.max(0, Math.round((endMs - jobStartMs) / 1000))
-      }
-    }
-    return { start: startElapsed, end: endElapsed }
-  }
-
-  // Lifecycle keys are INDEX-based and stable across the placeholder→API
-  // merge. Using stepId would break tracking because a placeholder's id
-  // ('ph-clone') differs from the backend's stepId once it takes over —
-  // we'd lose the running-window observation and the log slice would be
-  // empty. Declared above any useMemo/effect that references it to avoid
-  // TDZ when those callbacks run during the first render.
-  const lifecycleKeyFor = (idx: number): string => `step-${idx}`
-  const stepDurationKeyFor = (step: JobStep, idx: number): string =>
-    `${idx}:${(step.stepType || step.stepName || step.stepId || 'step').toLowerCase()}`
-
-  const lifecycleDurationFor = (idx: number, capSecs: number): number | null => {
-    const lifecycle = stepLifecycle[lifecycleKeyFor(idx)]
-    if (!lifecycle?.observedEndMs || lifecycle.observedEndMs <= lifecycle.observedStartMs) {
-      return null
-    }
-    return boundedDurationSecs(
-      (lifecycle.observedEndMs - lifecycle.observedStartMs) / 1000,
-      capSecs,
-    )
-  }
-
-  const findLogsForStep = (step: JobStep, key: string): LogEntry[] => {
-    const stepIdx = Number(key.replace('step-', ''))
-    if (Number.isInteger(stepIdx)) {
-      for (const logKey of stepLogKeysForIndex(stepIdx)) {
-        const exact = stepLogsMap.get(logKey)
-        if (exact && exact.length > 0) return exact
-      }
-    }
-
-    // 1. Exact / case-insensitive name match against the bracketed prefix.
-    // Normalize underscores so [security_gate.log] maps to security-gate.
-    const nameKey = step.stepName?.toLowerCase()
-    const normalizedNameKey = nameKey?.replace(/_/g, '-')
-    if (normalizedNameKey && stepLogsMap.has(normalizedNameKey)) return stepLogsMap.get(normalizedNameKey)!
-    const typeKey = step.stepType?.toLowerCase()
-    const normalizedTypeKey = typeKey?.replace(/_/g, '-')
-    if (normalizedTypeKey && stepLogsMap.has(normalizedTypeKey)) return stepLogsMap.get(normalizedTypeKey)!
-
-    // If the backend is tagging logs, never guess across tagged buckets.
-    // Security-related steps are too similar, so substring/icon fallback can
-    // accidentally show lightweight logs inside deep scan or gate sections.
-    if (hasTaggedStepLogs) return []
-
-    // 2. Substring match — handles "[lightweight-security.log]" vs step
-    //    type "security-light", etc.
-    if (normalizedTypeKey || normalizedNameKey) {
-      for (const [logKey, lines] of stepLogsMap) {
-        if (logKey === '__general__') continue
-        if (
-          (normalizedTypeKey && (logKey.includes(normalizedTypeKey) || normalizedTypeKey.includes(logKey))) ||
-          (normalizedNameKey && (logKey.includes(normalizedNameKey) || normalizedNameKey.includes(logKey)))
-        ) {
-          return lines
-        }
-      }
-    }
-
-    // 3. Frontend-observed lifecycle slice — the most reliable fallback
-    //    when the backend doesn't tag logs per step.
-    const life = stepLifecycle[key]
-    if (life) {
-      const start = life.startLogIdx
-      const end = life.endLogIdx ?? allLogEntries.length
-      if (end > start) {
-        return allLogEntries.slice(start, end)
-      }
-    }
-
-    // 4. Icon-class match (e.g. clone/checkout both → GitBranch icon)
-    const stepIcon = iconForStep(step)
-    for (const [logKey, lines] of stepLogsMap) {
-      if (logKey === '__general__') continue
-      const proxy: JobStep = { ...step, stepName: logKey, stepType: logKey }
-      if (iconForStep(proxy) === stepIcon) return lines
-    }
-
-    // 5. Backend timestamp window fallback
-    const window = stepWindow(step)
-    if (window) {
-      const within = allLogEntries.filter(
-        (e) => e.elapsedSec >= window.start && e.elapsedSec <= window.end,
-      )
-      if (within.length > 0) return within
-    }
-
-    // 6. Running step with nothing matched yet → show the recent tail of
-    //    unbucketed logs so the user always sees "what's happening now"
-    //    instead of "로그 없음".
-    if (step.status === 'running') {
-      if (generalLogEntries.length > 0) return generalLogEntries.slice(-20)
-      if (allLogEntries.length > 0) return allLogEntries.slice(-20)
-    }
-
-    return []
-  }
-
-  const logDurationFor = (step: JobStep, idx: number, capSecs: number): number | null => {
-    const lines = findLogsForStep(step, lifecycleKeyFor(idx))
-    if (lines.length < 2) return null
-    const first = lines[0]?.elapsedSec
-    const last = lines[lines.length - 1]?.elapsedSec
-    if (typeof first !== 'number' || typeof last !== 'number' || last <= first) return null
-    return boundedDurationSecs(last - first, capSecs)
-  }
+  }, [
+    job?.repoName,
+    job?.branch,
+    job?.triggeredBy,
+    job?.createdAt,
+    job?.startedAt,
+    job?.status,
+    commitSha,
+    cloneCommit?.message,
+    user?.login,
+    cacheKey,
+  ])
 
   async function handleCancel() {
-    if (!token || !jobId || isCancelling) return
+    if (isCancelling) return
     setIsCancelling(true)
+    setCancelError(null)
     try {
-      await cancelPipeline(token, jobId)
-      const refreshed = await fetchJobDetail(token, jobId)
-      if (refreshed) setJob(refreshed)
-      setError(null)
+      await cancel()
       setIsCancelDialogOpen(false)
     } catch (err) {
-      setError(err instanceof Error ? err.message : '파이프라인 취소에 실패했습니다.')
+      setCancelError(err instanceof Error ? err.message : String(err))
     } finally {
       setIsCancelling(false)
     }
   }
 
-  const steps: JobStep[] = useMemo(() => {
-    const usedApi = new Set<number>()
-    const taggedIndexes = logs
-      .map(stepIndexFromLogLine)
-      .filter((idx): idx is number => idx !== null)
-    const observedLogIndexes = new Set(taggedIndexes)
-    const latestLogIdx = taggedIndexes.length > 0 ? taggedIndexes[taggedIndexes.length - 1] : null
-
-    const statusFromLogs = (idx: number, backendStatus: JobStep['status']): JobStep['status'] => {
-      // Backend step state is authoritative. Log-derived state fills only the
-      // gap between a new step's first streamed line and the next steps poll.
-      if (TERMINAL_STEP_STATUSES.has(backendStatus)) return backendStatus
-      if (backendStatus === 'running') {
-        if (latestLogIdx !== null && latestLogIdx > idx) return 'success'
-        return 'running'
-      }
-      if (isTerminal) {
-        if (latestLogIdx === idx && jobStatus === 'failed') return 'failed'
-        if (observedLogIndexes.has(idx)) return 'success'
-        return backendStatus
-      }
-      if (latestLogIdx !== null) {
-        if (idx === latestLogIdx) return 'running'
-        if (idx < latestLogIdx && observedLogIndexes.has(idx)) return 'success'
-      }
-      return 'pending'
-    }
-
-    const merged: JobStep[] = PLACEHOLDER_STEPS.map((placeholder, placeholderIdx) => {
-      const placeholderIcon = iconForStep(placeholder)
-      const apiIdx = apiSteps.findIndex((api, i) => {
-        if (usedApi.has(i)) return false
-        if (api.stepType && placeholder.stepType && api.stepType === placeholder.stepType) return true
-        if (api.stepName && placeholder.stepName && api.stepName === placeholder.stepName) return true
-        return iconForStep(api) === placeholderIcon
-      })
-      if (apiIdx >= 0) {
-        usedApi.add(apiIdx)
-        const apiStep = apiSteps[apiIdx]
-        return {
-          ...apiStep,
-          stepName: placeholder.stepName,
-          status: statusFromLogs(placeholderIdx, apiStep.status),
-        }
-      }
-
-      const inferredStatus = statusFromLogs(placeholderIdx, placeholder.status)
-      if (inferredStatus !== placeholder.status) {
-        return { ...placeholder, status: inferredStatus }
-      }
-      return placeholder
-    })
-    // Append unmatched API steps (extras the backend reports beyond our 8-step template)
-    apiSteps.forEach((api, i) => {
-      if (!usedApi.has(i)) merged.push({ ...api, stepName: displayStepName(api, merged.length) })
-    })
-    return merged
-    // findLogsForStep depends on stepLogsMap which depends on logs
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiSteps, stepLogsMap, logs, isTerminal, jobStatus])
-
-  const isHistorySnapshot = isTerminal && !hasObservedLiveRunRef.current && apiSteps.length > 0
-  const revealedCount = steps.filter((step) => TERMINAL_STEP_STATUSES.has(step.status)).length
-  const [stepRevealLogCounts, setStepRevealLogCounts] = useState<Record<number, number>>({})
-
-  // Capture available untagged logs without delaying already-persisted states.
-  useEffect(() => {
-    setStepRevealLogCounts((previous) => {
-      let next = previous
-      steps.forEach((step, index) => {
-        if (TERMINAL_STEP_STATUSES.has(step.status) && previous[index] === undefined) {
-          if (next === previous) next = { ...previous }
-          next[index] = logs.length
-        }
-      })
-      return next
-    })
-  }, [steps, logs.length])
-
-  const runningDurationFor = (idx: number): number => {
-    const step = steps[idx]
-    if (step?.startedAt) {
-      const backendStartMs = Date.parse(step.startedAt)
-      if (!Number.isNaN(backendStartMs)) {
-        return Math.max(0, Math.round((Date.now() - backendStartMs) / 1000))
-      }
-    }
-    const observedStartMs = stepLifecycle[lifecycleKeyFor(idx)]?.observedStartMs
-    if (observedStartMs !== undefined) {
-      return Math.max(0, Math.round((Date.now() - observedStartMs) / 1000))
-    }
-    if (idx <= 0) return Math.max(0, elapsedSec)
-    const previousStepEnd = stepLogKeysForIndex(idx - 1)
-      .flatMap((logKey) => stepLogsMap.get(logKey) ?? [])
-      .reduce((latest, entry) => Math.max(latest, entry.elapsedSec), 0)
-    return Math.max(0, elapsedSec - previousStepEnd)
+  const showStageLogs = (index: number) => {
+    setLogFilter((previous) => ({ ...previous, stage: index }))
+    setLogsOpen('all-logs')
+    setOpenStages((previous) =>
+      previous.includes(stageKey(index)) ? previous : [...previous, stageKey(index)],
+    )
+    window.requestAnimationFrame(() =>
+      document.getElementById(`stage-card-${index}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' }),
+    )
   }
 
-  // Per-step displayed duration. Priority:
-  //   1. revealTime[idx] - revealTime[idx-1]  (frontend-observed gap —
-  //      our most reliable signal when backend timings are noisy)
-  //   2. backend (endedAt - startedAt)
-  //   3. backend durationSecs (only if > 0)
-  //   4. 1s default — guarantees no "0초" displayed.
-  const rawDisplayedDurationFor = (step: JobStep, idx: number): number => {
-    if (step.status === 'skipped') return 0
-    if (step.status === 'running') return runningDurationFor(idx)
-
-    const capSecs = job?.durationSecs && job.durationSecs > 0 ? job.durationSecs : elapsedSec
-    const storedDuration = boundedDurationSecs(
-      storedStepDurations[stepDurationKeyFor(step, idx)] ?? -1,
-      capSecs,
-    )
-    const backendDuration = backendStepDurationSecs(step, capSecs)
-    const lifecycleDuration = lifecycleDurationFor(idx, capSecs)
-    const liveDuration = boundedDurationSecs(
-      lastLiveStepDurationRef.current[lifecycleKeyFor(idx)] ?? -1,
-      capSecs,
-    )
-    const logDuration = logDurationFor(step, idx, capSecs)
-
-    if (backendDuration !== null) return backendDuration
-    if (storedDuration !== null) return storedDuration
-    if (lifecycleDuration !== null) return lifecycleDuration
-    if (liveDuration !== null) return liveDuration
-    if (logDuration !== null) return logDuration
-
-    return isHistorySnapshot ? 0 : 1
+  const jumpToLatest = () => {
+    const el = logContainerRef.current
+    if (!el) return
+    followRef.current = true
+    setFollowing(true)
+    el.scrollTop = el.scrollHeight
   }
 
-  // Display the state inferred from the latest polled logs immediately.
-  // Step pacing is no longer simulated with a reveal queue; when a new
-  // [*.log] tag arrives, that step becomes the active running step.
-  const displayedStatusFor = (_idx: number, real: JobStep['status']): JobStep['status'] => {
-    return real
+  const copyLogs = async () => {
+    try {
+      await navigator.clipboard.writeText(formatLogsForCopy(visibleLogs, labels.stageName, labels.level))
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1500)
+    } catch (copyError) {
+      console.error('[pipeline] copy logs failed:', copyError)
+    }
   }
 
-  // Currently running step — surfaced to the top "execution status" panel
-  // and to the auto-open accordion logic so the user always sees what's
-  // happening RIGHT NOW without having to click into a step. Picks the
-  // first step whose DISPLAYED status is running.
-  const currentStepIdx =
-    isHistorySnapshot
-      ? -1
-      : steps.findIndex((s, idx) => displayedStatusFor(idx, s.status) === 'running')
-  const currentStep = currentStepIdx >= 0 ? steps[currentStepIdx] : null
-
-  // Count how many steps the user currently SEES as success — driven by
-  // the reveal queue, not the raw backend status, so the "X/Y 단계 통과"
-  // counter ticks up in sync with the visual reveal.
-  const successCount = steps.filter(
-    (s, idx) => displayedStatusFor(idx, s.status) === 'success',
-  ).length
-
-  // Keep completed durations exactly aligned with the backend. Older UI code
-  // proportionally rescaled step durations to fit the job total, which made
-  // correctly reported backend timings appear different on screen.
-  const displayedStepDurations = steps.map((step, idx) => rawDisplayedDurationFor(step, idx))
-
-  // When the deploy step finishes successfully, scan its logs for an
-  // http(s) URL and persist it as this repo's deployment domain. The
-  // RepositoryDetailPage reads from the same localStorage key
-  // (keyed by job.repoName) and renders it in the "도메인 주소" card so
-  // the user no longer needs to type it manually.
-  const lastDomainExtractedRef = useRef<string | null>(null)
-  useEffect(() => {
-    const repoName = job?.repoName
-    if (!repoName) return
-    const deployIdx = steps.findIndex((s) =>
-      /deploy|배포|release|publish/i.test(`${s.stepName} ${s.stepType}`),
-    )
-    if (deployIdx < 0) return
-    const deployStep = steps[deployIdx]
-    if (deployStep.status !== 'success') return
-    const lines = findLogsForStep(deployStep, lifecycleKeyFor(deployIdx))
-    if (lines.length === 0) return
-
-    // Search from the latest line back — the deploy "Live at: URL" message
-    // is usually printed near the end of the step's output.
-    const urlPattern = /(https?:\/\/[^\s<>"'`)]+)/i
-    let found: string | null = null
-    for (let i = lines.length - 1; i >= 0; i -= 1) {
-      const m = lines[i].line.match(urlPattern)
-      if (m) {
-        found = m[1].replace(/[.,;]+$/, '')
-        break
-      }
-    }
-    if (!found) return
-    if (lastDomainExtractedRef.current === found) return
-    lastDomainExtractedRef.current = found
-    setDeployUrl((previous) => previous ?? found)
-    setRepoDomainUrl(cacheKey, repoName, found)
-    // findLogsForStep is intentionally not in deps — its closures are
-    // covered by `steps`/`stepLifecycle`/`logs` which already trigger re-runs.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [steps, stepLifecycle, logs, job?.repoName, cacheKey])
-
-  // Persist pipeline metadata for the RepositoryDetailPage's source card.
-  // The detail page tries GitHub's API for commit info but that often
-  // fails (backend may not proxy /commits/{branch}, or the auth token is
-  // a JWT rather than a GitHub OAuth token). This effect saves what we
-  // already KNOW from the running job + extracts a commit SHA/message
-  // from the clone step's logs, so the source card can always populate
-  // *something* meaningful instead of "(API에서 제공되지 않음)".
-  const lastCommitExtractedRef = useRef<string | null>(null)
-  useEffect(() => {
-    const repoName = job?.repoName
-    if (!repoName) return
-
-    // Base metadata that's always available once the job loads.
-    const basePatch = {
-      branch: job?.branch || undefined,
-      triggeredBy: user?.login || undefined,
-      triggeredAt: job?.createdAt ?? job?.startedAt ?? undefined,
-      lastStatus: job?.status,
-    }
-    setRepoPipelineInfo(cacheKey, repoName, basePatch)
-
-    // Commit extraction from clone step logs. Run only after we have
-    // some clone output to look at.
-    const cloneIdx = steps.findIndex((s) =>
-      /clone|checkout|레포|클론/i.test(`${s.stepName} ${s.stepType}`),
-    )
-    if (cloneIdx < 0) return
-    const cloneStep = steps[cloneIdx]
-    const cloneLogs = findLogsForStep(cloneStep, lifecycleKeyFor(cloneIdx))
-    if (cloneLogs.length === 0) return
-
-    // Try several common patterns. Order matters — most specific first.
-    let sha: string | undefined
-    let message: string | undefined
-    for (const { line } of cloneLogs) {
-      const head = line.match(/HEAD\s+is\s+now\s+at\s+([0-9a-f]{7,40})\s+(.+)/i)
-      if (head) {
-        sha = head[1]
-        message = head[2].trim()
-        break
-      }
-      const labeled = line.match(/(?:commit|sha)\s*[:=]\s*([0-9a-f]{7,40})\b\s*[-—|]?\s*(.+)?/i)
-      if (labeled) {
-        sha = labeled[1]
-        message = (labeled[2] ?? '').trim() || undefined
-        break
-      }
-    }
-    if (!sha) {
-      // Last resort: bare 40-char SHA on any line.
-      for (const { line } of cloneLogs) {
-        const m = line.match(/\b([0-9a-f]{40})\b/)
-        if (m) {
-          sha = m[1]
-          break
-        }
-      }
-    }
-    if (!sha) return
-    if (lastCommitExtractedRef.current === sha) return
-    lastCommitExtractedRef.current = sha
-    setRepoPipelineInfo(cacheKey, repoName, {
-      commitSha: sha,
-      ...(message ? { commitMessage: message } : {}),
+  const toggleLevel = (level: LogLevel) => {
+    setLogFilter((previous) => {
+      const levels = new Set(previous.levels)
+      if (levels.has(level)) levels.delete(level)
+      else levels.add(level)
+      return { ...previous, levels }
     })
-    // findLogsForStep is intentionally excluded — see note above.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    steps,
-    stepLifecycle,
-    logs,
-    job?.repoName,
-    job?.branch,
-    job?.createdAt,
-    job?.startedAt,
-    job?.status,
-    user?.login,
-    cacheKey,
-  ])
-
-  // Auto-open accordion entries for any step that's currently running so its
-  // streaming logs are visible without a manual click. We append-only — once
-  // the user opens or auto-opens a step it stays open.
-  useEffect(() => {
-    if (isHistorySnapshot) {
-      const historyKeys = steps
-        .map((step, idx) => ({
-          key: step.stepId || `${step.stepName}-${idx}`,
-          status: step.status,
-          logs: findLogsForStep(step, lifecycleKeyFor(idx)),
-        }))
-        .filter(({ status, logs }) => TERMINAL_STEP_STATUSES.has(status) && logs.length > 0)
-        .map(({ key }) => key)
-      if (historyKeys.length === 0) return
-      setOpenSteps((prev) => (prev.length > 0 ? prev : historyKeys))
-      return
-    }
-    let idx = -1
-    for (let i = steps.length - 1; i >= 0; i -= 1) {
-      if (findLogsForStep(steps[i], lifecycleKeyFor(i)).length > 0) {
-        idx = i
-        break
-      }
-    }
-    if (idx < 0) return
-    const step = steps[idx]
-    const key = step.stepId || `${step.stepName}-${idx}`
-    setOpenSteps((prev) => (prev.includes(key) ? prev : [...prev, key]))
-    // findLogsForStep is intentionally excluded; step/log changes are covered
-    // by the dependencies below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [steps, isHistorySnapshot, logs, stepLifecycle])
-
-  useEffect(() => {
-    setOpenSteps((prev) => {
-      const next = prev.filter((openKey) => {
-        const idx = steps.findIndex((step, stepIdx) =>
-          (step.stepId || `${step.stepName}-${stepIdx}`) === openKey,
-        )
-        if (idx < 0) return false
-        const step = steps[idx]
-        if (step.errorMessage) return true
-        return findLogsForStep(step, lifecycleKeyFor(idx)).length > 0
-      })
-      return next.length === prev.length ? prev : next
-    })
-    // findLogsForStep is intentionally excluded; step/log changes are covered
-    // by the dependencies below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [steps, logs, stepLifecycle])
-
-  // Track each running step's live elapsed in a ref so the render can fall
-  // back to this value during the brief running→complete transition window
-  // when the backend hasn't yet filled durationSecs/endedAt. We mutate the
-  // ref here (in an effect) rather than during render to satisfy the
-  // react-hooks/purity rule.
-  useEffect(() => {
-    steps.forEach((step, idx) => {
-      if (step.status !== 'running') return
-      const backendStart = step.startedAt ? Date.parse(step.startedAt) : Number.NaN
-      const lKey = lifecycleKeyFor(idx)
-      const lifeStart = stepLifecycle[lKey]?.observedStartMs
-      const startMs = !Number.isNaN(backendStart) ? backendStart : lifeStart
-      if (startMs === undefined || Number.isNaN(startMs)) return
-      lastLiveStepDurationRef.current[lKey] = Math.max(
-        0,
-        Math.round((Date.now() - startMs) / 1000),
-      )
-    })
-  }, [steps, elapsedSec, stepLifecycle])
-
-  useEffect(() => {
-    if (!jobId || steps.length === 0) return
-    const capSecs = job?.durationSecs && job.durationSecs > 0 ? job.durationSecs : elapsedSec
-
-    setStoredStepDurations((prev) => {
-      let next = prev
-      let changed = false
-
-      const writeDuration = (key: string, duration: number) => {
-        if (prev[key] === duration) return
-        if (!changed) {
-          next = { ...prev }
-          changed = true
-        }
-        next[key] = duration
-      }
-
-      steps.forEach((step, idx) => {
-        if (!TERMINAL_STEP_STATUSES.has(step.status)) return
-        const key = stepDurationKeyFor(step, idx)
-        if (step.status === 'skipped') {
-          writeDuration(key, 0)
-          return
-        }
-
-        const duration =
-          backendStepDurationSecs(step, capSecs) ??
-          lifecycleDurationFor(idx, capSecs) ??
-          boundedDurationSecs(lastLiveStepDurationRef.current[lifecycleKeyFor(idx)] ?? -1, capSecs) ??
-          logDurationFor(step, idx, capSecs)
-
-        if (duration !== null) {
-          writeDuration(key, duration)
-        }
-      })
-
-      if (changed) {
-        writeStepDurationCache(jobId, next)
-      }
-
-      return changed ? next : prev
-    })
-    // findLogsForStep/logDurationFor are intentionally not listed; their
-    // backing data is covered by steps, lifecycle, logs, and timestamps.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId, steps, stepLifecycle, logs, logTimestamps, job?.durationSecs, elapsedSec])
-
-  // Record step lifecycle transitions. For each poll we:
-  //   - Notice a step that just transitioned to running → stamp its
-  //     observedStartMs (using backend's startedAt when present, otherwise
-  //     wall clock) and inherit startLogIdx from the previous step's
-  //     endLogIdx so the slice covers logs we already had at mount time.
-  //   - Notice a step that just transitioned to terminal → stamp its end.
-  //   - Handle steps that appeared already-complete (missed the running
-  //     window because the page was opened mid-pipeline or the step
-  //     completed faster than our poll interval) — slice from prev step's
-  //     endLogIdx to now.
-  useEffect(() => {
-    setStepLifecycle((prev) => {
-      let next = prev
-      let changed = false
-      const terminal = new Set(['success', 'failed', 'cancelled', 'skipped'])
-
-      // Look up where the previous tracked step ended, walking backwards
-      // through indices until we find one with a closed endLogIdx. Used
-      // as the natural startLogIdx for the next step.
-      const priorEndLogIdx = (currentIdx: number): number => {
-        for (let i = currentIdx - 1; i >= 0; i -= 1) {
-          const prevKey = lifecycleKeyFor(i)
-          const prevLife = next[prevKey] ?? prev[prevKey]
-          if (prevLife && prevLife.endLogIdx !== null) return prevLife.endLogIdx
-        }
-        return 0
-      }
-
-      const ensureMutable = () => {
-        if (!changed) {
-          next = { ...prev }
-          changed = true
-        }
-      }
-
-      steps.forEach((step, idx) => {
-        const key = lifecycleKeyFor(idx)
-        const existing = next[key]
-        const backendStartMs = step.startedAt ? Date.parse(step.startedAt) : Number.NaN
-        const backendEndMs = step.endedAt ? Date.parse(step.endedAt) : Number.NaN
-
-        if (step.status === 'running' && !existing) {
-          ensureMutable()
-          next[key] = {
-            observedStartMs: !Number.isNaN(backendStartMs) ? backendStartMs : Date.now(),
-            observedEndMs: null,
-            startLogIdx: priorEndLogIdx(idx),
-            endLogIdx: null,
-          }
-        } else if (step.status === 'running' && existing) {
-          // While running, opportunistically improve observedStartMs if the
-          // backend has now reported a startedAt that's earlier than the
-          // frontend-only estimate — this fixes the "1초로 뜨는" case where
-          // the page mounted mid-step and we initially had to guess.
-          if (
-            !Number.isNaN(backendStartMs) &&
-            backendStartMs < existing.observedStartMs
-          ) {
-            ensureMutable()
-            next[key] = { ...existing, observedStartMs: backendStartMs }
-          }
-        } else if (
-          terminal.has(step.status) &&
-          existing &&
-          existing.observedEndMs === null
-        ) {
-          ensureMutable()
-          next[key] = {
-            ...existing,
-            observedStartMs:
-              !Number.isNaN(backendStartMs) && backendStartMs < existing.observedStartMs
-                ? backendStartMs
-                : existing.observedStartMs,
-            observedEndMs: !Number.isNaN(backendEndMs) ? backendEndMs : Date.now(),
-            endLogIdx: logs.length,
-          }
-        } else if (terminal.has(step.status) && !existing) {
-          // Missed-window step — caught it already terminal. Best effort:
-          //   - log slice = [prev step's end, now]
-          //   - duration: prefer backend timestamps, otherwise zero-window
-          //     (the duration column then falls through to backend
-          //     durationSecs in render).
-          ensureMutable()
-          const startMs = !Number.isNaN(backendStartMs) ? backendStartMs : Date.now()
-          const endMs = !Number.isNaN(backendEndMs) ? backendEndMs : Date.now()
-          next[key] = {
-            observedStartMs: startMs,
-            observedEndMs: endMs,
-            startLogIdx:
-              step.status === 'skipped' ? logs.length : priorEndLogIdx(idx),
-            endLogIdx: logs.length,
-          }
-        }
-      })
-      return changed ? next : prev
-    })
-  }, [steps, logs.length])
+  }
 
   if (!jobId) {
     return (
       <MainLayout>
-        <Card className="p-6 text-center text-[#FCA5A5]">
-          job_id가 전달되지 않았습니다. 새 파이프라인을 다시 실행해 주세요.
-        </Card>
+        <Card className="p-6 text-center text-[#FCA5A5]">{t('run.noJobId')}</Card>
         <div className="mt-3 flex justify-end">
-          <Button onClick={() => navigate('/pipeline/new')}>새 파이프라인</Button>
+          <Button onClick={() => navigate('/pipeline/new')}>{t('run.newPipeline')}</Button>
         </div>
       </MainLayout>
     )
   }
 
-  return (
-    <MainLayout pipelineElapsed={formatDuration(elapsedSec)}>
-      <section className="w-full space-y-4">
-        <div className="space-y-2">
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2 text-[28px] font-bold text-white">
-              <CodeXml className="h-7 w-7 text-[#34D399]" />
-              {repoName || jobId}
-            </div>
-            <p className="inline-flex items-center gap-2 text-[14px] text-[#878787]">
-              <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: jobBadge.dotColor }} />
-              {jobBadge.label} · {formatDuration(elapsedSec)}
-            </p>
-          </div>
-          <p className="text-[14px] text-[#6B7280]">
-            브랜치 {branch || '-'} · Job {jobId.slice(0, 8)}
-          </p>
-        </div>
+  const connectionStyle = CONNECTION_STYLE[connection]
+  const deployStage = stages[7]
+  const headlineLabel = t(`run.headline.${tone}.label`)
+  const headlineMessage = t(`run.headline.${tone}.message`)
 
-        {error ? (
-          <Card className="border-[#7F1D1D] bg-[#450A0A]/40 p-3 text-center text-sm text-[#FCA5A5]">
-            {error}
+  return (
+    <MainLayout pipelineElapsed={totalElapsed === null ? undefined : labels.duration(totalElapsed)}>
+      <section className="w-full space-y-4">
+        {/* ── Header ─────────────────────────────────────────────────── */}
+        <Card className="border-[#404040] bg-[#262626] p-4">
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <div className="flex min-w-0 items-center gap-2 text-[26px] font-bold text-white">
+              <CodeXml className="h-7 w-7 shrink-0 text-[#34D399]" />
+              <span className="truncate">{repoName || jobId}</span>
+            </div>
+            <div
+              className="inline-flex shrink-0 items-center gap-2 self-start rounded-xl border px-3 py-1.5"
+              style={{ borderColor: toneColor }}
+              role="status"
+              aria-live="polite"
+            >
+              {tone === 'running' ? (
+                <Loader2 className="h-4 w-4 animate-spin" style={{ color: toneColor }} />
+              ) : (
+                <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: toneColor }} />
+              )}
+              <span className="text-[13px] font-bold tracking-wide" style={{ color: toneColor }}>
+                {headlineLabel}
+              </span>
+              <span className="text-[13px] text-[#D1D5DB]">{headlineMessage}</span>
+            </div>
+          </div>
+
+          <div className="mt-4 grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
+            <MetaItem icon={GitBranch} label={t('run.meta.branch')}>{branch || '—'}</MetaItem>
+            <MetaItem icon={GitCommitHorizontal} label={t('run.meta.commit')}>
+              {commitSha ? (
+                commitLink ? (
+                  <a
+                    href={commitLink}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-mono text-[#93C5FD] hover:underline"
+                    title={commitSha}
+                  >
+                    {shortSha(commitSha)}
+                  </a>
+                ) : (
+                  <span className="font-mono" title={commitSha}>{shortSha(commitSha)}</span>
+                )
+              ) : (
+                '—'
+              )}
+            </MetaItem>
+            <MetaItem icon={Hash} label={t('run.meta.executionId')}>
+              <span className="font-mono" title={jobId}>{jobId.slice(0, 8)}</span>
+            </MetaItem>
+            <MetaItem icon={User} label={t('run.meta.triggeredBy')}>
+              {job ? triggerLabel(job.triggerSource, job.triggeredBy) : '—'}
+            </MetaItem>
+            <MetaItem icon={CalendarClock} label={t('run.meta.started')}>
+              {formatDateTime(job?.startedAt)}
+            </MetaItem>
+            <MetaItem icon={Timer} label={t('run.meta.duration')}>
+              {labels.duration(totalElapsed)}
+            </MetaItem>
+          </div>
+        </Card>
+
+        {error !== null ? (
+          <Card
+            className="border-[#7F1D1D] bg-[#450A0A]/40 p-3 text-center text-sm text-[#FCA5A5]"
+            title={error || undefined}
+          >
+            {t('run.loadFailed')}
           </Card>
         ) : null}
 
+        {/* ── Completion summary ─────────────────────────────────────── */}
+        {isTerminal ? (
+          <Card className="border-[#404040] bg-[#262626] p-4" style={{ borderColor: toneColor }}>
+            <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+              <div>
+                <p className="text-[20px] font-bold" style={{ color: toneColor }}>
+                  {jobStatus === 'success'
+                    ? t('run.summary.success')
+                    : jobStatus === 'failed'
+                      ? t('run.summary.failed')
+                      : t('run.summary.cancelled')}
+                </p>
+                <p className="mt-1 text-[13px] text-[#A1A1A1]">
+                  {t('run.stagesCompleted', { completed: progress.completed, total: progress.total })}
+                  {' · '}
+                  {labels.duration(totalElapsed)}
+                  {repoName ? ` · ${repoName}` : ''}
+                  {commitSha ? ` @ ${shortSha(commitSha)}` : ''}
+                </p>
+                {failedStage ? (
+                  <p className="mt-2 text-[13px] text-[#FCA5A5]">
+                    {t('run.failedAt', {
+                      number: failedStage.number,
+                      name: labels.stageName(failedStage.index),
+                    })}
+                    {failedStage.errorMessage ? ` — ${failedStage.errorMessage}` : ''}
+                  </p>
+                ) : null}
+                <p className="mt-2 text-[13px] text-[#A1A1A1]">
+                  {t('run.deployment')}:{' '}
+                  {deployUrl ? (
+                    <a href={deployUrl} target="_blank" rel="noopener noreferrer" className="text-[#93C5FD] hover:underline">
+                      {deployUrl}
+                    </a>
+                  ) : (
+                    labels.status(deployStage.status)
+                  )}
+                </p>
+              </div>
+              {failedStage ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="shrink-0 shadow-none"
+                  onClick={() => showStageLogs(failedStage.index)}
+                >
+                  <ScrollText className="mr-1.5 h-4 w-4" /> {t('run.viewErrorLogs')}
+                </Button>
+              ) : null}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {stages.map((stage) => (
+                <span
+                  key={stage.index}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-[#404040] bg-[#1E1E1E] px-2 py-1 text-[12px] text-[#D1D5DB]"
+                >
+                  <StageStatusIcon status={stage.status} animate={false} className="h-3.5 w-3.5" />
+                  {labels.stageName(stage.index)}
+                  <span className="text-[#808080]">{labels.duration(stageDuration(stage))}</span>
+                </span>
+              ))}
+            </div>
+          </Card>
+        ) : null}
+
+        {/* ── Progress overview ─────────────────────────────────────── */}
         <Card className="border-[#404040] bg-[#262626] p-4">
-          <div className="mb-4 flex items-center justify-between gap-3">
-            <p className="text-[24px] font-bold text-white">진행 과정</p>
-            <p className="text-[14px] text-[#878787]">
-              {successCount}/{steps.length} 단계 통과
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <p className="text-[22px] font-bold text-white">{t('run.progressTitle')}</p>
+            <p className="text-[14px] text-[#A1A1A1]">
+              <span className="font-semibold text-white">
+                {t('run.stagesCompleted', { completed: progress.completed, total: progress.total })}
+              </span>
+              {progress.failed > 0 ? t('run.failedCount', { count: progress.failed }) : ''}
+              {progress.skipped > 0 ? t('run.skippedCount', { count: progress.skipped }) : ''}
             </p>
           </div>
 
-          {/* "지금 무엇이 돌고 있는가" panel — replaces the inline status
-              dot with a more prominent live readout of the currently running
-              step + its latest log line. Falls back to job-status text when
-              no step is actively running (queued/terminal). */}
-          <div className="mb-4 rounded-xl border border-[#404040] bg-[#1E1E1E] p-3">
-            {currentStep ? (
+          <div
+            className="h-2.5 w-full overflow-hidden rounded-full bg-[#404040]"
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={progress.total}
+            aria-valuenow={progress.completed}
+            aria-label={t('run.completedStagesAria')}
+          >
+            <div
+              className="h-full rounded-full transition-[width] duration-500 ease-out"
+              style={{ width: `${progress.percent}%`, backgroundColor: toneColor }}
+            />
+          </div>
+
+          <div className="mt-3 grid grid-cols-8 gap-1.5">
+            {stages.map((stage) => {
+              const color = STATUS_COLOR[stage.status]
+              const active = stage.index === progress.currentIndex
+              return (
+                <button
+                  key={stage.index}
+                  type="button"
+                  onClick={() => showStageLogs(stage.index)}
+                  title={`${stage.number}. ${labels.stageName(stage.index)} · ${labels.status(stage.status)}`}
+                  className="group flex min-w-0 flex-col items-center gap-1 rounded-md py-1 hover:bg-[#2E2E2E]"
+                >
+                  <span
+                    className={`h-1.5 w-full rounded-full transition-colors duration-300 ${active ? 'animate-pulse' : ''}`}
+                    style={{
+                      backgroundColor: stage.status === 'pending' ? 'transparent' : color,
+                      boxShadow: stage.status === 'pending' ? 'inset 0 0 0 1px #6B7280' : undefined,
+                    }}
+                  />
+                  <span className="text-[11px] font-semibold" style={{ color }}>
+                    {String(stage.number).padStart(2, '0')}
+                  </span>
+                  <span className="hidden w-full truncate text-center text-[10px] text-[#808080] lg:block">
+                    {labels.stageName(stage.index)}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+
+          <div className="mt-3 rounded-xl border border-[#404040] bg-[#1E1E1E] p-3">
+            {currentStage ? (
               (() => {
-                const Icon = iconForStep(currentStep)
-                const cIdx = steps.indexOf(currentStep)
-                const stepLogs = findLogsForStep(currentStep, lifecycleKeyFor(cIdx))
-                const latestLine = stepLogs[stepLogs.length - 1]
-                const stepElapsed = runningDurationFor(cIdx)
+                const Icon = STAGE_ICONS[currentStage.index]
+                const latest = (logsByStage.get(currentStage.index) ?? []).at(-1)
                 return (
                   <>
                     <div className="flex items-center gap-2">
-                      <Loader2 className="h-5 w-5 animate-spin text-[#F59E0B]" />
-                      <Icon className="h-5 w-5 text-[#F59E0B]" />
-                      <p className="text-[16px] font-semibold text-white">
-                        현재: {displayStepName(currentStep, cIdx)}
+                      <Loader2 className="h-5 w-5 animate-spin text-[#60A5FA]" />
+                      <Icon className="h-5 w-5 text-[#60A5FA]" />
+                      <p className="text-[15px] font-semibold text-white">
+                        {t('run.now')}: {String(currentStage.number).padStart(2, '0')}{' '}
+                        {labels.stageName(currentStage.index)}
                       </p>
-                      <span className="ml-auto inline-flex items-center gap-1 text-[12px] text-[#FCD34D]">
+                      <span className="ml-auto inline-flex items-center gap-1 text-[12px] text-[#93C5FD]">
                         <Clock3 className="h-3.5 w-3.5" />
-                        {formatDuration(stepElapsed)}
+                        {labels.duration(stageDuration(currentStage))}
                       </span>
                     </div>
-                    {latestLine ? (
-                      <p className="mt-2 truncate font-mono text-[12px] text-[#9CA3AF]">
-                        <span className="mr-2 text-[#6B7280]">+{latestLine.elapsedSec}s</span>
-                        {latestLine.line}
-                      </p>
-                    ) : (
-                      <p className="mt-2 font-mono text-[12px] text-[#6B7280]">
-                        명령 실행 대기 중...
-                      </p>
-                    )}
+                    <p className="mt-2 truncate font-mono text-[12px] text-[#9CA3AF]">
+                      {latest ? latest.message : t('run.waitingFirstLog')}
+                    </p>
                   </>
                 )
               })()
             ) : (
-              <div className="flex items-center gap-2">
-                <span
-                  className="h-2.5 w-2.5 rounded-full"
-                  style={{ backgroundColor: jobBadge.dotColor }}
-                />
-                <p className="text-[14px] text-[#D1D5DB]">
-                  {jobStatus === 'running' && !isTerminal
-                    ? `백엔드 단계 정보 대기 중 · ${formatDuration(elapsedSec)}`
-                    : isTerminal
-                    ? `파이프라인 ${jobBadge.label} · 총 ${formatDuration(elapsedSec)}`
-                    : `${jobBadge.label} · ${formatDuration(elapsedSec)}`}
-                </p>
+              <div className="flex items-center gap-2 text-[14px] text-[#D1D5DB]">
+                <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: toneColor }} />
+                {jobStatus === 'queued'
+                  ? t('run.queuedHint')
+                  : jobStatus === 'running'
+                    ? t('run.awaitingStage')
+                    : t('run.finishedTotal', {
+                        message: headlineMessage,
+                        duration: labels.duration(totalElapsed),
+                      })}
               </div>
             )}
           </div>
-
-          <div
-            className="grid gap-3"
-            style={{ gridTemplateColumns: `repeat(${steps.length}, minmax(0, 1fr))` }}
-          >
-            {steps.map((step, idx) => {
-              const barStatus = displayedStatusFor(idx, step.status)
-              return (
-                <div key={step.stepId || step.stepName} className="h-2 rounded-full bg-[#404040]">
-                  {/* Pending → transparent so the track (gray in dark, light
-                      gray in light mode) shows instead of a dark #404040 fill. */}
-                  <div
-                    className="h-full w-full rounded-full"
-                    style={{
-                      backgroundColor:
-                        barStatus === 'pending' ? 'transparent' : statusColor(barStatus),
-                    }}
-                  />
-                </div>
-              )
-            })}
-          </div>
         </Card>
 
-        <Accordion
-          type="multiple"
-          value={openSteps}
-          onValueChange={setOpenSteps}
-          className="space-y-3"
-        >
-          {steps.map((step, idx) => {
-            const Icon = iconForStep(step)
-            const key = step.stepId || `${step.stepName}-${idx}`
-            const lKey = lifecycleKeyFor(idx)
-            // Status/border/duration are all driven by DISPLAYED status, so
-            // the reveal queue keeps icons + colors + timings in sync. The
-            // raw `step.status` is only used for lifecycle bookkeeping.
-            const dStatus = displayedStatusFor(idx, step.status)
-            const borderColor =
-              dStatus === 'success'
-                ? 'border-[#3ECF8E]'
-                : dStatus === 'failed'
-                  ? 'border-[#EF4444]'
-                  : dStatus === 'running'
-                    ? 'border-[#F59E0B]'
-                    : 'border-[#404040]'
-            const rawMatchedLogs = findLogsForStep(step, lKey)
-            // Show whatever logs we have for THIS step as soon as they're
-            // available. The reveal queue only animates the status icons —
-            // logs themselves are NOT gated, so a step that just finished
-            // on the backend can show its output immediately even if the
-            // reveal animation hasn't gotten to it yet.
-            //
-            // Fallback chain when tag matching gives nothing:
-            //   1. reveal-time slice [prev_reveal_log_count, this/live]
-            //   2. lifecycle slice (handled inside findLogsForStep)
-            let matchedLogs = rawMatchedLogs
-            if (
-              rawMatchedLogs.length === 0 &&
-              !hasTaggedStepLogs &&
-              revealedCount !== null &&
-              step.status !== 'skipped'
-            ) {
-              const sliceStart = idx > 0 ? (stepRevealLogCounts[idx - 1] ?? 0) : 0
-              const captured = stepRevealLogCounts[idx]
-              const isCurrentRunning = idx === revealedCount
-              const isLastStepEver = idx === steps.length - 1
-              const allRevealedDone = revealedCount >= steps.length
-              // Live end so late-arriving untagged logs land somewhere visible:
-              //  - currently-displayed running step → live
-              //  - last step after all reveals done → live
-              //  - any step matching the actual backend running step → live
-              const realIsRunning = step.status === 'running'
-              const useLiveEnd =
-                isCurrentRunning ||
-                realIsRunning ||
-                (isLastStepEver && allRevealedDone)
-              const sliceEnd = useLiveEnd
-                ? allLogEntries.length
-                : captured !== undefined
-                  ? captured
-                  : sliceStart
-              if (sliceEnd > sliceStart) {
-                matchedLogs = allLogEntries.slice(sliceStart, sliceEnd)
-              }
-            }
-            // Duration: if the step is displayed as terminal use
-            // displayedDurationFor (gap-based, guaranteed ≥1s). For the
-            // step we're currently animating as "running", tick live from
-            // its reveal timestamp (or the previous step's reveal).
-            let duration = 0
-            if (TERMINAL_STEP_STATUSES.has(dStatus)) {
-              duration = displayedStepDurations[idx] ?? 0
-            } else if (dStatus === 'running') {
-              duration = rawDisplayedDurationFor(step, idx)
-            }
-            const canOpenAccordion = matchedLogs.length > 0 || Boolean(step.errorMessage)
-            const isCurrentDisplayed = dStatus === 'running'
-            const isInactive = !isCurrentDisplayed && dStatus === 'pending' && !canOpenAccordion
-
-            return (
-              <AccordionItem
-                key={key}
-                value={key}
-                className={`rounded-2xl border bg-[#262626] p-4 transition-opacity ${borderColor} ${
-                  isInactive ? 'opacity-45' : ''
-                }`}
-              >
-                <AccordionTrigger
-                  disabled={!canOpenAccordion}
-                  className={`py-0 hover:no-underline disabled:cursor-default disabled:opacity-100 ${
-                    canOpenAccordion ? '' : '[&>svg]:hidden'
-                  }`}
-                >
-                  <div className="flex items-center gap-3">
-                    <StepStatusIcon status={dStatus} />
-                    <div className="flex items-center gap-3">
-                      <Icon className="h-5 w-5 text-[#6B7280]" />
-                      <div className="flex flex-col gap-1">
-                        <p className="text-[20px] font-semibold text-white">
-                          {displayStepName(step, idx)}
-                        </p>
-                        <div className="flex items-center gap-3 text-[14px]">
-                          <span className="inline-flex items-center gap-1 text-[#6B7280]">
-                            <Clock3 className="h-4 w-4" /> {formatDuration(duration)}
-                          </span>
-                          <span style={{ color: statusColor(dStatus) }}>
-                            {statusLabel(dStatus)}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </AccordionTrigger>
-                <AccordionContent className="pt-3">
-                  {step.errorMessage ? (
-                    <p className="mb-2 rounded-md border border-[#7F1D1D] bg-[#450A0A]/40 p-2 text-xs text-[#FCA5A5]">
-                      {step.errorMessage}
-                    </p>
-                  ) : null}
-                  <div className="max-h-72 overflow-y-auto rounded-md border border-[#404040] bg-[#1E1E1E] p-3 text-xs text-[#A1A1A1]">
-                    {matchedLogs.length === 0 ? (
-                      <p className="font-mono text-[#6B7280]">
-                        {step.status === 'running' || dStatus === 'running'
-                          ? '명령 실행 중...'
-                          : step.status === 'pending' && dStatus === 'pending'
-                            ? '이전 단계 완료 후 시작됩니다'
-                            : '이 단계에서 출력된 로그가 없습니다'}
-                      </p>
-                    ) : (
-                      matchedLogs.map((entry, lineIdx) => (
-                        <p key={lineIdx} className="font-mono leading-6 break-all">
-                          <span className="mr-2 text-[#6B7280]">+{entry.elapsedSec}s</span>
-                          {entry.line}
-                        </p>
-                      ))
-                    )}
-                  </div>
-                </AccordionContent>
-              </AccordionItem>
-            )
-          })}
+        {/* ── Stage cards ───────────────────────────────────────────── */}
+        <Accordion type="multiple" value={openStages} onValueChange={setOpenStages} className="space-y-3">
+          {stages.map((stage) => (
+            <StageCard
+              key={stage.index}
+              stage={stage}
+              isCurrent={stage.index === progress.currentIndex}
+              duration={stageDuration(stage)}
+              logs={logsByStage.get(stage.index) ?? []}
+              labels={labels}
+              onShowInFullLog={() => showStageLogs(stage.index)}
+            />
+          ))}
         </Accordion>
 
-        <Accordion type="single" collapsible defaultValue="all-logs">
+        {/* ── Real-time overall logs ────────────────────────────────── */}
+        <Accordion type="single" collapsible value={logsOpen} onValueChange={setLogsOpen}>
           <AccordionItem value="all-logs" className="rounded-2xl border border-[#404040] bg-[#262626] p-4">
             <AccordionTrigger className="py-0 hover:no-underline">
-              <div className="flex w-full items-center justify-between pr-3">
-                <p className="text-[16px] font-semibold text-white">실시간 전체 로그</p>
+              <div className="flex w-full flex-wrap items-center justify-between gap-2 pr-3">
+                <p className="text-[16px] font-semibold text-white">{t('run.logs.title')}</p>
                 <div className="flex items-center gap-3 text-[12px]">
-                  <span
-                    className={`inline-flex items-center gap-1.5 ${
-                      isTerminal || logStreamStatus === 'complete'
-                        ? 'text-[#6B7280]'
-                        : logStreamStatus === 'live'
-                          ? 'text-[#34D399]'
-                          : 'text-[#F59E0B]'
-                    }`}
-                  >
+                  <span className="inline-flex items-center gap-1.5" style={{ color: connectionStyle.color }}>
                     <span
-                      className={`h-2 w-2 rounded-full ${
-                        logStreamStatus === 'live' && !isTerminal ? 'animate-pulse' : ''
-                      }`}
-                      style={{
-                        backgroundColor:
-                          isTerminal || logStreamStatus === 'complete'
-                            ? '#6B7280'
-                            : logStreamStatus === 'live'
-                              ? '#34D399'
-                              : '#F59E0B',
-                      }}
+                      className={`h-2 w-2 rounded-full ${connectionStyle.pulse ? 'animate-pulse' : ''}`}
+                      style={{ backgroundColor: connectionStyle.color }}
                     />
-                    {isTerminal || logStreamStatus === 'complete'
-                      ? '수집 완료'
-                      : logStreamStatus === 'live'
-                        ? '실시간 연결됨'
-                        : logStreamStatus === 'reconnecting'
-                          ? '실시간 연결 실패 · REST 폴링 중'
-                          : '연결 중'}
+                    {t(`run.connection.${connection}`)}
                   </span>
-                  <span className="text-[#6B7280]">{logs.length} 줄</span>
+                  <span className="text-[#6B7280]">
+                    {visibleLogs.length === logs.length
+                      ? t('run.logs.lines', { count: logs.length })
+                      : t('run.logs.linesFiltered', { shown: visibleLogs.length, total: logs.length })}
+                  </span>
                 </div>
               </div>
             </AccordionTrigger>
             <AccordionContent className="pt-3">
-              <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-[#9CA3AF]" role="status">
-                <span>마지막 로그 갱신: {lastLogAt === null ? '아직 수신하지 않음' : `${Math.max(0, Math.floor((activityNow - lastLogAt) / 1000))}초 전`}</span>
-                {!isTerminal && <span>엔진 응답: {lastEngineAt === null ? '확인 중' : `${Math.max(0, Math.floor((activityNow - lastEngineAt) / 1000))}초 전`}
-                  {lastEngineAt !== null && activityNow - lastEngineAt > 30000 ? ' · 응답 지연' : ''}</span>}
-                {!isTerminal && lastEngineAt !== null && activityNow - lastEngineAt < 30000 && (lastLogAt === null || activityNow - lastLogAt > 10000) && <span>엔진 동작 중 · 로그 출력 대기</span>}
+              {/* Liveness: lets the user tell a quiet step from a stalled engine. */}
+              {!isTerminal ? (
+                <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-[12px] text-[#9CA3AF]" role="status">
+                  <span>
+                    {t('run.activity.lastLog')}:{' '}
+                    {activity.lastLogAt === null
+                      ? t('run.activity.none')
+                      : t('run.activity.secondsAgo', { secs: Math.max(0, Math.floor((now - activity.lastLogAt) / 1000)) })}
+                  </span>
+                  <span>
+                    {t('run.activity.engine')}:{' '}
+                    {activity.lastEngineAt === null
+                      ? t('run.activity.checking')
+                      : t('run.activity.secondsAgo', { secs: Math.max(0, Math.floor((now - activity.lastEngineAt) / 1000)) })}
+                    {activity.lastEngineAt !== null && now - activity.lastEngineAt > 30_000 ? (
+                      <span className="text-[#FBBF24]"> · {t('run.activity.delayed')}</span>
+                    ) : null}
+                  </span>
+                  {activity.lastEngineAt !== null &&
+                  now - activity.lastEngineAt <= 30_000 &&
+                  (activity.lastLogAt === null || now - activity.lastLogAt > 10_000) ? (
+                    <span>{t('run.activity.waitingOutput')}</span>
+                  ) : null}
+                </div>
+              ) : null}
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <select
+                  value={String(logFilter.stage)}
+                  onChange={(event) => {
+                    const value = event.target.value
+                    setLogFilter((previous) => ({
+                      ...previous,
+                      stage: value === 'all' || value === 'general' ? value : Number(value),
+                    }))
+                  }}
+                  className="h-8 rounded-lg border border-[#404040] bg-[#1E1E1E] px-2 text-[12px] text-[#E5E7EB]"
+                  aria-label={t('run.logs.filterStage')}
+                >
+                  <option value="all">{t('run.logs.allStages')}</option>
+                  {PIPELINE_STAGES.map((def, index) => (
+                    <option key={def.number} value={index}>
+                      {def.number}. {labels.stageName(index)}
+                    </option>
+                  ))}
+                  <option value="general">{t('run.logs.general')}</option>
+                </select>
+                <div className="flex flex-wrap gap-1" role="group" aria-label={t('run.logs.filterLevel')}>
+                  {LOG_LEVELS.map((level) => {
+                    const active = logFilter.levels.has(level)
+                    return (
+                      <button
+                        key={level}
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() => toggleLevel(level)}
+                        className={`h-8 rounded-lg border px-2 text-[11px] font-semibold ${
+                          active
+                            ? `border-[#5B5B5B] bg-[#2E2E2E] ${LEVEL_CLASS[level]}`
+                            : 'border-[#404040] bg-transparent text-[#6B7280] line-through'
+                        }`}
+                      >
+                        {labels.level(level)}
+                      </button>
+                    )
+                  })}
+                </div>
+                <div className="ml-auto flex gap-1">
+                  {!following ? (
+                    <Button type="button" variant="outline" className="h-8 px-2 text-[12px] shadow-none" onClick={jumpToLatest}>
+                      <ArrowDownToLine className="mr-1 h-3.5 w-3.5" /> {t('run.logs.jumpLatest')}
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-8 px-2 text-[12px] shadow-none"
+                    onClick={() => void copyLogs()}
+                    disabled={visibleLogs.length === 0}
+                  >
+                    {copied ? <Check className="mr-1 h-3.5 w-3.5" /> : <Copy className="mr-1 h-3.5 w-3.5" />}
+                    {copied ? t('run.logs.copied') : t('run.logs.copy')}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-8 px-2 shadow-none"
+                    onClick={() => setLogsExpanded((value) => !value)}
+                    aria-label={logsExpanded ? t('run.logs.collapse') : t('run.logs.expand')}
+                    title={logsExpanded ? t('run.logs.collapse') : t('run.logs.expand')}
+                  >
+                    {logsExpanded ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+                  </Button>
+                </div>
               </div>
               <div
                 ref={logContainerRef}
-                className="max-h-96 overflow-y-auto rounded-md border border-[#404040] bg-[#0F0F0F] p-3 text-xs text-[#D1D5DB]"
+                onScroll={(event) => {
+                  const el = event.currentTarget
+                  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+                  followRef.current = atBottom
+                  if (atBottom !== following) setFollowing(atBottom)
+                }}
+                className={`${logsExpanded ? 'max-h-[70vh]' : 'max-h-96'} overflow-y-auto rounded-md border border-[#404040] bg-[#0F0F0F] p-3`}
               >
-                {logs.length === 0 ? (
-                  <p className="font-mono text-[#6B7280]">
-                    {isTerminal ? '수집된 로그가 없습니다.' : '로그를 기다리는 중...'}
-                  </p>
-                ) : (
-                  logs.map((line, idx) => (
-                    <p key={idx} className="font-mono leading-5 break-all">
-                      <span className="mr-2 text-[#6B7280]">+{logTimestamps[idx] ?? 0}s</span>
-                      {line}
-                    </p>
-                  ))
-                )}
+                <LogLines
+                  entries={visibleLogs}
+                  showStage={logFilter.stage === 'all'}
+                  labels={labels}
+                  emptyText={
+                    logs.length > 0
+                      ? t('run.logs.noMatch')
+                      : isTerminal
+                        ? t('run.logs.none')
+                        : t('run.logs.waiting')
+                  }
+                />
               </div>
             </AccordionContent>
           </AccordionItem>
         </Accordion>
 
-        <div className="flex justify-end gap-2 pt-1">
+        {cancelError !== null && !isCancelDialogOpen ? (
+          <p className="text-right text-[13px] text-[#FCA5A5]" title={cancelError || undefined}>
+            {t('run.cancelFailed')}
+          </p>
+        ) : null}
+
+        <div className="flex flex-wrap justify-end gap-2 pt-1">
           {deployUrl ? (
             <Button asChild variant="outline" className="shadow-none">
               <a href={deployUrl} target="_blank" rel="noopener noreferrer">
                 <ExternalLink className="mr-1.5 h-4 w-4" />
-                배포된 서비스 열기
+                {t('run.openDeployment')}
               </a>
             </Button>
           ) : null}
@@ -1806,19 +924,15 @@ function PipelineProcessContent() {
               disabled={isCancelling}
               className="border border-[#7F1D1D] bg-transparent text-[#FCA5A5] shadow-none hover:bg-[#450A0A]/40"
             >
-              {isCancelling ? '취소 중...' : '파이프라인 취소'}
+              {isCancelling ? t('run.cancelling') : t('run.cancel')}
             </Button>
           ) : null}
           <Button
-            onClick={() =>
-              navigate('/pipeline/result', {
-                state: { jobId, repoName, branch },
-              })
-            }
+            onClick={() => navigate('/pipeline/result', { state: { jobId, repoName, branch } })}
             disabled={!isTerminal}
             className="shadow-none"
           >
-            보안 분석 결과
+            {t('run.securityResult')}
           </Button>
         </div>
       </section>
@@ -1826,10 +940,13 @@ function PipelineProcessContent() {
       <Dialog open={isCancelDialogOpen} onOpenChange={(open) => !isCancelling && setIsCancelDialogOpen(open)}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>파이프라인을 취소할까요?</DialogTitle>
-            <DialogDescription>
-              진행 중인 작업이 즉시 종료됩니다. 이미 생성된 로그와 기록은 유지됩니다.
-            </DialogDescription>
+            <DialogTitle>{t('run.cancelDialog.title')}</DialogTitle>
+            <DialogDescription>{t('run.cancelDialog.description')}</DialogDescription>
+            {cancelError !== null ? (
+              <p className="mt-2 text-sm text-[#FCA5A5]" title={cancelError || undefined}>
+                {t('run.cancelFailed')}
+              </p>
+            ) : null}
           </DialogHeader>
           <DialogFooter>
             <Button
@@ -1838,25 +955,130 @@ function PipelineProcessContent() {
               onClick={() => setIsCancelDialogOpen(false)}
               disabled={isCancelling}
             >
-              계속 실행
+              {t('run.cancelDialog.keep')}
             </Button>
             <Button
               type="button"
-              onClick={handleCancel}
+              onClick={() => void handleCancel()}
               disabled={isCancelling}
               className="bg-[#EF4444] text-white shadow-none hover:bg-[#DC2626]"
             >
               {isCancelling ? (
                 <>
-                  <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />취소 중...
+                  <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+                  {t('run.cancelling')}
                 </>
               ) : (
-                '파이프라인 취소'
+                t('run.cancel')
               )}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
     </MainLayout>
+  )
+}
+
+function StageCard({ stage, isCurrent, duration, logs, labels, onShowInFullLog }: {
+  stage: StageView
+  isCurrent: boolean
+  duration: number | null
+  logs: ResolvedLogEntry[]
+  labels: Labels
+  onShowInFullLog: () => void
+}) {
+  const { t } = labels
+  const Icon = STAGE_ICONS[stage.index]
+  const color = STATUS_COLOR[stage.status]
+  const canOpen = stage.status !== 'pending' || logs.length > 0 || Boolean(stage.errorMessage)
+  const borderColor =
+    stage.status === 'success' || stage.status === 'failed' || stage.status === 'running'
+      ? color
+      : undefined
+  const startedAt = formatClock(toMs(stage.startedAt))
+  const endedAt = formatClock(toMs(stage.endedAt))
+
+  return (
+    <AccordionItem
+      id={`stage-card-${stage.index}`}
+      value={stageKey(stage.index)}
+      className={`scroll-mt-4 rounded-2xl border border-[#404040] bg-[#262626] p-4 transition-[border-color,opacity] duration-300 ${
+        stage.status === 'pending' && !isCurrent ? 'opacity-60' : ''
+      }`}
+      style={borderColor ? { borderColor } : undefined}
+    >
+      <AccordionTrigger
+        disabled={!canOpen}
+        className={`py-0 hover:no-underline disabled:cursor-default disabled:opacity-100 ${canOpen ? '' : '[&>svg]:hidden'}`}
+      >
+        <div className="flex w-full min-w-0 flex-col gap-2 pr-2 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 items-center gap-3">
+            <StageStatusIcon status={stage.status} animate={isCurrent} className="h-7 w-7 shrink-0" />
+            <span className="font-mono text-[13px] text-[#808080]">
+              {String(stage.number).padStart(2, '0')}
+            </span>
+            <Icon className="h-5 w-5 shrink-0 text-[#6B7280]" />
+            <span className="truncate text-left text-[18px] font-semibold text-white">
+              {labels.stageName(stage.index)}
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-3 pl-10 text-[12px] text-[#9CA3AF] sm:pl-0">
+            <span
+              className="inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold"
+              style={{ color, borderColor: color }}
+            >
+              {labels.status(stage.status)}
+            </span>
+            <span className="inline-flex items-center gap-1" title={t('run.stageCard.duration')}>
+              <Clock3 className="h-3.5 w-3.5" />
+              <span style={stage.status === 'running' ? { color } : undefined}>
+                {labels.duration(duration)}
+              </span>
+            </span>
+            <span className="hidden md:inline" title={`${t('run.stageCard.start')} → ${t('run.stageCard.end')}`}>
+              {startedAt} → {endedAt}
+            </span>
+          </div>
+        </div>
+      </AccordionTrigger>
+      <AccordionContent className="pt-3">
+        <div className="mb-2 grid grid-cols-3 gap-2 text-[12px] text-[#9CA3AF] md:hidden">
+          <span>{t('run.stageCard.start')} {startedAt}</span>
+          <span>{t('run.stageCard.end')} {endedAt}</span>
+          <span>{t('run.stageCard.duration')} {labels.duration(duration)}</span>
+        </div>
+        {stage.status === 'failed' || stage.errorMessage ? (
+          <div className="mb-2 rounded-md border border-[#7F1D1D] bg-[#450A0A]/40 p-2 text-[12px] text-[#FCA5A5]">
+            <p className="font-semibold">{t('run.stageCard.errorDetails')}</p>
+            <p className="mt-1 whitespace-pre-wrap break-words">
+              {stage.errorMessage || t('run.stageCard.noErrorReason')}
+            </p>
+          </div>
+        ) : null}
+        <div className="max-h-72 overflow-y-auto rounded-md border border-[#404040] bg-[#1E1E1E] p-3">
+          <LogLines
+            entries={logs}
+            showStage={false}
+            labels={labels}
+            emptyText={
+              stage.status === 'running'
+                ? t('run.stageCard.runningEmpty')
+                : stage.status === 'pending'
+                  ? t('run.stageCard.pendingEmpty')
+                  : stage.status === 'skipped'
+                    ? t('run.stageCard.skippedEmpty')
+                    : t('run.stageCard.noLogs')
+            }
+          />
+        </div>
+        {logs.length > 0 ? (
+          <div className="mt-2 flex justify-end">
+            <button type="button" onClick={onShowInFullLog} className="text-[12px] text-[#93C5FD] hover:underline">
+              {t('run.stageCard.showInFullLog')}
+            </button>
+          </div>
+        ) : null}
+      </AccordionContent>
+    </AccordionItem>
   )
 }

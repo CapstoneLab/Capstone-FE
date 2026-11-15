@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { fetchCurrentUser, type AuthUser } from '@/lib/auth'
+import { queryClient } from '@/lib/queryClient'
 
 export type User = AuthUser
 
@@ -84,6 +85,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const logout = useCallback(() => {
+    // Cached job data belongs to the signed-in user.
+    queryClient.clear()
     clearPersistedToken()
     setToken(null)
     setUser(null)

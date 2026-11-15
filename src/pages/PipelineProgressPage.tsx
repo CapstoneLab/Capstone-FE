@@ -13,7 +13,7 @@ import {
   ShieldAlert,
   ShieldCheck,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { ArcElement, Chart as ChartJS, Legend, Tooltip, type ChartOptions } from 'chart.js'
 import { Doughnut } from 'react-chartjs-2'
 import { useLocation, useNavigate } from 'react-router-dom'
@@ -23,8 +23,8 @@ import { Card } from '@/components/ui/card'
 import { useAuth } from '@/contexts/AuthContext'
 import { useTheme } from '@/contexts/ThemeContext'
 import { useLanguage } from '@/contexts/LanguageContext'
+import { useJobDetailQuery, useJobResultQuery } from '@/hooks/useJobQueries'
 import {
-  fetchJobDetail,
   fetchJobResult,
   type JobDetail,
   type JobResult,
@@ -37,6 +37,9 @@ import {
 import { securityCheckCatalog } from '@/data/securityCatalog'
 import { ResultDownloadDialog } from '@/components/ResultDownloadDialog'
 import type { ReportData } from '@/lib/reportExport'
+import { localizeFinding } from '@/lib/findingI18n'
+import { GATE_RULES, matchGateRule, stricterVerdict } from '@/lib/deploymentGate'
+import { DeployApprovalDialog } from '@/components/DeployApprovalDialog'
 
 ChartJS.register(ArcElement, Tooltip, Legend)
 
@@ -91,17 +94,6 @@ const VERDICT_CONFIG: Record<
   block: { label: '차단', message: '배포 차단 — 코드 수정 필요', color: '#EF4444', tone: 'block', icon: Ban },
 }
 
-// B-2: the deployment gate hierarchy. Each row maps to a verdict so we can
-// highlight the row the current verdict landed on ("← 현재 여기").
-const GATE_ROWS: { color: string; label: string; action: string; match: VerdictKind }[] = [
-  { color: '#EF4444', label: 'Critical ≥ 1', action: '즉시 차단', match: 'block' },
-  { color: '#EF4444', label: 'High ≥ 2', action: '즉시 차단', match: 'block' },
-  { color: '#F97316', label: 'High = 1', action: '승인 필요', match: 'block_pending_approval' },
-  { color: '#F97316', label: 'Medium ≥ 2', action: '승인 필요', match: 'block_pending_approval' },
-  { color: '#EAB308', label: 'Medium = 1', action: '경고(통과)', match: 'warn' },
-  { color: '#EAB308', label: 'Low ≥ 1', action: '경고(통과)', match: 'warn' },
-  { color: '#22C55E', label: '없음', action: '통과', match: 'pass' },
-]
 
 const toneBannerClass: Record<'pass' | 'warn' | 'approve' | 'block', string> = {
   pass: 'border-[#3ECF8E] bg-[#065F46]/30',
@@ -243,21 +235,42 @@ export function PipelineProgressPage() {
   const navigate = useNavigate()
   const { token } = useAuth()
   const { resolvedTheme } = useTheme()
-  const { t } = useLanguage()
+  const { t, locale } = useLanguage()
   const { state } = useLocation()
   const locationState = (state ?? {}) as LocationState
   const jobId = locationState.jobId ?? ''
 
-  const [result, setResult] = useState<JobResult | null>(null)
-  const [detail, setDetail] = useState<JobDetail | null>(null)
-  // Lazy-init so we don't synchronously toggle loading inside the effect when
-  // there's nothing to fetch (jobId/token are stable for this page's life).
-  const [isLoading, setIsLoading] = useState(() => !!(jobId && token))
-  const [error, setError] = useState<string | null>(null)
+  // Cached via TanStack Query — revisiting a finished run renders instantly,
+  // and hovering a run in the history list prefetches it.
+  const detailQuery = useJobDetailQuery(token, jobId)
+  const resultQuery = useJobResultQuery(token, jobId)
+  const detail: JobDetail | null = detailQuery.data ?? null
+  // "더 보기" pages are appended locally on top of the cached first page.
+  const [extraFindings, setExtraFindings] = useState<SecurityFinding[]>([])
+  const [morePagination, setMorePagination] = useState<JobResult['pagination'] | null>(null)
+  const result: JobResult | null = useMemo(() => {
+    const base = resultQuery.data ?? null
+    if (!base || extraFindings.length === 0) return base
+    return {
+      ...base,
+      findings: [...base.findings, ...extraFindings],
+      pagination: morePagination ?? base.pagination,
+    }
+  }, [resultQuery.data, extraFindings, morePagination])
+  const isLoading =
+    !!(jobId && token) && (detailQuery.isPending || resultQuery.isPending) && !detail && !result
+  const error =
+    detailQuery.isError && (resultQuery.isError || resultQuery.data === null)
+      ? detailQuery.error instanceof Error
+        ? detailQuery.error.message
+        : t('result.loadFailed')
+      : null
+  const [approvalAutoOpened, setApprovalAutoOpened] = useState(false)
   // Which copy affordance most recently succeeded — keyed by `${id}:code|ai`,
   // shown as "복사됨" briefly.
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const [downloadOpen, setDownloadOpen] = useState(false)
+  const [approvalOpen, setApprovalOpen] = useState(false)
   const [isLoadingMore, setIsLoadingMore] = useState(false)
 
   async function handleCopy(key: string, text: string) {
@@ -276,49 +289,13 @@ export function PipelineProgressPage() {
         offset: result.findings.length,
       })
       if (next) {
-        setResult((current) => current ? {
-          ...next,
-          findings: [...current.findings, ...next.findings],
-        } : next)
+        setExtraFindings((current) => [...current, ...next.findings])
+        setMorePagination(next.pagination)
       }
     } finally {
       setIsLoadingMore(false)
     }
   }
-
-  useEffect(() => {
-    if (!jobId || !token) return
-    let cancelled = false
-
-    Promise.allSettled([
-      fetchJobDetail(token, jobId),
-      fetchJobResult(token, jobId),
-    ]).then(([detailRes, resultRes]) => {
-      if (cancelled) return
-
-      if (detailRes.status === 'fulfilled') setDetail(detailRes.value)
-      else console.error('[result] job detail failed:', detailRes.reason)
-
-      if (resultRes.status === 'fulfilled') setResult(resultRes.value)
-      else console.error('[result] job result failed:', resultRes.reason)
-
-      if (
-        detailRes.status === 'rejected' &&
-        (resultRes.status === 'rejected' || resultRes.value === null)
-      ) {
-        setError(
-          detailRes.reason instanceof Error
-            ? detailRes.reason.message
-            : t('result.loadFailed'),
-        )
-      }
-      setIsLoading(false)
-    })
-
-    return () => {
-      cancelled = true
-    }
-  }, [jobId, token, t])
 
   const repoName = result?.repoName || detail?.repoName || locationState.repoName || ''
   const branch = result?.branch || detail?.branch || locationState.branch || ''
@@ -374,9 +351,29 @@ export function PipelineProgressPage() {
   const scoreLabel = vd?.scoreLabel || (score != null ? `${score}/100` : null)
   const displayScoreColor = vd?.gaugeColor ?? '#9CA3AF'
 
-  // Effective verdict — prefer the rich model, else map the legacy verdict.
-  const effectiveVerdict: VerdictKind | null =
+  // Effective verdict — backend verdict (rich model, else legacy), tightened by
+  // the count-based gate policy. The count rule can only make it stricter.
+  const backendVerdict: VerdictKind | null =
     vd?.verdict ?? legacyToVerdictKind(result?.verdict ?? detail?.verdict ?? null, jobStatus)
+  const gateRule = matchGateRule(counts)
+  // Apply the count rule whenever scan data exists. A run waiting for approval
+  // is reported as overall_status "pending" (or still running), and gating on
+  // "not pending" here used to hide the verdict banner — and the approval
+  // button with it — exactly when approval was needed.
+  const hasScanData = !!vd || totalCount > 0 || (result?.findings.length ?? 0) > 0
+  const effectiveVerdict: VerdictKind | null =
+    hasScanData || !isResultPending ? stricterVerdict(backendVerdict, gateRule.verdict) : backendVerdict
+
+  // Pop the approval dialog once when the run lands on "승인 필요" and nothing
+  // has been accepted yet (acknowledged CWEs mean it was already approved).
+  if (
+    !approvalAutoOpened &&
+    effectiveVerdict === 'block_pending_approval' &&
+    (vd?.acknowledgedCwes.length ?? 0) === 0
+  ) {
+    setApprovalAutoOpened(true)
+    setApprovalOpen(true)
+  }
   const verdictCfg = effectiveVerdict ? VERDICT_CONFIG[effectiveVerdict] : null
   const verdictLabel = effectiveVerdict ? t(`result.verdict.${effectiveVerdict}.label`) : ''
   const verdictMessage = effectiveVerdict ? t(`result.verdict.${effectiveVerdict}.message`) : ''
@@ -395,7 +392,12 @@ export function PipelineProgressPage() {
   // Banner accent: use gauge_color directly when present (B-0).
   const accent = vd?.gaugeColor || verdictCfg?.color || '#F97316'
 
-  const allFindings: SecurityFinding[] = useMemo(() => result?.findings ?? [], [result])
+  // Scanner text is English; in Korean mode it is replaced by Korean text
+  // (backend *_ko fields or the local dictionary). Also feeds the report.
+  const allFindings: SecurityFinding[] = useMemo(
+    () => (result?.findings ?? []).map((finding) => localizeFinding(finding, locale)),
+    [result, locale],
+  )
   const inScopeFindings = useMemo(() => allFindings.filter((f) => f.inScope), [allFindings])
   const outOfScopeFindings = useMemo(() => allFindings.filter((f) => !f.inScope), [allFindings])
   // out_of_scope_count: prefer the backend value, else count locally.
@@ -601,17 +603,25 @@ export function PipelineProgressPage() {
     )
   }
 
-  // The gate row the verdict landed on (for the "← 현재 여기" highlight).
-  const activeRowVerdict: VerdictKind =
-    effectiveVerdict ??
-    (counts.critical > 0 || counts.high >= 2 ? 'block' : counts.high > 0 || counts.medium >= 2 ? 'block_pending_approval' : counts.medium > 0 || counts.low > 0 ? 'warn' : 'pass')
+  // The gate row the verdict landed on (for the "← 현재 여기" highlight). When
+  // the backend is stricter than the counts (e.g. a P0 secret block), point at
+  // the first row with that verdict instead.
+  const activeRuleId =
+    !effectiveVerdict || gateRule.verdict === effectiveVerdict
+      ? gateRule.id
+      : GATE_RULES.find((r) => r.verdict === effectiveVerdict)?.id ?? gateRule.id
 
-  const reasons =
+  const backendReasons =
     effectiveVerdict === 'warn'
       ? vd?.warnReasons ?? []
       : effectiveVerdict === 'block' || effectiveVerdict === 'block_pending_approval'
         ? vd?.blockReasons ?? []
         : []
+  // When the count policy tightened the backend verdict, say which rule did it.
+  const reasons =
+    effectiveVerdict && effectiveVerdict !== backendVerdict && gateRule.verdict === effectiveVerdict
+      ? [...backendReasons, `${gateRule.label} 탐지 — 배포 게이트 정책`]
+      : backendReasons
 
   const renderFinding = (item: SecurityFinding) => {
     const cwe = item.cwe || item.cve
@@ -644,7 +654,7 @@ export function PipelineProgressPage() {
           </span>
           {/* 항목명 + CWE 태그. policy_item == null 이면 "정책 항목 외" */}
           <span className="text-[14px] font-semibold text-white">
-            {item.policyItem || t('result.policyItemOutside')}
+            {item.categoryLabel || t('result.policyItemOutside')}
           </span>
           {cwe ? (
             <span className="rounded-full border border-[#404040] px-2 py-0.5 text-[11px] text-[#9CA3AF]">
@@ -738,6 +748,16 @@ export function PipelineProgressPage() {
           <div className="mt-3">
             <p className="text-[12px] font-semibold text-[#D1D5DB]">{t('result.description')}</p>
             <p className="mt-1 text-[12px] text-[#A3A3A3]">{fullText}</p>
+            {item.originalText ? (
+              <details className="mt-1.5">
+                <summary className="cursor-pointer text-[11px] text-[#6B7280] hover:text-[#9CA3AF]">
+                  {t('result.showOriginal')}
+                </summary>
+                <p className="mt-1 whitespace-pre-wrap break-words text-[11px] text-[#808080]">
+                  {item.originalText}
+                </p>
+              </details>
+            ) : null}
           </div>
         ) : null}
 
@@ -876,10 +896,10 @@ export function PipelineProgressPage() {
                   ) : null}
                 </div>
                 {/* Approval path exists only for block_pending_approval. block hides it. */}
-                {vd?.requiresApproval && effectiveVerdict === 'block_pending_approval' ? (
+                {effectiveVerdict === 'block_pending_approval' ? (
                   <Button
                     type="button"
-                    onClick={() => navigate('/pipeline/approval', { state: { jobId, repoName, branch } })}
+                    onClick={() => setApprovalOpen(true)}
                     className="h-8 shrink-0 bg-[#EA580C] px-3 text-xs text-white shadow-none hover:bg-[#C2410C]"
                   >
                     {t('result.requestApproval')}
@@ -891,31 +911,26 @@ export function PipelineProgressPage() {
 
           {/* Gate hierarchy with current position highlighted */}
           <div className="mt-3 space-y-1.5">
-            {GATE_ROWS.map((row) => {
-              const applicable = row.label.startsWith('Critical') ? counts.critical > 0
-                : row.label === 'High ≥ 2' ? counts.high >= 2
-                : row.label === 'High = 1' ? counts.high === 1
-                : row.label === 'Medium ≥ 2' ? counts.medium >= 2
-                : row.label === 'Medium = 1' ? counts.medium === 1
-                : row.label === 'Low ≥ 1' ? counts.low > 0
-                : totalCount === 0
-              const active = row.match === activeRowVerdict && applicable
+            {GATE_RULES.map((row) => {
+              const active = row.id === activeRuleId
               return (
                 <div
-                  key={row.label}
+                  key={row.id}
                   className={`flex items-center gap-3 rounded-lg border px-3 py-2 text-[13px] ${
                     active ? 'border-[#5B5B5B] bg-[#1E1E1E]' : 'border-transparent'
                   }`}
                 >
                   <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: row.color }} />
-                  <span className={active ? 'font-semibold text-white' : 'text-[#9CA3AF]'}>{row.label}</span>
+                  <span className={active ? 'font-semibold text-white' : 'text-[#9CA3AF]'}>
+                    {row.id === 'none' ? t('result.gate.none') : row.label}
+                  </span>
                   <span className="text-[#6B7280]">→</span>
                   <span className={active ? 'font-semibold text-white' : 'text-[#9CA3AF]'}>
-                    {row.match === 'block'
+                    {row.verdict === 'block'
                       ? t('result.gate.block')
-                      : row.match === 'block_pending_approval'
+                      : row.verdict === 'block_pending_approval'
                         ? t('result.gate.approval')
-                        : row.match === 'warn'
+                        : row.verdict === 'warn'
                           ? t('result.gate.warn')
                           : t('result.gate.pass')}
                   </span>
@@ -975,30 +990,37 @@ export function PipelineProgressPage() {
         <div className="grid gap-4 lg:grid-cols-2">
           <Card className="border-[#404040] bg-[#262626] p-4">
             <p className="mb-3 text-[16px] font-semibold text-white">{t('result.securityScore')}</p>
-            <div className="relative mx-auto h-30 w-36">
-              {/* Soft colored glow keyed to the gauge color, sitting under the
-                  arc for a bit of depth (theme-independent — it's a tint). */}
-              <div
-                aria-hidden
-                className="pointer-events-none absolute left-1/2 top-[62%] h-24 w-24 -translate-x-1/2 -translate-y-1/2 rounded-full opacity-25 blur-2xl"
-                style={{ backgroundColor: displayScoreColor }}
-              />
-              <Doughnut data={scoreChartData} options={scoreChartOptions} />
-              <p
-                className="pointer-events-none absolute left-1/2 top-[72%] -translate-x-1/2 -translate-y-1/2 text-[44px] font-bold leading-none"
-                style={{ color: displayScoreColor }}
-              >
-                {score ?? '-'}
-              </p>
-              <p className="pointer-events-none absolute left-1/2 top-[98%] -translate-x-1/2 -translate-y-1/2 text-[12px] text-[#9CA3AF]">
+            <div className="flex flex-col items-center">
+              {/* Half-doughnut in an exact 2:1 box so the arc fills it; the
+                  score sits inside the arc's hollow, the label below it. */}
+              <div className="relative h-24 w-48">
+                {/* Soft colored glow keyed to the gauge color, sitting under the
+                    arc for a bit of depth (theme-independent — it's a tint). */}
+                <div
+                  aria-hidden
+                  className="pointer-events-none absolute bottom-0 left-1/2 h-24 w-24 -translate-x-1/2 rounded-full opacity-25 blur-2xl"
+                  style={{ backgroundColor: displayScoreColor }}
+                />
+                <Doughnut data={scoreChartData} options={scoreChartOptions} />
+                <p
+                  className="pointer-events-none absolute inset-x-0 bottom-0 text-center text-[36px] font-bold leading-none tabular-nums"
+                  style={{ color: displayScoreColor }}
+                >
+                  {score ?? '-'}
+                </p>
+              </div>
+              <p className="mt-2 whitespace-nowrap text-center text-[12px] text-[#9CA3AF]">
                 {scoreLabel ?? '/ 100'}
               </p>
             </div>
             <div className="mt-3 rounded-lg border border-[#404040] bg-[#1E1E1E] p-3">
               <p className="text-[12px] text-[#6B7280]">{t('result.codeQualityScore')}</p>
-              <p className="text-[24px] font-bold leading-none" style={{ color: displayScoreColor }}>
+              <p
+                className="mt-1 text-[24px] font-bold leading-none tabular-nums"
+                style={{ color: displayScoreColor }}
+              >
                 {score ?? '-'}
-                <span className="text-[24px]">/100</span>
+                <span className="ml-0.5 text-[14px] font-medium text-[#9CA3AF]">/100</span>
               </p>
               <div className="mt-3 h-2.5 w-full overflow-hidden rounded-full bg-[#404040]">
                 <div
@@ -1022,7 +1044,9 @@ export function PipelineProgressPage() {
                         <span className="h-2 w-2 rounded-full" style={{ backgroundColor: severityColors[label] }} />
                         {label}
                       </span>
-                      <span className="text-[#FCA5A5]">-{vd.scoreBreakdown[key] ?? 0}</span>
+                      <span className="font-medium tabular-nums text-[#FCA5A5]">
+                        -{vd.scoreBreakdown[key] ?? 0}
+                      </span>
                     </div>
                   ))}
                 </div>
@@ -1129,6 +1153,15 @@ export function PipelineProgressPage() {
         open={downloadOpen}
         onOpenChange={setDownloadOpen}
         data={reportData}
+      />
+      <DeployApprovalDialog
+        open={approvalOpen}
+        onOpenChange={setApprovalOpen}
+        jobId={jobId}
+        repoName={repoName}
+        branch={branch}
+        counts={counts}
+        findings={inScopeFindings}
       />
     </MainLayout>
   )

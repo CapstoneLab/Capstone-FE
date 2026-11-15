@@ -40,6 +40,22 @@ contextBridge.exposeInMainWorld('desktop', {
       return () => ipcRenderer.removeListener('auth:callback', listener)
     },
   },
+  pipelineLink: {
+    getPendingOpen: () => ipcRenderer.invoke('pipeline:get-pending-open'),
+    acknowledgeOpen: (jobId) => ipcRenderer.invoke('pipeline:ack-open', jobId),
+    onOpen: (callback) => {
+      if (typeof callback !== 'function') {
+        return () => {}
+      }
+
+      const listener = (_event, jobId) => {
+        callback(jobId)
+        void ipcRenderer.invoke('pipeline:ack-open', jobId)
+      }
+      ipcRenderer.on('pipeline:open', listener)
+      return () => ipcRenderer.removeListener('pipeline:open', listener)
+    },
+  },
   report: {
     savePdf: (html, fileName) =>
       ipcRenderer.invoke('report:save-pdf', { html, fileName }),

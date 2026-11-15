@@ -83,6 +83,22 @@ function errorMessage(payload: UnknownRecord): string {
   return pick<string>(payload, 'message') ?? readableDetail(payload.detail)
 }
 
+/** Returns a normalised http(s) URL, or '' when the value is not one. A bare
+ *  host like `my-app.example.com` is treated as https. */
+export function normalizeHttpUrl(value: string | null | undefined): string {
+  const trimmed = value?.trim() ?? ''
+  if (!trimmed) return ''
+  const withScheme = /^[a-z][a-z\d+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
+  try {
+    const parsed = new URL(withScheme)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return ''
+    if (!parsed.hostname.includes('.') && parsed.hostname !== 'localhost') return ''
+    return parsed.href
+  } catch {
+    return ''
+  }
+}
+
 function mapRepo(raw: UnknownRecord): RepositoryItem {
   const isPrivate = pick<boolean>(raw, 'private', 'isPrivate', 'visibility_private')
   const visibilityField = pick<string>(raw, 'visibility')
@@ -110,7 +126,8 @@ function mapRepo(raw: UnknownRecord): RepositoryItem {
     repositoryUrl: pick<string>(raw, 'clone_url', 'cloneUrl') ?? htmlUrl,
     htmlUrl,
     ownerLogin: pick<string>(raw, 'owner_login', 'ownerLogin') ?? fullName.split('/')[0] ?? '',
-    domainUrl: normalizeWebUrl(pick<string>(raw, 'homepage') ?? ''),
+    // GitHub repository "homepage" — an externally hosted deployment URL.
+    domainUrl: normalizeWebUrl(pick<string>(raw, 'homepage', 'homepage_url', 'homepageUrl') ?? ''),
     pipelineStatus: 'pending',
     source: {
       branch: defaultBranch ?? '',
@@ -180,6 +197,166 @@ export async function fetchBranches(
     .filter((item) => item.name)
 }
 
+export type RepositoryWebhook = {
+  enabled: boolean
+  url: string | null
+  events: string[]
+}
+
+function parseRepositoryName(repositoryName: string): { owner: string; repo: string } {
+  const [owner, repo] = repositoryName.trim().replace(/\.git$/, '').split('/')
+  if (!owner || !repo) {
+    throw new Error('웹훅을 설정할 GitHub 저장소 형식이 올바르지 않습니다.')
+  }
+  return { owner, repo }
+}
+
+function parseErrorDetail(text: string): string {
+  if (!text) return ''
+  try {
+    return errorMessage(JSON.parse(text) as UnknownRecord) || text
+  } catch {
+    return text
+  }
+}
+
+export const WEBHOOK_PERMISSION_HINT =
+  'GitHub 웹훅 권한이 없습니다. 로그아웃 후 다시 로그인해 admin:repo_hook 권한을 승인하고, ' +
+  '조직 저장소라면 조직 Settings → Third-party access에서 OAuth 앱을 승인했는지, ' +
+  '계정이 해당 저장소의 Admin 권한을 가졌는지 확인해 주세요.'
+
+export class WebhookRequestError extends Error {
+  readonly status: number
+  readonly detail: string
+  constructor(message: string, status: number, detail: string) {
+    super(message)
+    this.name = 'WebhookRequestError'
+    this.status = status
+    this.detail = detail
+  }
+
+  /** 403: token lacks admin:repo_hook, org blocks the OAuth app, or no repo admin. */
+  get isPermissionError(): boolean {
+    return this.status === 403
+  }
+}
+
+function webhookError(action: string, status: number, text: string): WebhookRequestError {
+  const detail = parseErrorDetail(text).trim()
+  const base = `저장소 웹훅 ${action}에 실패했습니다. (${status})`
+  const hint = status === 403 ? `\n${WEBHOOK_PERMISSION_HINT}` : ''
+  return new WebhookRequestError(
+    detail ? `${base} ${detail}${hint}` : `${base}${hint}`,
+    status,
+    detail,
+  )
+}
+
+function mapRepositoryWebhook(raw: UnknownRecord): RepositoryWebhook {
+  return {
+    enabled: pick<boolean>(raw, 'enabled', 'active') ?? false,
+    url: pick<string>(raw, 'url', 'webhook_url', 'webhookUrl') ?? null,
+    events: pick<string[]>(raw, 'events') ?? ['push'],
+  }
+}
+
+export async function fetchRepositoryWebhook(
+  token: string,
+  repositoryName: string,
+): Promise<RepositoryWebhook> {
+  const { owner, repo } = parseRepositoryName(repositoryName)
+  const res = await fetch(
+    `${API_BASE}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/webhook`,
+    { headers: authHeaders(token) },
+  )
+
+  if (!res.ok) {
+    notifyIfUnauthorized(res.status)
+    const text = await res.text().catch(() => '')
+    if (res.status === 401) throw new AuthExpiredError(text)
+    throw webhookError('상태 조회', res.status, text)
+  }
+
+  return mapRepositoryWebhook((await res.json()) as UnknownRecord)
+}
+
+export async function setRepositoryWebhook(
+  token: string,
+  repositoryName: string,
+  enabled: boolean,
+): Promise<RepositoryWebhook> {
+  const { owner, repo } = parseRepositoryName(repositoryName)
+  const res = await fetch(
+    `${API_BASE}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/webhook`,
+    {
+      method: 'PUT',
+      headers: authHeaders(token, true),
+      body: JSON.stringify({ enabled, events: ['push'] }),
+    },
+  )
+
+  if (!res.ok) {
+    notifyIfUnauthorized(res.status)
+    const text = await res.text().catch(() => '')
+    if (res.status === 401) throw new AuthExpiredError(text)
+    console.error('[api] webhook PUT failed:', res.status, text)
+    throw webhookError(enabled ? '등록' : '해제', res.status, text)
+  }
+
+  return mapRepositoryWebhook((await res.json()) as UnknownRecord)
+}
+
+export type RepositoryWebhookStatus =
+  | { state: 'on' | 'off'; webhook: RepositoryWebhook }
+  | { state: 'unknown'; error: string }
+
+/**
+ * Looks up the webhook state of many repositories with bounded concurrency.
+ * 404 means "no webhook registered" (off); other failures become `unknown`
+ * so one bad repository never hides the rest. 401 aborts the whole lookup.
+ */
+export async function fetchRepositoryWebhookStatuses(
+  token: string,
+  repositoryNames: string[],
+  concurrency = 4,
+): Promise<Map<string, RepositoryWebhookStatus>> {
+  const results = new Map<string, RepositoryWebhookStatus>()
+  let nextIndex = 0
+
+  const worker = async () => {
+    while (nextIndex < repositoryNames.length) {
+      const name = repositoryNames[nextIndex++]
+      try {
+        const webhook = await fetchRepositoryWebhook(token, name)
+        results.set(name, { state: webhook.enabled ? 'on' : 'off', webhook })
+      } catch (error) {
+        if (error instanceof AuthExpiredError) throw error
+        if (error instanceof WebhookRequestError && error.status === 404) {
+          results.set(name, {
+            state: 'off',
+            webhook: { enabled: false, url: null, events: [] },
+          })
+        } else {
+          results.set(name, {
+            state: 'unknown',
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(Math.max(1, concurrency), repositoryNames.length) }, worker),
+  )
+  return results
+}
+
+/** Whether a pipeline's trigger_source came from a GitHub webhook event. */
+export function isWebhookTrigger(source: string | null | undefined): boolean {
+  return !!source && /webhook|push/i.test(source)
+}
+
 export type JobStatus = 'queued' | 'running' | 'success' | 'failed' | 'cancelled'
 
 export type JobVerdict = 'passed' | 'warning' | 'failed'
@@ -199,7 +376,7 @@ export type JobStep = {
   stepId: string
   stepName: string
   stepType: string
-  status: 'pending' | 'running' | 'success' | 'failed' | 'skipped'
+  status: 'pending' | 'running' | 'success' | 'failed' | 'skipped' | 'cancelled'
   errorMessage: string | null
   startedAt: string | null
   endedAt: string | null
@@ -215,6 +392,10 @@ export type JobDetail = {
   repoName: string
   branch: string
   triggerSource: string
+  /** Commit the run checked out (`commit_sha`); empty when not reported. */
+  commitSha: string
+  /** Login of the user/actor that triggered the run; empty when not reported. */
+  triggeredBy: string
   status: JobStatus
   overallResult: string | null
   createdAt: string | null
@@ -230,7 +411,7 @@ export type JobDetail = {
   securityScore: number
 }
 
-function repoNameFromUrl(url: string): string {
+export function repoNameFromUrl(url: string): string {
   if (!url) return ''
   try {
     const parsed = new URL(url)
@@ -317,6 +498,9 @@ function mapJobDetail(raw: UnknownRecord): JobDetail {
     repoName: repoNameFromUrl(repoUrl),
     branch: pick<string>(job, 'branch') ?? '',
     triggerSource: pick<string>(job, 'trigger_source', 'triggerSource') ?? '',
+    commitSha: pick<string>(job, 'commit_sha', 'commitSha', 'commit_hash', 'commitHash') ?? '',
+    triggeredBy:
+      pick<string>(job, 'triggered_by', 'triggeredBy', 'triggered_by_login', 'actor') ?? '',
     status: (pick<JobStatus>(job, 'status') as JobStatus) ?? 'queued',
     overallResult: pick<string>(job, 'overall_result', 'overallResult') ?? null,
     createdAt: pick<string>(job, 'created_at', 'createdAt') ?? null,
@@ -624,6 +808,88 @@ export function setRepoDomainUrl(
   }
 }
 
+// Deployment URL hosted OUTSIDE SecuPipeline (Vercel, Netlify, own server…),
+// entered by the user on the repository detail page. Kept separate from the
+// SecuPipeline deployment URL above so the two never overwrite each other.
+const REPO_EXTERNAL_DOMAIN_PREFIX = 'secupipeline:repo-external-domain:'
+
+export function getRepoExternalDomainUrl(cacheKey: string, repoName: string): string {
+  try {
+    return localStorage.getItem(`${REPO_EXTERNAL_DOMAIN_PREFIX}${cacheKey}:${repoName}`) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+export function setRepoExternalDomainUrl(cacheKey: string, repoName: string, url: string): void {
+  try {
+    const key = `${REPO_EXTERNAL_DOMAIN_PREFIX}${cacheKey}:${repoName}`
+    const trimmed = url.trim()
+    if (trimmed) localStorage.setItem(key, trimmed)
+    else localStorage.removeItem(key)
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function deploymentSettingsUrl(owner: string, repo: string): string {
+  return `${API_BASE}/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/deployment-settings`
+}
+
+function externalUrlFrom(data: UnknownRecord): string {
+  const nested = pick<UnknownRecord>(data, 'settings', 'deployment_settings', 'deploymentSettings')
+  const source = nested ?? data
+  return normalizeHttpUrl(pick<string>(source, 'external_url', 'externalUrl'))
+}
+
+// GET /api/repos/{owner}/{repo}/deployment-settings → { external_url }.
+// Server-side copy of the external deployment URL (survives reinstall /
+// other devices). Returns null when the backend has nothing to say (404).
+export async function fetchDeploymentSettings(
+  token: string,
+  owner: string,
+  repo: string,
+): Promise<{ externalUrl: string } | null> {
+  const res = await fetch(deploymentSettingsUrl(owner, repo), { headers: authHeaders(token) })
+  if (res.status === 404) return null
+  if (!res.ok) {
+    notifyIfUnauthorized(res.status)
+    throw new Error(`Failed to fetch deployment settings (${res.status})`)
+  }
+  return { externalUrl: externalUrlFrom((await res.json()) as UnknownRecord) }
+}
+
+// PUT /api/repos/{owner}/{repo}/deployment-settings { external_url | null }.
+export async function saveDeploymentSettings(
+  token: string,
+  owner: string,
+  repo: string,
+  externalUrl: string,
+): Promise<{ externalUrl: string }> {
+  const res = await fetch(deploymentSettingsUrl(owner, repo), {
+    method: 'PUT',
+    headers: authHeaders(token, true),
+    body: JSON.stringify({ external_url: externalUrl || null }),
+  })
+  if (!res.ok) {
+    notifyIfUnauthorized(res.status)
+    const text = await res.text().catch(() => '')
+    let detail = ''
+    try {
+      detail = errorMessage(JSON.parse(text) as UnknownRecord)
+    } catch {
+      detail = text
+    }
+    throw new Error(
+      detail
+        ? `외부 배포 주소 저장 실패 (${res.status}): ${detail}`
+        : `외부 배포 주소 저장 실패 (${res.status})`,
+    )
+  }
+  const data = (await res.json().catch(() => ({}))) as UnknownRecord
+  return { externalUrl: externalUrlFrom(data) || externalUrl }
+}
+
 const REPO_DETECT_PREFIX = 'secupipeline:repo-detect:'
 
 export function getRepoDetectEnabled(cacheKey: string, repoId: string): boolean {
@@ -697,6 +963,14 @@ export type SecurityFinding = {
   description: string
   aiSuggestion: string
   references: string[]
+  /** Korean texts when the backend provides them (`*_ko` fields). */
+  titleKo?: string
+  descriptionKo?: string
+  aiSuggestionKo?: string
+  /** Set by localizeFinding: display name of the category (e.g. "코드 인젝션"). */
+  categoryLabel?: string
+  /** Set by localizeFinding: scanner's original text that was replaced. */
+  originalText?: string
 }
 
 // The 4-state deployment gate verdict (화면 B). NOT the same as JobVerdict
@@ -796,6 +1070,10 @@ function mapFinding(raw: UnknownRecord, idx: number): SecurityFinding {
     description: pick<string>(raw, 'description') ?? '',
     aiSuggestion: pick<string>(raw, 'ai_suggestion', 'aiSuggestion') ?? '',
     references: Array.isArray(refsRaw) ? (refsRaw as string[]) : [],
+    titleKo: pick<string>(raw, 'title_ko', 'titleKo') || undefined,
+    descriptionKo:
+      pick<string>(raw, 'description_ko', 'descriptionKo', 'message_ko', 'messageKo') || undefined,
+    aiSuggestionKo: pick<string>(raw, 'ai_suggestion_ko', 'aiSuggestionKo') || undefined,
   }
 }
 
@@ -1094,9 +1372,11 @@ export function approveJob(
   jobId: string,
   reason: string,
   approvedCwes?: string[],
+  approverName?: string,
 ): Promise<ApprovalResponse> {
   const body: UnknownRecord = { reason }
   if (approvedCwes && approvedCwes.length > 0) body.approved_cwes = approvedCwes
+  if (approverName) body.approver_name = approverName
   return postApproval(token, jobId, 'approve', body)
 }
 
@@ -1105,8 +1385,9 @@ export function rejectJob(
   token: string,
   jobId: string,
   reason: string,
+  approverName?: string,
 ): Promise<ApprovalResponse> {
-  return postApproval(token, jobId, 'reject', { reason })
+  return postApproval(token, jobId, 'reject', approverName ? { reason, approver_name: approverName } : { reason })
 }
 
 // 화면 D — 감사 로그 (append-only 승인 이력).
@@ -1625,7 +1906,10 @@ export async function fetchPipelineDeployment(
   const data = (await res.json()) as UnknownRecord
   const deployment = pick<UnknownRecord>(data, 'deployment')
   const deploymentStatus = deployment ? pick<string>(deployment, 'status') : undefined
-  if (deploymentStatus && deploymentStatus !== 'success') return { url: null }
+  // Hide failed/in-progress deployments. The backend contract reports a live
+  // deployment as "active" (docs/repo-detail-backend-handoff.md); some
+  // builds send "success" — accept both.
+  if (deploymentStatus && !['success', 'active', 'deployed'].includes(deploymentStatus)) return { url: null }
   const url = deployment ? pick<string>(deployment, 'url') : pick<string>(data, 'url')
 
   if (typeof url !== 'string' || !url.trim()) return { url: null }

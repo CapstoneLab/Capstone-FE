@@ -100,14 +100,6 @@ export function AuthPage() {
               ))}
             </ul>
           </Card>
-
-          <p className="auth-text-secondary mt-6 text-center text-xs">
-            {t('auth.termsPrefix')}{' '}
-            <a href="#" className="font-semibold text-[#34D399] underline underline-offset-2">
-              {t('auth.privacy')}
-            </a>
-            {t('auth.termsSuffix')}
-          </p>
         </div>
       </main>
     </section>
